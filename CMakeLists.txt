@@ -48,6 +48,11 @@ add_executable(tdmd src/main.cpp src/io/config.cpp)
 target_link_libraries(tdmd PRIVATE tdmd_core yaml-cpp)
 target_compile_options(tdmd PRIVATE -Wall -Wextra)
 
+# --- M2.5 Tier-1 occupancy probe (CUDA-free analytical tool) ---
+add_executable(occupancy_probe src/probe/occupancy_probe.cpp)
+target_include_directories(occupancy_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(occupancy_probe PRIVATE -Wall -Wextra)
+
 # --- tests (do NOT depend on yaml-cpp; golden-data driven, no LAMMPS) ---
 if(TDMD_BUILD_TESTS)
   enable_testing()
@@ -73,4 +78,8 @@ if(TDMD_BUILD_TESTS)
   add_executable(test_buffer tests/test_buffer.cpp)    # M2: buffer / auto-step
   target_link_libraries(test_buffer PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_Buffer COMMAND test_buffer)
+
+  add_executable(test_occupancy tests/test_occupancy.cpp)  # M2.5: occupancy model
+  target_link_libraries(test_occupancy PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_Occupancy COMMAND test_occupancy)
 endif()
