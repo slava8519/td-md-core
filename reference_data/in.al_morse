@@ -1,0 +1,11 @@
+# Reproduce golden forces in LAMMPS (metal units)
+units metal
+atom_style atomic
+boundary p p p
+read_data al_fcc_72.data
+pair_style morse 4.0
+pair_coeff 1 1 0.29614 1.11892 3.29692
+pair_modify shift yes
+run 0
+dump d all custom 1 forces.dump id fx fy fz
+run 0

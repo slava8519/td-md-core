@@ -1,0 +1,32 @@
+{
+  "n_atoms": 72,
+  "lattice_const_A": 4.05,
+  "supercell": [
+    3,
+    3,
+    2
+  ],
+  "box_A": [
+    12.149999999999999,
+    12.149999999999999,
+    8.1
+  ],
+  "potential": "morse",
+  "D_eV": 0.29614,
+  "alpha_inv_A": 1.11892,
+  "r0_A": 3.29692,
+  "rcut_A": 4.0,
+  "pair_modify": "shift yes",
+  "mass_amu": 26.9815,
+  "pbc": [
+    true,
+    true,
+    true
+  ],
+  "seed": 42,
+  "displace_amp_A": 0.1,
+  "PE_total_eV": 14.728680388396365,
+  "max_abs_force_eV_per_A": 1.438090539204743,
+  "fd_check_max_err": 2.42583564347143e-10,
+  "units": "metal"
+}

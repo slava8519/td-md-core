@@ -1,0 +1,13 @@
+# Normalize line endings for text; treat source as text
+* text=auto
+
+# Binary assets (no line-ending munging, no textual diff)
+*.docx binary
+*.png  binary
+*.pdf  binary
+
+# Reference data: keep LF, treat as text so diffs stay reviewable
+*.data   text eol=lf
+*.xyz    text eol=lf
+*.csv    text eol=lf
+*.json   text eol=lf

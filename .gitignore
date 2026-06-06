@@ -1,0 +1,53 @@
+# === macOS ===
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# === Build artifacts (C++/CMake/CUDA) ===
+build/
+build-*/
+cmake-build-*/
+out/
+CMakeCache.txt
+CMakeFiles/
+CMakeUserPresets.json
+*.o
+*.obj
+*.so
+*.a
+*.dylib
+*.exe
+
+# === CUDA / profiling ===
+*.nsys-rep
+*.qdrep
+*.sqlite
+*.ptx
+*.cubin
+
+# === Python (reference_data generator) ===
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# === Engine run outputs ===
+*.lammpstrj
+rescue.xyz
+forces.dump
+log.lammps
+
+# === Editors / IDE ===
+.vscode/
+.idea/
+*.swp
+*~
+
+# === Misc ===
+*.log
+
+# === Local-only source (kept out of the repo for now) ===
+# Dissertation .docx is the local source of truth; not tracked.
+# Text extract source/time_decomposition.txt stays in the repo for grep.
+source/time_decomposition.docx
