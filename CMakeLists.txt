@@ -33,7 +33,8 @@ FetchContent_MakeAvailable(yaml-cpp)
 # --- core library (no external deps: pure C++20) ---
 add_library(tdmd_core
   src/io/reader_lammps.cpp
-  src/io/writer.cpp)
+  src/io/writer.cpp
+  src/io/rescue.cpp)
 target_include_directories(tdmd_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(tdmd_core PUBLIC
   TDMD_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
@@ -68,4 +69,8 @@ if(TDMD_BUILD_TESTS)
   add_executable(test_fsm tests/test_fsm.cpp)          # M1: zone FSM
   target_link_libraries(test_fsm PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_Zone_FSM COMMAND test_fsm)
+
+  add_executable(test_buffer tests/test_buffer.cpp)    # M2: buffer / auto-step
+  target_link_libraries(test_buffer PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_Buffer COMMAND test_buffer)
 endif()

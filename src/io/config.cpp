@@ -44,11 +44,23 @@ Config load_config(const std::string& path) {
   if (auto t = root["timestep"]) {
     if (t["mode"])       c.ts_mode = t["mode"].as<std::string>();
     if (t["dt_initial"]) c.dt      = t["dt_initial"].as<double>();
+    if (t["dt_max"])     c.dt_max  = t["dt_max"].as<double>();
+    if (t["C1"])         c.C1      = t["C1"].as<double>();
+    if (t["K2"])         c.K2      = t["K2"].as<double>();
+    if (t["C3"])         c.C3      = t["C3"].as<double>();
+    if (t["C_buf"])      c.C_buf   = t["C_buf"].as<double>();
+  }
+  if (auto d = root["decomposition"]) {
+    if (d["cell_size"]) c.cell_size = d["cell_size"].as<double>();
   }
   if (auto io = root["io"]) {
     if (auto tr = io["trajectory"]) {
       if (tr["file"])  c.traj_file  = tr["file"].as<std::string>();
       if (tr["every"]) c.traj_every = tr["every"].as<long>();
+    }
+    if (auto rs = io["rescue"]) {
+      if (rs["enabled"]) c.rescue_enabled = rs["enabled"].as<bool>();
+      if (rs["file"])    c.rescue_file    = rs["file"].as<std::string>();
     }
   }
 

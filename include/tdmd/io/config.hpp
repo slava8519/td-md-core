@@ -22,11 +22,16 @@ struct Config {
   bool   shift = true;
   double D = 0.29614, alpha = 1.11892, r0 = 3.29692;
   // timestep
-  std::string ts_mode = "fixed";
-  double dt = 0.005;  // ps
+  std::string ts_mode = "fixed";  // fixed | auto
+  double dt = 0.005;              // ps (dt_initial)
+  double dt_max = 0.02;          // ps
+  double C1 = 0.1, K2 = 50.0, C3 = 0.5, C_buf = 1.5;  // auto-step coeffs (M2)
+  double cell_size = 2.33;       // Å, spatial cell (decomposition.cell_size)
   // io
   std::string traj_file  = "traj.lammpstrj";
   long        traj_every = 50;
+  bool        rescue_enabled = true;
+  std::string rescue_file = "rescue.xyz";
 };
 
 // Loads and validates a config.yaml. Throws std::runtime_error on fatal problems.

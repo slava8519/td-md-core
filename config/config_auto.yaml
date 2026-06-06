@@ -1,0 +1,17 @@
+# === TD-MD Core — auto-step demo (M2) ===
+# Same physics as config_m0.yaml but with the automatic time step (Гл.3.3/3.5):
+# C1 (displacement, top priority), K2 (per-atom ΔT), C3 (change threshold),
+# plus the causality buffer R_buf = v_max·dt·C_buf (eq.33, INV-4).
+run: { steps: 300, ensemble: nve, seed: 1 }
+units: metal
+precision: { mode: deterministic_fp64 }
+geometry: { file: reference_data/al_fcc_72.data, format: lammps_data }
+boundary: { x: periodic, y: periodic, z: periodic }
+decomposition: { axis: z, mode: by_n_zones, n_zones: 1, cell_size: 2.33, ring: { backend: streams, n_nodes: 1 } }
+potential: { type: morse, r_cut: 4.0, shift: true, morse: { D: 0.29614, alpha: 1.11892, r0: 3.29692 } }
+timestep: { mode: auto, dt_initial: 0.005, dt_max: 0.02, C1: 0.1, K2: 50.0, C3: 0.5, C_buf: 1.5 }
+integrator: velocity_verlet
+io:
+  trajectory: { file: traj.lammpstrj, every: 50 }
+  rescue: { enabled: true, file: rescue.xyz }
+verify: { enabled: false, golden: reference_data/, tests: [test_0_step] }

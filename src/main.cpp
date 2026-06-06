@@ -8,7 +8,9 @@
 #include "tdmd/io/writer.hpp"
 #include "tdmd/core/soa.hpp"
 #include "tdmd/core/integrator.hpp"
+#include "tdmd/core/buffer.hpp"
 #include "tdmd/potentials/morse.hpp"
+#include "tdmd/io/rescue.hpp"
 #include "tdmd/units.hpp"
 
 using namespace tdmd;
@@ -44,6 +46,12 @@ int main(int argc, char** argv) {
   if (cfg.pot_type != "morse") {
     std::fprintf(stderr, "[fatal] M0 supports only potential: morse\n"); return 1;
   }
+  if (cfg.ts_mode == "auto" && cfg.C_buf < 1.0) {  // ConfigSchema invariant
+    std::fprintf(stderr,
+        "[fatal] timestep.C_buf=%g < 1.0 — buffer cannot guarantee causality\n",
+        cfg.C_buf);
+    return 1;
+  }
 
   core::AtomSoA<double> atoms;
   core::Box box;
@@ -75,26 +83,63 @@ int main(int argc, char** argv) {
   io::TrajectoryWriter writer(cfg.traj_file);
   if (cfg.traj_every > 0) writer.write_frame(0, atoms, box);
 
+  const bool auto_step = (cfg.ts_mode == "auto");
+  core::buffer::TimeStepCfg ts{cfg.C1, cfg.K2, cfg.C3, cfg.C_buf,
+                               cfg.cell_size, cfg.dt_max, 1e-6};
+  if (auto_step)
+    std::printf("auto-step    : C1=%g K2=%g C3=%g C_buf=%g cell=%g dt_max=%g\n",
+                ts.C1, ts.K2, ts.C3, ts.C_buf, ts.cell_size, ts.dt_max);
+
+  double dt = cfg.dt;
+  double v_max_prev = core::buffer::max_speed(atoms);  // local v_max (A8)
   double emin = e0, emax = e0;
   for (long step = 1; step <= cfg.steps; ++step) {
-    core::VelocityVerlet<double>::first_half(atoms, cfg.dt);
+    // Buffer for this step uses the previous pass's (conservative) v_max (A8).
+    const double R_buf = core::buffer::compute_R_buf(v_max_prev, dt, ts.C_buf);
+
+    core::VelocityVerlet<double>::first_half(atoms, dt);
     pe = morse.compute(atoms, box);
-    core::VelocityVerlet<double>::second_half(atoms, cfg.dt);
+    core::VelocityVerlet<double>::second_half(atoms, dt);
     ke = core::kinetic_energy(atoms);
+
     const double e = pe + ke;
     if (std::isnan(e) || std::isinf(e)) {
       std::fprintf(stderr, "[fatal] non-finite energy at step %ld\n", step);
       return 2;
     }
+
+    const double v_max_now = core::buffer::max_speed(atoms);
+    // INV-4: no atom may cross the buffer. step>1 skips the rest-start transient
+    // where the stale v_max (=0) would give a meaningless R_buf.
+    if (auto_step && step > 1 &&
+        !core::buffer::causality_ok(v_max_now, dt, R_buf)) {
+      std::fprintf(stderr,
+          "[HALT] causality (INV-4) at step %ld: v_max·dt=%.4g > R_buf=%.4g\n",
+          step, v_max_now * dt, R_buf);
+      if (cfg.rescue_enabled) {
+        io::write_rescue_xyz(cfg.rescue_file, atoms, box,
+                             "INV-4 causality violation");
+        std::fprintf(stderr, "[HALT] rescue dump: %s\n", cfg.rescue_file.c_str());
+      }
+      return 3;
+    }
+
     emin = std::min(emin, e);
     emax = std::max(emax, e);
     if (cfg.traj_every > 0 && step % cfg.traj_every == 0)
       writer.write_frame(step, atoms, box);
+
+    v_max_prev = v_max_now;
+    if (auto_step)
+      dt = core::buffer::auto_dt(v_max_now, dt, ts,
+                                 core::buffer::temperature_limited_dt(atoms, ts.K2));
   }
 
   const double drift = emax - emin;
   std::printf("after %ld    : E=%.10f  drift(max-min)=%.3e eV  rel=%.3e\n",
               cfg.steps, pe + ke, drift, drift / std::fabs(e0));
+  if (auto_step)
+    std::printf("final dt     : %.5g ps  (v_max=%.4g Å/ps)\n", dt, v_max_prev);
   std::printf("trajectory   : %s\n", cfg.traj_file.c_str());
   return 0;
 }
