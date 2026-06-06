@@ -64,4 +64,8 @@ if(TDMD_BUILD_TESTS)
   add_executable(test_nve_drift tests/test_nve_drift.cpp)
   target_link_libraries(test_nve_drift PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_NVE_Drift COMMAND test_nve_drift)
+
+  add_executable(test_fsm tests/test_fsm.cpp)          # M1: zone FSM
+  target_link_libraries(test_fsm PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_Zone_FSM COMMAND test_fsm)
 endif()
