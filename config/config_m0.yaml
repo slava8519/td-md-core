@@ -1,0 +1,13 @@
+# === TD-MD Core — minimal config for M0 walking skeleton ===
+# Schema: docs/TD_MD_Core_ConfigSchema_v1_0.md §4
+run: { steps: 100, ensemble: nve, seed: 1 }
+units: metal
+precision: { mode: deterministic_fp64 }
+geometry: { file: reference_data/al_fcc_72.data, format: lammps_data }
+boundary: { x: periodic, y: periodic, z: periodic }
+decomposition: { axis: z, mode: by_n_zones, n_zones: 1, ring: { backend: streams, n_nodes: 1 } }
+potential: { type: morse, r_cut: 4.0, shift: true, morse: { D: 0.29614, alpha: 1.11892, r0: 3.29692 } }
+timestep: { mode: fixed, dt_initial: 0.005 }
+integrator: velocity_verlet
+io: { trajectory: { file: traj.lammpstrj, every: 50 } }
+verify: { enabled: false, golden: reference_data/, tests: [test_0_step] }
