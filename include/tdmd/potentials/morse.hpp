@@ -18,6 +18,9 @@ template <typename Real>
 struct MorsePotential {
   double D = 0.29614, alpha = 1.11892, r0 = 3.29692, rcut = 4.0;
   bool   shift = true;
+  // min pair distance^2 seen by the last compute() — overlap-HALT probe (B10).
+  // Tracked over ALL pairs (also beyond rcut), so it is the true system minimum.
+  double last_min_r2 = 1e300;
 
   double energy_shift() const {
     if (!shift) return 0.0;
@@ -27,7 +30,7 @@ struct MorsePotential {
 
   // Fills a.f{x,y,z}; returns total potential energy (eV).
   // Deterministic accumulation order: outer i, inner j, locals -> store.
-  double compute(AtomSoA<Real>& a, const Box& box) const {
+  double compute(AtomSoA<Real>& a, const Box& box) {
     const double ush = energy_shift();
     const double rc2 = rcut * rcut;
     const double L[3] = {box.len(0), box.len(1), box.len(2)};
@@ -36,6 +39,7 @@ struct MorsePotential {
     std::fill(a.fz.begin(), a.fz.end(), 0.0);
 
     double pe = 0.0;
+    double min_r2 = 1e300;
     for (int i = 0; i < a.n; ++i) {
       double fxi = 0.0, fyi = 0.0, fzi = 0.0;
       for (int j = 0; j < a.n; ++j) {
@@ -47,6 +51,7 @@ struct MorsePotential {
         if (box.periodic[1]) dy -= L[1] * std::round(dy / L[1]);
         if (box.periodic[2]) dz -= L[2] * std::round(dz / L[2]);
         const double r2 = dx * dx + dy * dy + dz * dz;
+        min_r2 = std::min(min_r2, r2);
         if (r2 >= rc2 || r2 < 1e-18) continue;
         const double r   = std::sqrt(r2);
         const double ea  = std::exp(-alpha * (r - r0));
@@ -62,6 +67,7 @@ struct MorsePotential {
       a.fy[i] = fyi;
       a.fz[i] = fzi;
     }
+    last_min_r2 = min_r2;
     return pe;
   }
 };

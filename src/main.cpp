@@ -40,19 +40,8 @@ int main(int argc, char** argv) {
               cfg.pot_type.c_str(), cfg.rcut, cfg.shift ? "yes" : "no",
               cfg.D, cfg.alpha, cfg.r0);
 
-  // M0 scope guards
-  if (cfg.ensemble != "nve") {
-    std::fprintf(stderr, "[fatal] M0 supports only ensemble: nve\n"); return 1;
-  }
-  if (cfg.pot_type != "morse") {
-    std::fprintf(stderr, "[fatal] M0 supports only potential: morse\n"); return 1;
-  }
-  if (cfg.ts_mode == "auto" && cfg.C_buf < 1.0) {  // ConfigSchema invariant
-    std::fprintf(stderr,
-        "[fatal] timestep.C_buf=%g < 1.0 — buffer cannot guarantee causality\n",
-        cfg.C_buf);
-    return 1;
-  }
+  // enum/range guards (ensemble, potential, C_buf>=1, ...) live in load_config
+  // since B10 — a Config that reaches this point is valid.
 
   core::AtomSoA<double> atoms;
   core::Box box;
@@ -91,7 +80,28 @@ int main(int argc, char** argv) {
 
   potentials::MorsePotential<double> morse{cfg.D, cfg.alpha, cfg.r0, cfg.rcut, cfg.shift};
 
+  // B10: overlap HALT. 0.5 Å is far inside any physical Al–Al approach (Morse
+  // wall at 1.5 Å is already ~32 eV/Å); doubles as the guard that keeps forces
+  // inside the int64 Q24.40 accumulator range (B1).
+  constexpr double kRMinHalt = 0.5;  // Å
+  auto overlap_halt = [&](long step) -> bool {
+    if (morse.last_min_r2 >= kRMinHalt * kRMinHalt) return false;
+    std::fprintf(stderr,
+                 "[HALT] atom overlap at step %ld: min pair distance %.4g Å < %.2g Å\n",
+                 step, std::sqrt(morse.last_min_r2), kRMinHalt);
+    if (cfg.rescue_enabled) {
+      char reason[128];
+      std::snprintf(reason, sizeof(reason),
+                    "atom overlap step=%ld min_r=%.6g A", step,
+                    std::sqrt(morse.last_min_r2));
+      io::write_rescue_xyz(cfg.rescue_file, atoms, box, reason);
+      std::fprintf(stderr, "[HALT] rescue dump: %s\n", cfg.rescue_file.c_str());
+    }
+    return true;
+  };
+
   double pe = morse.compute(atoms, box);
+  if (overlap_halt(0)) return 4;
   double ke = core::kinetic_energy(atoms);
   const double e0 = pe + ke;
   std::printf("step 0       : PE=%.10f  KE=%.10f  E=%.10f eV\n", pe, ke, e0);
@@ -115,6 +125,7 @@ int main(int argc, char** argv) {
 
     core::VelocityVerlet<double>::first_half(atoms, dt);
     pe = morse.compute(atoms, box);
+    if (overlap_halt(step)) return 4;
     core::VelocityVerlet<double>::second_half(atoms, dt);
     ke = core::kinetic_energy(atoms);
 

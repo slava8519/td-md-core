@@ -56,9 +56,16 @@ target_compile_definitions(tdmd_core PUBLIC
 target_compile_options(tdmd_core PUBLIC -ffp-contract=off)
 target_compile_options(tdmd_core PRIVATE -Wall -Wextra)
 
-# --- engine executable (config parser pulls yaml-cpp) ---
-add_executable(tdmd src/main.cpp src/io/config.cpp)
-target_link_libraries(tdmd PRIVATE tdmd_core yaml-cpp)
+# --- config library (B10: separate target so it is unit-testable; keeps
+#     tdmd_core and the golden-data tests YAML-free) ---
+add_library(tdmd_config src/io/config.cpp)
+target_include_directories(tdmd_config PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_link_libraries(tdmd_config PUBLIC yaml-cpp)
+target_compile_options(tdmd_config PRIVATE -Wall -Wextra)
+
+# --- engine executable ---
+add_executable(tdmd src/main.cpp)
+target_link_libraries(tdmd PRIVATE tdmd_core tdmd_config)
 target_compile_options(tdmd PRIVATE -Wall -Wextra)
 
 # --- M2.5 Tier-1 occupancy probe (CUDA-free analytical tool) ---
@@ -104,6 +111,14 @@ if(TDMD_BUILD_TESTS)
   add_executable(test_thermal tests/test_thermal.cpp)      # M2.6: Maxwell init
   target_link_libraries(test_thermal PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_Thermal COMMAND test_thermal)
+
+  add_executable(test_config tests/test_config.cpp)        # M3/B10: strict config
+  target_link_libraries(test_config PRIVATE tdmd_config tdmd_core GTest::gtest_main)
+  add_test(NAME Test_Config COMMAND test_config)
+
+  add_executable(test_reader tests/test_reader.cpp)        # M3/B10: reader hardening
+  target_link_libraries(test_reader PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_Reader COMMAND test_reader)
 
   if(TDMD_WITH_CUDA)                                       # M2.7: toolchain smoke
     add_executable(test_cuda_smoke tests/test_cuda_smoke.cu)

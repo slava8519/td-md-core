@@ -28,7 +28,9 @@ void TrajectoryWriter::write_frame(long timestep,
   f << "ITEM: NUMBER OF ATOMS\n" << a.n << "\n";
   f << "ITEM: BOX BOUNDS " << bb << "\n";
   for (int d = 0; d < 3; ++d) f << box.lo[d] << ' ' << box.hi[d] << "\n";
-  f << "ITEM: ATOMS id type x y z\n";
+  // xu yu zu: global coordinates are never wrapped back into the box (B10) —
+  // 'x y z' would make OVITO/LAMMPS treat them as wrapped and mis-render PBC.
+  f << "ITEM: ATOMS id type xu yu zu\n";
   for (int i = 0; i < a.n; ++i)
     f << (i + 1) << ' ' << a.type[i] << ' '
       << a.x[i] << ' ' << a.y[i] << ' ' << a.z[i] << "\n";
