@@ -21,9 +21,14 @@ units: metal                # фиксировано; смена единиц з
 precision:
   mode: production_mixed     # production_mixed | deterministic_fp64
   real_type: fp32            # тип расчёта сил при production_mixed
-  # накопление сил всегда фикс-точечное int64 (B1/INV-9): целочисленное сложение
-  # ассоциативно => порядок потоков не влияет; FP64-atomicAdd — только референс.
-  # Дефолт движка до появления mixed-пути (M4) — deterministic_fp64.
+  # Договорное определение production_mixed (= индустриальный "mixed" LAMMPS/HOOMD,
+  # см. _meta/MIXED_PRECISION_BESTPRACTICES_2026-06-11.md): координаты — FP64;
+  # расчёт парной силы — real_type (FP32); накопление сил/энергии/вириала —
+  # фикс-точечное int64 (B1/INV-9: целое ассоциативно => порядок потоков не влияет);
+  # интегрирование — FP64. Формат: силы Q24.40 (scale 2^40 на эВ/Å), энергия/вириал
+  # Q34.30-аналог (scale 2^30). FP64-atomicAdd — только референс сверки (наш B1 ≡
+  # AMBER SPFP). Дефолт движка до появления mixed-пути (M4) — deterministic_fp64
+  # (временно: на consumer-Blackwell FP64 1:66, в production он не для горячего пути).
 
 geometry:
   file: reference_data/al_fcc_72.data
