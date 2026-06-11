@@ -11,6 +11,7 @@ struct Config {
   long        steps    = 100;
   std::string ensemble = "nve";
   long        seed     = 1;
+  double      init_temperature = 0.0;  // K; >0 — Maxwell init from seed (M2.6/B8)
   std::string precision_mode = "deterministic_fp64";
   // geometry
   std::string geom_file;

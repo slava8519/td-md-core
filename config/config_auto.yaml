@@ -2,7 +2,9 @@
 # Same physics as config_m0.yaml but with the automatic time step (Гл.3.3/3.5):
 # C1 (displacement, top priority), K2 (per-atom ΔT), C3 (change threshold),
 # plus the causality buffer R_buf = v_max·dt·C_buf (eq.33, INV-4).
-run: { steps: 300, ensemble: nve, seed: 1 }
+# init_temperature > 0 (M2.6/B8): Maxwell start from seed — thermal regime
+# actually exercises K2 and the causality buffer (дисс. §3.5 тестирует до 600 K).
+run: { steps: 300, ensemble: nve, seed: 1, init_temperature: 300.0 }
 units: metal
 precision: { mode: deterministic_fp64 }
 geometry: { file: reference_data/al_fcc_72.data, format: lammps_data }

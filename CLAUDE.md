@@ -42,10 +42,11 @@ C++20, CUDA NVCC через слой HAL (без Kokkos), MPI, CMake, Google Tes
 - VerifyLab/liblammps — опционально за CMake-флагом `-DWITH_LAMMPS=ON`; не делать жёсткой зависимостью CI.
 
 ## Текущий статус (2026-06-11)
-Выполнены вехи **M0–M2.5** (критерии приёмки зелёные, см. `Roadmap`):
+Выполнены вехи **M0–M2.6** (критерии приёмки зелёные, см. `Roadmap`):
 - **M0** — walking skeleton: CPU, O(N²) Морзе, velocity-Verlet NVE, `Test_0_Step` (силы ≤1e-6 эВ/Å vs golden) + `Test_NVE_Drift`.
 - **M1** — `ZoneFSM` (чистая логика): таблица переходов, INV-3, seed S₁, чёт/нечёт I/O-порядок; `Test_Zone_FSM`.
 - **M2** — буфер причинности (ур. 33) + авто-шаг C1/K2/C3 + HALT/rescue; `Test_Buffer`.
 - **M2.5** — аналитический occupancy-зонд (Tier-1, без CUDA): отчёт `docs/_meta/occupancy_probe_2026-06-06.md`; вывод — одиночная тонкая зона недогружает GPU, нужен батчинг ~зон/стрим; `Test_Occupancy`.
+- **M2.6** — тепловая инициализация (B8): `tdmd/core/thermal.hpp` (SplitMix64+Бокс—Мюллер — собственный ГПСЧ ради побитовой воспроизводимости, обнуление импульса ЦМ, точный рескейл к T на 3N−3); чтение `Velocities` в ридере; `run.init_temperature` в конфиге; `Test_Thermal` + NVE-дрейф/импульс при 300 K. T(0) точно, |p|≤2e-13, прогоны с одним seed побитово идентичны.
 
-**Следующая веха — M2.6** (тепловая инициализация: Maxwell по `seed`, чтение Velocities, тест импульса), затем M3 (clustering, Tier-split) → M3.5 (TimeConveyor-CPU) → M4 (порт на CUDA). План пересмотрен по второму арх-ревью: `docs/_meta/ARCH_ROADMAP_REVIEW_2026-06-11.md` (B1 фикс-точечное накопление, B2 Δt-handoff, B3 PBC-замыкание, B4 k шагов/узел). Переход к следующей вехе — только после зелёного критерия приёмки текущей (`Roadmap`). Сборка: `cmake -S . -B build -G Ninja && cmake --build build && ctest --test-dir build` (5 тестов).
+**Следующая веха — M3** (warp-aligned clustering, Z-order сортировка, список пар кластеров со skin, уход от O(N²); попутно B10 — строгая валидация конфига, юнит-тесты `config`/`reader_lammps`), затем M3.5 (TimeConveyor-CPU) → M4 (порт на CUDA). План пересмотрен по второму арх-ревью: `docs/_meta/ARCH_ROADMAP_REVIEW_2026-06-11.md` (B1 фикс-точечное накопление, B2 Δt-handoff, B3 PBC-замыкание, B4 k шагов/узел). Переход к следующей вехе — только после зелёного критерия приёмки текущей (`Roadmap`). Сборка: `cmake -S . -B build -G Ninja && cmake --build build && ctest --test-dir build` (6 тестов).

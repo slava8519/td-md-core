@@ -82,4 +82,8 @@ if(TDMD_BUILD_TESTS)
   add_executable(test_occupancy tests/test_occupancy.cpp)  # M2.5: occupancy model
   target_link_libraries(test_occupancy PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_Occupancy COMMAND test_occupancy)
+
+  add_executable(test_thermal tests/test_thermal.cpp)      # M2.6: Maxwell init
+  target_link_libraries(test_thermal PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_Thermal COMMAND test_thermal)
 endif()

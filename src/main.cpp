@@ -9,6 +9,7 @@
 #include "tdmd/core/soa.hpp"
 #include "tdmd/core/integrator.hpp"
 #include "tdmd/core/buffer.hpp"
+#include "tdmd/core/thermal.hpp"
 #include "tdmd/potentials/morse.hpp"
 #include "tdmd/io/rescue.hpp"
 #include "tdmd/units.hpp"
@@ -71,6 +72,21 @@ int main(int argc, char** argv) {
                  "[fatal] r_cut=%g > half min box edge %g — min-image invalid\n",
                  cfg.rcut, 0.5 * min_edge);
     return 1;
+  }
+
+  // M2.6 (B8): init_temperature > 0 — Maxwell velocities from run.seed
+  // (overrides any Velocities from the data file); 0 — keep file velocities.
+  if (cfg.init_temperature > 0.0) {
+    core::thermal::maxwell_init(atoms, cfg.init_temperature,
+                                static_cast<uint64_t>(cfg.seed));
+  }
+  {
+    const double T0 =
+        core::thermal::temperature(atoms, core::thermal::dof_thermal(atoms.n));
+    const auto p = core::thermal::momentum(atoms);
+    std::printf("thermal init : %s  T(0)=%.4f K  |p|=(%.3e %.3e %.3e) amu·Å/ps\n",
+                cfg.init_temperature > 0.0 ? "maxwell(seed)" : "from data file",
+                T0, p[0], p[1], p[2]);
   }
 
   potentials::MorsePotential<double> morse{cfg.D, cfg.alpha, cfg.r0, cfg.rcut, cfg.shift};

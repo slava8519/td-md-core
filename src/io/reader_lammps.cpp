@@ -30,6 +30,7 @@ bool read_lammps_data(const std::string& path,
   std::map<int, double> type_mass;
   std::vector<int> ids, types;
   std::vector<std::array<double, 3>> pos;
+  std::map<int, std::array<double, 3>> vel;  // id -> velocity (Å/ps), M2.6/B8
 
   std::getline(f, line);  // first line: title/comment
 
@@ -60,8 +61,11 @@ bool read_lammps_data(const std::string& path,
         types.push_back(std::stoi(t[1]));
         pos.push_back({std::stod(t[2]), std::stod(t[3]), std::stod(t[4])});
       }
+    } else if (mode == VELOCITIES) {
+      // id vx vy vz (metal units: Å/ps)
+      if (t.size() >= 4)
+        vel[std::stoi(t[0])] = {std::stod(t[1]), std::stod(t[2]), std::stod(t[3])};
     }
-    // VELOCITIES ignored for M0 (golden data has none)
   }
 
   if (natoms == 0 || static_cast<int>(pos.size()) != natoms) return false;
@@ -81,6 +85,12 @@ bool read_lammps_data(const std::string& path,
     atoms.type[k] = types[s];
     auto it = type_mass.find(types[s]);
     atoms.mass[k] = (it != type_mass.end()) ? it->second : 0.0;
+    auto vit = vel.find(ids[s]);
+    if (vit != vel.end()) {
+      atoms.vx[k] = vit->second[0];
+      atoms.vy[k] = vit->second[1];
+      atoms.vz[k] = vit->second[2];
+    }
   }
   return true;
 }

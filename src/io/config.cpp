@@ -18,6 +18,8 @@ Config load_config(const std::string& path) {
     if (run["steps"])    c.steps    = run["steps"].as<long>();
     if (run["ensemble"]) c.ensemble = run["ensemble"].as<std::string>();
     if (run["seed"])     c.seed     = run["seed"].as<long>();
+    if (run["init_temperature"])
+      c.init_temperature = run["init_temperature"].as<double>();
   }
   if (auto pr = root["precision"]) {
     if (pr["mode"]) c.precision_mode = pr["mode"].as<std::string>();
