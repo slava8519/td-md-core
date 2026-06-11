@@ -1,5 +1,5 @@
 # СХЕМА КОНФИГУРАЦИИ `config.yaml`
-## TD-MD Core · v1.0 · 2026-06-05
+## TD-MD Core · v1.0 · 2026-06-05 · ревизия 2026-06-11 (B-ревью: `init_temperature`, `steps_per_node`, `neighbor.skin`, формат rescue)
 
 Единая точка задания всех параметров запуска. Движок обязан валидировать конфиг до старта и печатать предстартовый чек-лист. Все величины — в системе `metal` (см. `TD_MD_Core_Units_v1_0.md`).
 
@@ -13,6 +13,8 @@ run:
   steps: 50000              # число шагов интегрирования
   ensemble: nve             # v1: только nve (NVT/NPT — backlog)
   seed: 20070101            # глобальный seed для всех ГПСЧ (повторяемость)
+  init_temperature: 300.0   # K; >0 — максвелловская инициализация скоростей от seed
+                            # (импульс ЦМ обнуляется); 0 — скорости из Velocities/нулевые (M2.6)
 
 units: metal                # фиксировано; смена единиц запрещена
 
@@ -39,7 +41,13 @@ decomposition:
   ring:
     backend: streams         # streams (1 GPU, эмуляция) | multi_gpu
     n_nodes: 4               # узлов кольца = одновременно считаемых шагов
+    steps_per_node: 1        # k шагов на узел (Гл. 3.4, ур. 49–51): трафик ↓ в k раз,
+                             # до k зон в полёте на узле — рычаг occupancy multi-GPU (B4)
     transport: auto          # auto | memcpy | p2p | mpi
+
+neighbor:
+  skin: 1.0                  # Å; слой валидности списка пар кластеров (аналог таблиц
+                             # Варлета, R_k−R_max); перестройка по накопленному смещению (M3)
 
 potential:
   type: morse                # morse | eam | fs | meam | ml
@@ -63,7 +71,8 @@ integrator: velocity_verlet  # фиксировано (Гл.1.2)
 io:
   trajectory: { file: traj.lammpstrj, every: 1000, format: lammpstrj }
   telemetry:  { every: 100 }                  # дашборд/лог
-  rescue:     { enabled: true, file: rescue.xyz }
+  rescue:     { enabled: true, file: rescue.xyz }   # расширенный XYZ: x y z vx vy vz
+                                                    # + step/dt в комментарии (рестарт-пригодный, B9)
   async: true                                 # I/O в фоновом CPU-потоке
 
 verify:
@@ -91,6 +100,11 @@ logging:
 | `potential.r_cut` | float ≤ ½·мин. ребро бокса | для min-image при PBC |
 | `timestep.C1` | 0<C1≤1 | приоритетный лимит (Гл.3.3) |
 | `timestep.C_buf` | ≥ 1.0 | иначе буфер не гарантирует причинность |
+| `timestep.mode` | enum: auto/fixed | неизвестное значение ⇒ **fatal** (не молчаливый fixed) |
+| `decomposition.ring.steps_per_node` | int ≥ 1 | k шагов на узел (Гл. 3.4) |
+| `decomposition.ring.n_nodes` vs $P_{op}$ | n_nodes ≤ s/s_min | предупреждение, если узлов больше полезного максимума (ур. 44–45) |
+| `neighbor.skin` | float > 0 | слой списка пар; кадрность перестройки из C1-оценки |
+| неизвестные ключи | — | warning с именем ключа (защита от опечаток) |
 | `verify.enabled` | bool | true требует `-DWITH_LAMMPS=ON` |
 
 ---

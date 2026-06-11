@@ -117,8 +117,10 @@ int main(int argc, char** argv) {
           "[HALT] causality (INV-4) at step %ld: v_max·dt=%.4g > R_buf=%.4g\n",
           step, v_max_now * dt, R_buf);
       if (cfg.rescue_enabled) {
-        io::write_rescue_xyz(cfg.rescue_file, atoms, box,
-                             "INV-4 causality violation");
+        char reason[128];
+        std::snprintf(reason, sizeof(reason),
+                      "INV-4 causality violation step=%ld dt=%.17g", step, dt);
+        io::write_rescue_xyz(cfg.rescue_file, atoms, box, reason);
         std::fprintf(stderr, "[HALT] rescue dump: %s\n", cfg.rescue_file.c_str());
       }
       return 3;

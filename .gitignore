@@ -51,3 +51,6 @@ log.lammps
 # Dissertation .docx is the local source of truth; not tracked.
 # Text extract source/time_decomposition.txt stays in the repo for grep.
 source/time_decomposition.docx
+
+# === Claude Code local settings ===
+.claude/
