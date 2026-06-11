@@ -26,5 +26,5 @@ jobs:
       - name: Build
         run: cmake --build build
 
-      - name: Test (5 milestone tests, M0–M2.5)
+      - name: Test (milestone tests; GPU-labeled tests run via scripts/gpu_gate.sh locally)
         run: ctest --test-dir build --output-on-failure

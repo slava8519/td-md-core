@@ -14,6 +14,19 @@ if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
 endif()
 
 option(TDMD_BUILD_TESTS "Build unit tests (Test_0_Step, NVE drift)" ON)
+# M2.7 GPU bring-up: devprobe + CUDA smoke test. OFF by default — the CPU build
+# and cloud CI must not require a CUDA toolkit. GPU tests carry the `cuda` ctest
+# label and are gated locally via scripts/gpu_gate.sh (compute-sanitizer).
+option(TDMD_WITH_CUDA "Build CUDA components (tools/devprobe, Test_CUDA_Smoke)" OFF)
+
+if(TDMD_WITH_CUDA)
+  # 120-real: SASS for the RTX 5080 dev box, no PTX (bare "120" would embed PTX
+  # that does NOT JIT on datacenter sm_100 — for clusters list archs explicitly).
+  if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
+    set(CMAKE_CUDA_ARCHITECTURES 120-real)
+  endif()
+  enable_language(CUDA)
+endif()
 
 include(FetchContent)
 # Old deps (yaml-cpp 0.8.0) declare a pre-3.5 minimum; allow them under CMake 4.x.
@@ -53,6 +66,11 @@ add_executable(occupancy_probe src/probe/occupancy_probe.cpp)
 target_include_directories(occupancy_probe PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(occupancy_probe PRIVATE -Wall -Wextra)
 
+# --- M2.7 GPU bring-up: device probe (Tier-2 of the occupancy model) ---
+if(TDMD_WITH_CUDA)
+  add_executable(devprobe tools/devprobe.cu)
+endif()
+
 # --- tests (do NOT depend on yaml-cpp; golden-data driven, no LAMMPS) ---
 if(TDMD_BUILD_TESTS)
   enable_testing()
@@ -86,4 +104,11 @@ if(TDMD_BUILD_TESTS)
   add_executable(test_thermal tests/test_thermal.cpp)      # M2.6: Maxwell init
   target_link_libraries(test_thermal PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_Thermal COMMAND test_thermal)
+
+  if(TDMD_WITH_CUDA)                                       # M2.7: toolchain smoke
+    add_executable(test_cuda_smoke tests/test_cuda_smoke.cu)
+    target_link_libraries(test_cuda_smoke PRIVATE GTest::gtest_main)
+    add_test(NAME Test_CUDA_Smoke COMMAND test_cuda_smoke)
+    set_tests_properties(Test_CUDA_Smoke PROPERTIES LABELS cuda)
+  endif()
 endif()
