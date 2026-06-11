@@ -12,14 +12,15 @@ namespace tdmd::core {
 
 struct ZoneFSM {
   // Each state allows exactly one event; each event maps from exactly one state
-  // (the canonical cycle c→d→w→p→o→c). Any other (state,event) is forbidden.
+  // (the canonical cycle o→d→w→c→p→o, letters per dissertation Гл.2.1).
+  // Any other (state,event) is forbidden.
   static constexpr bool allowed(ZoneType from, ZoneEvent e) {
     switch (from) {
-      case ZoneType::c: return e == ZoneEvent::RECV;
+      case ZoneType::o: return e == ZoneEvent::RECV;
       case ZoneType::d: return e == ZoneEvent::SPHERE;
       case ZoneType::w: return e == ZoneEvent::START;
-      case ZoneType::p: return e == ZoneEvent::END;
-      case ZoneType::o: return e == ZoneEvent::SEND;
+      case ZoneType::c: return e == ZoneEvent::END;
+      case ZoneType::p: return e == ZoneEvent::SEND;
     }
     return false;
   }
@@ -31,15 +32,15 @@ struct ZoneFSM {
     switch (e) {
       case ZoneEvent::RECV:   return ZoneType::d;
       case ZoneEvent::SPHERE: return ZoneType::w;
-      case ZoneEvent::START:  return ZoneType::p;
-      case ZoneEvent::END:    return ZoneType::o;
-      case ZoneEvent::SEND:   return ZoneType::c;
+      case ZoneEvent::START:  return ZoneType::c;
+      case ZoneEvent::END:    return ZoneType::p;
+      case ZoneEvent::SEND:   return ZoneType::o;
     }
     throw std::logic_error("ZoneFSM::next — unknown event");
   }
 
   // Applies a transition to a zone and maintains INV-3 (force_complete == true
-  // iff type == o) and the contribution mask. Throws on a forbidden transition.
+  // iff type == p) and the contribution mask. Throws on a forbidden transition.
   static void apply(Zone& z, ZoneEvent e) {
     z.type = next(z.type, e);  // throws if not allowed
     switch (e) {
@@ -54,10 +55,10 @@ struct ZoneFSM {
 
 // --- start-up / scheduling helpers (ZoneFSM §7), still pure logic ---
 
-// Initial zone type at t0 (§7.3): node P1 starts with data (d), the rest free (c).
+// Initial zone type at t0 (§7.3): node P1 starts with data (d), the rest free (o).
 // node_id is 1-based (P1..Pz).
 inline ZoneType initial_zone_type(int node_id) {
-  return (node_id == 1) ? ZoneType::d : ZoneType::c;
+  return (node_id == 1) ? ZoneType::d : ZoneType::o;
 }
 
 // First zone S1 has no predecessor, so it receives an artificial SPHERE seed

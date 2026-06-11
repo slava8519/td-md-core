@@ -76,11 +76,11 @@ struct AtomSoA {                             // строго SoA (ТЗ §4)
   int     n;
 };
 
-enum class ZoneType { c, d, w, p, o };       // см. ZoneFSM §2
+enum class ZoneType { o, d, w, c, p };       // см. ZoneFSM §2 (буквы по диссертации)
 
 struct Zone {
   int id, step_h, n_atoms;
-  ZoneType type = ZoneType::c;
+  ZoneType type = ZoneType::o;   // свободна
   double left_bound_glob;                    // граница зоны (для offsets)
   bool   force_complete = false;            // INV-3
   uint32_t contrib_mask = 0;                // вклады соседей
