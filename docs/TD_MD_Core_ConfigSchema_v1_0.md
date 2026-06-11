@@ -21,7 +21,9 @@ units: metal                # фиксировано; смена единиц з
 precision:
   mode: production_mixed     # production_mixed | deterministic_fp64
   real_type: fp32            # тип расчёта сил при production_mixed
-  # accumulation всегда fp64 с фиксированным порядком (INV-9)
+  # накопление сил всегда фикс-точечное int64 (B1/INV-9): целочисленное сложение
+  # ассоциативно => порядок потоков не влияет; FP64-atomicAdd — только референс.
+  # Дефолт движка до появления mixed-пути (M4) — deterministic_fp64.
 
 geometry:
   file: reference_data/al_fcc_72.data

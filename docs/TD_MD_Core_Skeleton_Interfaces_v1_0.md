@@ -43,8 +43,14 @@ namespace tdmd::hal {
   void   wait  (Stream, Event);              // консьюмер перед CALC_START (INV-2)
   void   memcpy_async(void* dst, const void* src, size_t n, Stream);
 
-  // детерминированное накопление силы (INV-9): fp64 atomicAdd с фикс. порядком
-  __device__ void accumulate(double* dst, double val);
+  // детерминированное накопление силы (INV-9, реализация B1 — см. ZoneFSM §8):
+  // фикс-точечное int64 — целочисленное сложение ассоциативно, результат не
+  // зависит от порядка потоков/блоков. Масштаб ~2^40 отсчётов на эВ/Å (запас
+  // >8000x по диапазону для сил Al/Морзе). Аппаратный atomicAdd(double) имеет
+  // НЕфиксированный порядок (и на consumer-Blackwell измеренно ~38x медленнее
+  // целочисленного) — допустим только как референс сверки, не основной путь.
+  template<typename Real>
+  __device__ void accumulate(long long* dst, Real val, Real scale);
 
   // макросы переносимости: HAL_SHARED_MEMORY, HAL_SYNC_THREADS, HAL_ATOMIC
 }
@@ -72,8 +78,8 @@ struct AtomSoA {                             // строго SoA (ТЗ §4)
   double *x, *y, *z;                         // глобальные координаты FP64
   Real   *xo, *yo, *zo;                      // локальные offsets FP32 от границы зоны
   Real   *vx, *vy, *vz;
-  double *fx, *fy, *fz;                      // накопление сил FP64
-  int     n;
+  long long *fx_acc, *fy_acc, *fz_acc;       // накопление сил: int64 фикс-точка (B1/INV-9)
+  int     n;                                 // (конвертация в Real — на выходе редукции)
 };
 
 enum class ZoneType { o, d, w, c, p };       // см. ZoneFSM §2 (буквы по диссертации)
