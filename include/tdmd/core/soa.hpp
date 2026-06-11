@@ -1,6 +1,7 @@
 #pragma once
 #include <vector>
 #include <array>
+#include <algorithm>
 
 // SoA atom container and simulation box (ТЗ §4: strict SoA; global coords FP64,
 // force accumulation FP64 for determinism INV-9). Kept template<typename Real>
@@ -31,5 +32,16 @@ struct AtomSoA {
     type.assign(N, 0); mass.assign(N, 0.0);
   }
 };
+
+// Force buffers are zeroed by the CALLER, not inside potential::compute (M3
+// split): the w-mechanism of zones accumulates partial contributions from
+// several compute passes into one buffer (INV-3/INV-8), so zeroing is loop
+// policy, not potential policy.
+template <typename Real>
+void zero_forces(AtomSoA<Real>& a) {
+  std::fill(a.fx.begin(), a.fx.end(), 0.0);
+  std::fill(a.fy.begin(), a.fy.end(), 0.0);
+  std::fill(a.fz.begin(), a.fz.end(), 0.0);
+}
 
 } // namespace tdmd::core

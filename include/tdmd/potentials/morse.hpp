@@ -1,14 +1,21 @@
 #pragma once
 #include <cmath>
 #include <algorithm>
-#include "tdmd/core/soa.hpp"
 
-// Pair Morse potential with minimum-image PBC and optional energy shift at rcut.
-// Naive O(N^2) over the whole system (M0 scope — no neighbour lists, no zones).
-// Reproduces reference_data/generate_reference.py exactly:
-//   U(r) = D*(e^{-2a(r-r0)} - 2 e^{-a(r-r0)}) - Ushift,   r < rcut
-//   F_i  = sum_j (-dU/dr) * (r_i - r_j)/r
-// Params from dissertation Гл.3.5 (см. reference_data/README.md).
+#include "tdmd/core/soa.hpp"
+#include "tdmd/potentials/pair_morse.hpp"
+
+// Reference O(N²) driver over the pair_morse functor (single source of pair
+// math — see pair_morse.hpp), with minimum-image PBC and optional energy shift
+// at rcut. This driver is the FP64 oracle for the M3 clustered path
+// (cross test: clustered ≡ O(N²) to <=1e-12).
+// Reproduces reference_data/generate_reference.py exactly.
+//
+// CONTRACT (M3 split): compute() ACCUMULATES into a.f{x,y,z} — the caller
+// zeroes via core::zero_forces() (zone w-mechanism stacks several partial
+// passes into one buffer, INV-3/INV-8). Driver math stays FP64 regardless of
+// Real — it is the deterministic reference; the Real-typed fast path arrives
+// with the clustered driver.
 namespace tdmd::potentials {
 
 using tdmd::core::AtomSoA;
@@ -24,19 +31,18 @@ struct MorsePotential {
 
   double energy_shift() const {
     if (!shift) return 0.0;
-    return D * (std::exp(-2 * alpha * (rcut - r0)) -
-                2 * std::exp(-alpha * (rcut - r0)));
+    double u, f_over_r;
+    pair_morse<double>(rcut, {D, alpha, r0}, u, f_over_r);
+    return u;
   }
 
-  // Fills a.f{x,y,z}; returns total potential energy (eV).
+  // Accumulates into a.f{x,y,z}; returns total potential energy (eV).
   // Deterministic accumulation order: outer i, inner j, locals -> store.
   double compute(AtomSoA<Real>& a, const Box& box) {
+    const MorseParams<double> prm{D, alpha, r0};
     const double ush = energy_shift();
     const double rc2 = rcut * rcut;
     const double L[3] = {box.len(0), box.len(1), box.len(2)};
-    std::fill(a.fx.begin(), a.fx.end(), 0.0);
-    std::fill(a.fy.begin(), a.fy.end(), 0.0);
-    std::fill(a.fz.begin(), a.fz.end(), 0.0);
 
     double pe = 0.0;
     double min_r2 = 1e300;
@@ -53,19 +59,16 @@ struct MorsePotential {
         const double r2 = dx * dx + dy * dy + dz * dz;
         min_r2 = std::min(min_r2, r2);
         if (r2 >= rc2 || r2 < 1e-18) continue;
-        const double r   = std::sqrt(r2);
-        const double ea  = std::exp(-alpha * (r - r0));
-        const double e2a = ea * ea;
-        pe += 0.5 * (D * (e2a - 2 * ea) - ush);  // pair counted twice over i,j
-        const double fmag  = 2 * alpha * D * (e2a - ea);  // = -dU/dr
-        const double inv_r = 1.0 / r;
-        fxi += fmag * inv_r * dx;
-        fyi += fmag * inv_r * dy;
-        fzi += fmag * inv_r * dz;
+        double u, f_over_r;
+        pair_morse<double>(std::sqrt(r2), prm, u, f_over_r);
+        pe += 0.5 * (u - ush);  // pair counted twice over i,j
+        fxi += f_over_r * dx;
+        fyi += f_over_r * dy;
+        fzi += f_over_r * dz;
       }
-      a.fx[i] = fxi;
-      a.fy[i] = fyi;
-      a.fz[i] = fzi;
+      a.fx[i] += fxi;
+      a.fy[i] += fyi;
+      a.fz[i] += fzi;
     }
     last_min_r2 = min_r2;
     return pe;

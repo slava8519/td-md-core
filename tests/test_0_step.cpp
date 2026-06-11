@@ -31,6 +31,7 @@ TEST(Test0Step, MorseForcesMatchGolden) {
   ASSERT_EQ(atoms.n, 72);
 
   potentials::MorsePotential<double> morse;  // defaults = dissertation params
+  core::zero_forces(atoms);
   const double pe = morse.compute(atoms, box);
   EXPECT_NEAR(pe, 14.7286803884, 1e-6);  // golden PE_total (eV)
 

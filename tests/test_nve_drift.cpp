@@ -29,6 +29,7 @@ TEST(NveDrift, EnergyConservedNoNaN) {
       project_root() + "/reference_data/al_fcc_72.data", atoms, box));
 
   potentials::MorsePotential<double> morse;
+  core::zero_forces(atoms);
   double pe = morse.compute(atoms, box);
   const double e0 = pe + core::kinetic_energy(atoms);
 
@@ -39,6 +40,7 @@ TEST(NveDrift, EnergyConservedNoNaN) {
   double emin = e0, emax = e0;
   for (int s = 0; s < steps; ++s) {
     core::VelocityVerlet<double>::first_half(atoms, dt);
+    core::zero_forces(atoms);
     pe = morse.compute(atoms, box);
     core::VelocityVerlet<double>::second_half(atoms, dt);
     const double e = pe + core::kinetic_energy(atoms);
@@ -69,6 +71,7 @@ TEST(NveDrift, EnergyAndMomentumConservedAt300K) {
               T, 1e-9);
 
   potentials::MorsePotential<double> morse;
+  core::zero_forces(atoms);
   double pe = morse.compute(atoms, box);
   const double e0 = pe + core::kinetic_energy(atoms);
 
@@ -77,6 +80,7 @@ TEST(NveDrift, EnergyAndMomentumConservedAt300K) {
   double emin = e0, emax = e0;
   for (int s = 0; s < steps; ++s) {
     core::VelocityVerlet<double>::first_half(atoms, dt);
+    core::zero_forces(atoms);
     pe = morse.compute(atoms, box);
     core::VelocityVerlet<double>::second_half(atoms, dt);
     const double e = pe + core::kinetic_energy(atoms);

@@ -120,6 +120,10 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_reader PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_Reader COMMAND test_reader)
 
+  add_executable(test_determinism tests/test_determinism.cpp)  # M3: bitwise net
+  target_link_libraries(test_determinism PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_Determinism COMMAND test_determinism)
+
   if(TDMD_WITH_CUDA)                                       # M2.7: toolchain smoke
     add_executable(test_cuda_smoke tests/test_cuda_smoke.cu)
     target_link_libraries(test_cuda_smoke PRIVATE GTest::gtest_main)
