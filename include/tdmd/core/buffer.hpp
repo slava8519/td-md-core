@@ -6,23 +6,29 @@
 #include "tdmd/units.hpp"
 
 // Causality buffer and automatic time-step (M2).
-// Source of truth: dissertation Гл.2.1 (буфер, ур.33), Гл.3.3/3.5 (авто-шаг,
-// коэффициенты C1/K2/C3). See docs/TD_MD_Core_ZoneFSM_v1_0.md §6 (INV-4) and
-// TD_MD_Core_Roadmap_v1_0.md (M2).
+// Source of truth: dissertation Гл.2.1 (буфер, ур.33), Гл.3.3/3.5 (авто-шаг).
+// Exact formulas verified against the .docx WMF equations on 2026-06-11 —
+// see docs/_meta/FORMULA_VERIFICATION_2026-06-11.md and the symbol mapping:
+//   dissertation C1 (eq.33 buffer coefficient, >1)  <->  cfg.C_buf
+//   dissertation C2 (Гл.3.3) = С1 (Гл.3.5, typ. 10) <->  cfg.C1 = 1/C1_diss
+//   dissertation C3 (eq.62)                          <->  cfg.C3 (same semantics)
+// See docs/TD_MD_Core_ZoneFSM_v1_0.md §6 (INV-4) and TD_MD_Core_Roadmap_v1_0.md (M2).
 namespace tdmd::core::buffer {
 
 // Parameters of the automatic step (config: timestep.*, decomposition.cell_size).
 struct TimeStepCfg {
-  double C1 = 0.1;          // displacement fraction of cell_size (highest priority)
+  double C1 = 0.1;          // displacement fraction of cell_size (highest priority);
+                            // reciprocal of the dissertation's С1=10 (Гл.3.5)
   double K2 = 50.0;         // max per-atom temperature rise per step, K
   double C3 = 0.5;          // step-change threshold (ур.62): 0=fixed, 1=every step
-  double C_buf = 1.5;       // buffer-width coefficient (>= 1)
+  double C_buf = 1.5;       // buffer-width coefficient (>= 1); eq.33 calls it C1
   double cell_size = 2.33;  // Å, spatial cell (Al ≈ 2.33)
   double dt_max = 0.02;     // ps, upper bound
   double dt_min = 1e-6;     // ps, floor
 };
 
-// Buffer width R_buf = v_max · dt · C  (eq. 33, C >= 1). Precondition: C >= 1.
+// Buffer width R_buf = (v̄_max · Δt) · C  (eq. 33; the dissertation names the
+// coefficient C1 > 1, the project names it C_buf). Precondition: C >= 1.
 inline double compute_R_buf(double v_max, double dt, double C) {
   return v_max * dt * C;
 }
@@ -47,8 +53,10 @@ double max_speed(const AtomSoA<Real>& a) {
 }
 
 // Best-effort per-atom temperature-rise limit (coefficient K2, in K).
-// NOTE: the exact dissertation formula (Гл.3.3) is image-only in the text
-// extract; this is a conservative approximation to verify against the .docx.
+// VERIFIED 2026-06-11: the dissertation gives NO formula for K2 — only the
+// verbal definition (Гл.3.5): "приращение температуры любого атома за один шаг
+// не должно превышать К2". This conservative quadratic bound is therefore an
+// [ENG] interpretation, consistent with (not prescribed by) the dissertation.
 // ΔT_i over dt ≈ (m_i / (3 k_B)) · |Δ(v_i²)|, with Δ(v²) ≈ 2|v·a|dt + a²dt².
 // Returns the largest dt keeping every atom's ΔT ≤ K2.
 template <typename Real>
@@ -75,21 +83,24 @@ double temperature_limited_dt(const AtomSoA<Real>& a, double K2) {
   return dt;
 }
 
-// Automatic step (Гл.3.3, 3.5). C1 (displacement, highest priority — стр.1125)
-// plus an optional external cap (e.g. K2 via temperature_limited_dt). C3
-// hysteresis (ур.62) decides whether to actually switch from dt_current.
+// Automatic step (Гл.3.3, 3.5). C1 (displacement, highest priority) plus an
+// optional external cap (e.g. K2 via temperature_limited_dt). C3 hysteresis
+// follows eq.62 exactly: KEEP dt while abs((h_new-h_old)/h_old) < C3, i.e.
+// switch when the relative change is >= C3. The prose anchors "C3=0 — шаг не
+// меняется" and "C3=1 — каждый шаг" are program-level special cases in the
+// dissertation (the literal formula would invert them), kept here as such.
 inline double auto_dt(double v_max, double dt_current, const TimeStepCfg& cfg,
                       double extra_cap = std::numeric_limits<double>::infinity()) {
   if (v_max <= 0.0) return dt_current;  // nothing moving — keep the step
-  // C1: fastest atom travels <= C1 · cell_size per step.
+  // C1: fastest atom travels <= C1 · cell_size per step (= cell/С1_diss, Гл.3.5).
   double dt_target = std::min(cfg.C1 * cfg.cell_size / v_max, extra_cap);
   dt_target = std::clamp(dt_target, cfg.dt_min, cfg.dt_max);
 
-  // C3 (ур.62): keep dt unless the relative change is large enough.
-  if (cfg.C3 <= 0.0) return dt_current;  // C3=0: fixed step (стр.1208)
-  if (cfg.C3 >= 1.0) return dt_target;   // C3=1: update every step
+  // C3 (ур.62): keep dt while |Δh|/h_old < C3.
+  if (cfg.C3 <= 0.0) return dt_current;  // special case: fixed step
+  if (cfg.C3 >= 1.0) return dt_target;   // special case: update every step
   const double rel = std::fabs(dt_target - dt_current) / dt_current;
-  return (rel >= (1.0 - cfg.C3)) ? dt_target : dt_current;
+  return (rel >= cfg.C3) ? dt_target : dt_current;  // eq.62
 }
 
 } // namespace tdmd::core::buffer

@@ -37,15 +37,17 @@ TEST(Buffer, AutoDtC1Displacement) {
   EXPECT_NEAR(v_max * dt, 0.1 * 2.33, 1e-12);    // displacement = 0.233 Å
 }
 
-// C3 hysteresis (ур.62): 0 = fixed, 1 = always, 0.5 = switch on >=50% change.
+// C3 hysteresis — eq.62 exactly: keep dt while abs((h_new-h_old)/h_old) < C3,
+// switch on rel >= C3. Special cases (dissertation prose): 0 = fixed, 1 = always.
+// Verified vs the .docx formula: docs/_meta/FORMULA_VERIFICATION_2026-06-11.md §3.
 TEST(Buffer, AutoDtC3Hysteresis) {
   buffer::TimeStepCfg cfg;
   cfg.C1 = 0.1; cfg.cell_size = 2.33; cfg.dt_max = 1.0;
 
-  cfg.C3 = 0.0;  // fixed step — never changes
+  cfg.C3 = 0.0;  // special case: fixed step — never changes
   EXPECT_DOUBLE_EQ(buffer::auto_dt(10.0, 0.02, cfg), 0.02);
 
-  cfg.C3 = 1.0;  // update every step
+  cfg.C3 = 1.0;  // special case: update every step
   EXPECT_NEAR(buffer::auto_dt(10.0, 0.02, cfg), 0.0233, 1e-9);
 
   cfg.C3 = 0.5;  // switch only on >= 50% relative change
@@ -53,6 +55,12 @@ TEST(Buffer, AutoDtC3Hysteresis) {
   EXPECT_DOUBLE_EQ(buffer::auto_dt(10.0, 0.02, cfg), 0.02);
   // big change: target 0.00233 vs current 0.02 -> 88% -> switch
   EXPECT_NEAR(buffer::auto_dt(100.0, 0.02, cfg), 0.00233, 1e-9);
+
+  // eq.62 monotonicity guard: at C3=0.8 a 16% change must NOT switch the step
+  // (the pre-2026-06-11 inverted rule `rel >= 1-C3` would have switched at 20%).
+  cfg.C3 = 0.8;
+  EXPECT_DOUBLE_EQ(buffer::auto_dt(10.0, 0.02, cfg), 0.02);       // 16% < 80% -> keep
+  EXPECT_NEAR(buffer::auto_dt(100.0, 0.02, cfg), 0.00233, 1e-9);  // 88% >= 80% -> switch
 }
 
 TEST(Buffer, TemperatureLimitedDtFinitePositive) {
