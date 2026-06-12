@@ -30,12 +30,19 @@ namespace tdmd::mpi {
 
 class MpiRingEdge final : public cuda::IBoundaryEdge {
  public:
+  // Each ring instance gets a UNIQUE tag (process-global counter — identical
+  // on every rank as long as rings are constructed in the same order): a
+  // HALTED ring leaves unconsumed messages in flight, and a shared tag would
+  // let the NEXT ring consume them as its own (found by test: garbage
+  // headers, SIGSEGV). The destructor additionally drains stragglers; call
+  // it only after all ranks left run() (e.g. behind a barrier).
   MpiRingEdge(MPI_Comm comm, int rank, int nranks, std::size_t payload_bytes)
       : comm_(comm),
         prev_((rank - 1 + nranks) % nranks),
         next_((rank + 1) % nranks),
         nranks_(nranks),
-        bytes_(payload_bytes) {
+        bytes_(payload_bytes),
+        tag_(next_tag()) {
     for (auto& p : pool_) p.buf.resize(sizeof(cuda::GpuHeader) + bytes_);
     rbuf_.resize(sizeof(cuda::GpuHeader) + bytes_);
   }
@@ -43,6 +50,16 @@ class MpiRingEdge final : public cuda::IBoundaryEdge {
   ~MpiRingEdge() override {
     for (auto& p : pool_)
       if (p.req != MPI_REQUEST_NULL) MPI_Wait(&p.req, MPI_STATUS_IGNORE);
+    // drain unconsumed messages of THIS ring (halt mid-flight): eager-size
+    // payloads only — a rendezvous-size straggler cannot occur on the test
+    // scale, and matched messages of a clean run are all consumed already.
+    int flag = 1;
+    while (true) {
+      MPI_Iprobe(prev_, tag_, comm_, &flag, MPI_STATUS_IGNORE);
+      if (!flag) break;
+      MPI_Recv(rbuf_.data(), int(rbuf_.size()), MPI_BYTE, prev_, tag_, comm_,
+               MPI_STATUS_IGNORE);
+    }
   }
 
   void send(const cuda::GpuHeader& h, const void* payload,
@@ -54,14 +71,14 @@ class MpiRingEdge final : public cuda::IBoundaryEdge {
     if (p.req != MPI_REQUEST_NULL) MPI_Wait(&p.req, MPI_STATUS_IGNORE);
     std::memcpy(p.buf.data(), &h, sizeof h);
     std::memcpy(p.buf.data() + sizeof h, payload, bytes);
-    MPI_Isend(p.buf.data(), int(p.buf.size()), MPI_BYTE, next_, kTag, comm_,
+    MPI_Isend(p.buf.data(), int(p.buf.size()), MPI_BYTE, next_, tag_, comm_,
               &p.req);
   }
 
   bool recv(cuda::GpuHeader& h, void* payload, std::size_t bytes) override {
     if (poisoned_) return false;
     if (bytes != bytes_) throw std::logic_error("mpi edge: payload size");
-    MPI_Recv(rbuf_.data(), int(rbuf_.size()), MPI_BYTE, prev_, kTag, comm_,
+    MPI_Recv(rbuf_.data(), int(rbuf_.size()), MPI_BYTE, prev_, tag_, comm_,
              MPI_STATUS_IGNORE);
     std::memcpy(&h, rbuf_.data(), sizeof h);
     if (h.hdr.sent_pos < 0) {  // poison from another rank
@@ -70,7 +87,7 @@ class MpiRingEdge final : public cuda::IBoundaryEdge {
       if (ttl > 0) {
         cuda::GpuHeader fwd = h;
         fwd.hdr.step_h = ttl - 1;
-        MPI_Send(&fwd, int(sizeof fwd), MPI_BYTE, next_, kTag, comm_);
+        MPI_Send(&fwd, int(sizeof fwd), MPI_BYTE, next_, tag_, comm_);
       }
       return false;
     }
@@ -84,11 +101,14 @@ class MpiRingEdge final : public cuda::IBoundaryEdge {
     cuda::GpuHeader p{};
     p.hdr.sent_pos = -1;
     p.hdr.step_h = nranks_ - 1;  // hop TTL
-    MPI_Send(&p, int(sizeof p), MPI_BYTE, next_, kTag, comm_);
+    MPI_Send(&p, int(sizeof p), MPI_BYTE, next_, tag_, comm_);
   }
 
  private:
-  static constexpr int kTag = 57;  // zone-payload channel
+  static int next_tag() {
+    static int counter = 57;
+    return counter++;
+  }
   static constexpr int kPool = 4;
   struct Pending {
     std::vector<char> buf;
@@ -98,6 +118,7 @@ class MpiRingEdge final : public cuda::IBoundaryEdge {
   MPI_Comm comm_;
   int prev_, next_, nranks_;
   std::size_t bytes_;
+  int tag_;
   std::array<Pending, kPool> pool_;
   int next_buf_ = 0;
   std::vector<char> rbuf_;

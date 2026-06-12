@@ -530,7 +530,13 @@ class GpuTimeConveyor {
           // gated by the previous H2D's event (never-recorded => no-op).
           TDMD_CU(cudaEventSynchronize(in_evt_));
           GpuHeader gh;
-          if (!part_.in->recv(gh, in_stage_, wire_bytes())) return false;
+          if (!part_.in->recv(gh, in_stage_, wire_bytes())) {
+            // poison from another rank: report honestly (idempotent CAS — a
+            // locally-originated halt keeps its own kind/message)
+            set_halt(core::Halt::Internal,
+                     "halt propagated across the ring boundary");
+            return false;
+          }
           if (gh.hdr.zone_id != want_id || gh.hdr.step_h != h - 1 ||
               gh.hdr.sent_pos != arrived)
             throw std::logic_error("gpu conveyor: boundary arrival out of order");

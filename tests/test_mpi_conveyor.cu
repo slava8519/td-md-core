@@ -156,6 +156,11 @@ void run_case(const char* name, const core::AtomSoA<double>& init,
     if (int(((h - 1) % Z) / k) != rank) continue;
     const auto& a = rmpi.stats[std::size_t(h - 1)];
     const auto& b = rref.stats[std::size_t(h - 1)];
+    if (!(a.dt == b.dt && a.pe == b.pe && a.v_max == b.v_max))
+      std::fprintf(stderr,
+                   "[rank %d] pass %ld: dt %.17g vs %.17g  pe %.17g vs %.17g"
+                   "  vmax %.17g vs %.17g\n",
+                   rank, h, a.dt, b.dt, a.pe, b.pe, a.v_max, b.v_max);
     MPI_CHECK(a.dt == b.dt && a.pe == b.pe && a.v_max == b.v_max,
               "owned-pass stats mismatch");
   }
@@ -244,10 +249,54 @@ int main(int argc, char** argv) {
   om.mixed_transport = true;
   run_case("lj fixed mixed", init, box, om, make_lj32(), rank, nranks);
 
+  // PBC along the decomposition axis over MPI: the rotation closure's send
+  // order crosses rank boundaries (the partition must be transparent to it)
+  core::Box pbox;
+  auto pinit = make_fcc(pbox, 2, 2, 8);
+  pbox.periodic = {true, true, true};
+  core::thermal::maxwell_init(pinit, 300.0, 77);
+  run_case("lj fixed pbc-z", pinit, pbox, o, make_lj64(), rank, nranks);
+  run_case("lj fixed pbc-z", pinit, pbox, o, make_lj64(), rank, nranks, 2);
+
   // k steps per node (M5a, Гл. 3.4): bitwise vs Z = np*k single-process
   run_case("lj fixed fp64", init, box, o, make_lj64(), rank, nranks, 2);
   run_case("lj auto fp64", init, box, oa, make_lj64(), rank, nranks, 3);
   run_case("lj fixed mixed", init, box, om, make_lj32(), rank, nranks, 2);
+
+  // HALT propagation across ranks: a causality halt on the owning rank must
+  // poison the ring; every rank reports a halt (origin keeps its kind).
+  {
+    core::Box hb;
+    hb.lo = {0.0, 0.0, 0.0};
+    hb.hi = {40.0, 12.0, 12.0};
+    hb.periodic = {false, false, false};
+    core::AtomSoA<double> ha;
+    ha.resize(2);
+    ha.x = {17.9, 22.1};
+    ha.y = {6.0, 6.0};
+    ha.z = {6.0, 6.0};
+    ha.vx = {20.0, -20.0};
+    ha.type = {1, 1};
+    ha.mass = {1.0, 1.0};
+    core::ConveyorOptions oh;
+    oh.steps = 10;
+    oh.n_zones = 1;
+    oh.dt_initial = 0.02;
+    const std::size_t wire = 10 * sizeof(double) * 2;  // cap = 2 atoms
+    mpi::MpiRingEdge edge(MPI_COMM_WORLD, rank, nranks, wire);
+    cuda::RingPart part{nranks, rank, 1, &edge, &edge};
+    oh.n_nodes = 1;
+    auto r = cuda::run_conveyor_gpu(ha, hb, kRcut, make_morse(), oh, part);
+    MPI_CHECK(r.halt != core::Halt::None, "halt did not reach this rank");
+    int causality = (r.halt == core::Halt::Causality) ? 1 : 0, any = 0;
+    MPI_Allreduce(&causality, &any, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    MPI_CHECK(any >= 1, "no rank reported the original Causality kind");
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (rank == 0)
+      std::printf("[mpi ring] %-22s np=%d k=1 : ok\n", "halt propagation",
+                  nranks);
+  }
+
 
   if (argc > 1 && std::string(argv[1]) == "--replica") {
     // §3.6 replica over the MPI ring (M5a criterion: the M4 determinism/NVE
