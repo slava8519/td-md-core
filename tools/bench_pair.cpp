@@ -6,7 +6,9 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdint>
+#include <string>
 
+#include "tdmd/core/cluster.hpp"
 #include "tdmd/core/soa.hpp"
 #include "tdmd/core/thermal.hpp"
 #include "tdmd/potentials/morse.hpp"
@@ -55,7 +57,9 @@ static double time_ms(core::AtomSoA<double>& a, const core::Box& box, Pot& pot,
   return std::chrono::duration<double, std::milli>(t1 - t0).count() / iters;
 }
 
-int main() {
+int main(int argc, char** argv) {
+  const bool list_only = argc > 1 && std::string(argv[1]) == "list";
+  if (!list_only) {
   std::printf("| N | direct O(N²), ms/step | clustered, ms/step | speedup |\n");
   std::printf("|--:|--:|--:|--:|\n");
   double prev_d = 0, prev_c = 0;
@@ -76,6 +80,37 @@ int main() {
                   prev_n, atoms.n, double(atoms.n) / prev_n, td / prev_d, tc / prev_c);
     }
     prev_d = td; prev_c = tc; prev_n = atoms.n;
+  }
+  }  // !list_only
+
+  // M3 grid cull: pair-LIST build cost, grid broad-phase vs O(C²) reference
+  // (the production build() uses the grid; bruteforce is the test oracle).
+  std::printf("\n| N | clusters | list build (grid), ms | list O(C²), ms | speedup |\n");
+  std::printf("|--:|--:|--:|--:|--:|\n");
+  for (int nc : {30, 63}) {  // 108 000 and 1 000 188 atoms
+    core::Box box;
+    auto atoms = make_fcc(nc, box);
+    core::ClusterSet cs;
+    const double cutoff = 4.0 + 1.0;  // rcut + skin
+
+    auto t0 = clk::now();
+    cs.build(atoms, box, 2.33, cutoff);
+    auto t1 = clk::now();
+    const double t_grid =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    t0 = clk::now();
+    auto brute = cs.build_pairs_bruteforce(box, cutoff);
+    t1 = clk::now();
+    const double t_brute =
+        std::chrono::duration<double, std::milli>(t1 - t0).count();
+
+    size_t mismatch = 0;
+    for (size_t p = 0; p < brute.size(); ++p)
+      if (cs.nbr[p] != brute[p]) ++mismatch;
+    std::printf("| %d | %zu | %.1f | %.1f | x%.0f |%s\n", atoms.n,
+                cs.clusters.size(), t_grid, t_brute, t_brute / t_grid,
+                mismatch ? "  LIST MISMATCH!" : "");
   }
   return 0;
 }

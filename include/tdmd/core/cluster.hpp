@@ -131,35 +131,178 @@ class ClusterSet {
       }
     }
 
-    // pair list: B in nbr[A] iff min-image AABB gap <= cutoff (full list, incl.
-    // self). O(C^2) — fine through ~10^5 atoms; grid-cull lands with M4 scale.
-    nbr.assign(nc, {});
-    const double cut2 = cutoff * cutoff;
-    for (int p = 0; p < nc; ++p) {
+    // flattened AABB mirrors (centre/half per dim): the narrow phase below
+    // touches random clusters — SoA mirrors keep it to two tight loads per
+    // dim instead of striding through the 72-byte Cluster structs.
+    for (int d = 0; d < 3; ++d) {
+      cc_[d].resize(nc);
+      hh_[d].resize(nc);
       for (int q = 0; q < nc; ++q) {
-        double gap2 = 0.0;
-        for (int d = 0; d < 3; ++d) {
-          const double ca = 0.5 * (clusters[p].lo[d] + clusters[p].hi[d]);
-          const double cb = 0.5 * (clusters[q].lo[d] + clusters[q].hi[d]);
-          const double ha = 0.5 * (clusters[p].hi[d] - clusters[p].lo[d]);
-          const double hb = 0.5 * (clusters[q].hi[d] - clusters[q].lo[d]);
-          double dc = ca - cb;
-          if (box.periodic[d]) {
-            const double L = box.len(d);
-            dc -= L * std::round(dc / L);
-            // an AABB pair wider than the box can always touch through PBC
-            if (ha + hb >= 0.5 * L) continue;
-          }
-          const double g = std::max(0.0, std::fabs(dc) - ha - hb);
-          gap2 += g * g;
-        }
-        if (gap2 <= cut2) nbr[p].push_back(q);
+        cc_[d][q] = 0.5 * (clusters[q].lo[d] + clusters[q].hi[d]);
+        hh_[d][q] = 0.5 * (clusters[q].hi[d] - clusters[q].lo[d]);
       }
     }
+
+    // pair list: B in nbr[A] iff min-image AABB gap <= cutoff (full list,
+    // incl. self). LOOSE GRID broad-phase (object rasterization) + the exact
+    // AABB test as narrow phase => the pair SET is IDENTICAL to the O(C²)
+    // reference (build_pairs_bruteforce; Test_Cluster cross-checks list
+    // equality), but the build is O(C) — needed at the flagship 10⁶–10⁷
+    // scale (M4).
+    //
+    // Why rasterization: Z-order chunking leaves MANY clusters straddling
+    // curve discontinuities with AABBs of 2×..box-size (measured 10⁶: 12% of
+    // clusters exceed 2·median) — any centre-binned grid sized to contain
+    // them collapses or pays a fat search radius for everyone. Registering a
+    // cluster in EVERY cell its AABB overlaps makes the cost adapt to each
+    // cluster's own extent: if two AABBs are within `cutoff` per dim, p's
+    // padded interval intersects q's interval, the intersection lies in some
+    // cell, and q is registered there — no misses for arbitrarily degenerate
+    // straddlers. Decision recorded in Rationale.
+    nbr.assign(nc, {});
+    const double cut2 = cutoff * cutoff;
+
+    int g[3];
+    double edge[3];
+    for (int d = 0; d < 3; ++d) {
+      g[d] = std::max(1, std::min(int(span[d] / cutoff), 128));
+      edge[d] = span[d] / g[d];
+    }
+    const size_t ncells = size_t(g[0]) * g[1] * g[2];
+
+    // absolute cell range [c0, c0+cnt) (mod g on PBC dims) of interval [lo,hi].
+    // Index math in long long with the double clamped BEFORE conversion: a
+    // degenerate free dim (flat monolayer => span floored to 1e-12) makes the
+    // raw index ~ +-cutoff/1e-12 ~ 5e12 — converting that straight to int is
+    // UB ([conv.fpint]; caught by UBSan in review).
+    auto cell_idx = [&](int d, double v) -> long long {
+      const double t = std::floor((v - bmin[d]) / edge[d]);
+      return (long long)(std::clamp(t, -4.0e18, 4.0e18));
+    };
+    auto range_of = [&](int d, double lo, double hi, int& c0, int& cnt) {
+      const long long a = cell_idx(d, lo);
+      const long long b = cell_idx(d, hi);
+      if (box.periodic[d]) {
+        cnt = int(std::min<long long>(b - a + 1, g[d]));
+        c0 = int((a % g[d] + g[d]) % g[d]);
+      } else {
+        const long long ca = std::clamp<long long>(a, 0, g[d] - 1);
+        const long long cb = std::clamp<long long>(b, 0, g[d] - 1);
+        c0 = int(ca);
+        cnt = int(cb - ca + 1);
+      }
+    };
+    auto wrap = [&](int d, int c) { return box.periodic[d] ? c % g[d] : c; };
+
+    // CSR cell table, two passes (deterministic: entries ascending within a
+    // cell because pass 2 iterates q ascending)
+    std::vector<int> r0(size_t(nc) * 3), rn(size_t(nc) * 3);
+    std::vector<int> off(ncells + 1, 0);
+    for (int q = 0; q < nc; ++q)
+      for (int d = 0; d < 3; ++d)
+        range_of(d, clusters[q].lo[d], clusters[q].hi[d], r0[size_t(q) * 3 + d],
+                 rn[size_t(q) * 3 + d]);
+    auto for_each_cell = [&](int q, auto&& fn) {
+      const int* c0 = &r0[size_t(q) * 3];
+      const int* cn = &rn[size_t(q) * 3];
+      for (int i = 0; i < cn[0]; ++i) {
+        const size_t ax = wrap(0, c0[0] + i);
+        for (int j = 0; j < cn[1]; ++j) {
+          const size_t ay = wrap(1, c0[1] + j);
+          for (int k = 0; k < cn[2]; ++k)
+            fn((ax * g[1] + ay) * g[2] + wrap(2, c0[2] + k));
+        }
+      }
+    };
+    for (int q = 0; q < nc; ++q)
+      for_each_cell(q, [&](size_t cell) { ++off[cell + 1]; });
+    for (size_t c = 0; c < ncells; ++c) off[c + 1] += off[c];
+    std::vector<int> entries(off[ncells]);
+    {
+      std::vector<int> cur(off.begin(), off.end() - 1);
+      for (int q = 0; q < nc; ++q)
+        for_each_cell(q, [&](size_t cell) { entries[cur[cell]++] = q; });
+    }
+
+    // queries: visit the cells of the cutoff-padded AABB, stamp-dedupe
+    // (a cluster registered in several cells must be tested once)
+    std::vector<int> stamp(nc, -1);
+    std::vector<int> qc0(3), qcn(3);
+    for (int p = 0; p < nc; ++p) {
+      for (int d = 0; d < 3; ++d) {
+        // pad beyond cutoff by >> 1 ulp: the narrow phase computes the gap
+        // from rounded centre/half mirrors (cc, hh), the broad phase from raw
+        // lo/hi — for a gap within a few ulp of EXACTLY cutoff the two could
+        // disagree and the grid would miss a pair the bruteforce keeps
+        // (review counterexample). The pad keeps coverage strictly
+        // conservative; extra candidates are rejected by aabb_close anyway.
+        const double qpad = cutoff + 1e-9 * (span[d] + cutoff);
+        range_of(d, clusters[p].lo[d] - qpad, clusters[p].hi[d] + qpad,
+                 qc0[d], qcn[d]);
+      }
+      auto& out = nbr[p];
+      for (int i = 0; i < qcn[0]; ++i) {
+        const size_t ax = wrap(0, qc0[0] + i);
+        for (int j = 0; j < qcn[1]; ++j) {
+          const size_t ay = wrap(1, qc0[1] + j);
+          for (int k = 0; k < qcn[2]; ++k) {
+            const size_t cell = (ax * g[1] + ay) * g[2] + wrap(2, qc0[2] + k);
+            for (int e = off[cell]; e < off[cell + 1]; ++e) {
+              const int q = entries[e];
+              if (stamp[q] == p) continue;
+              stamp[q] = p;
+              if (aabb_close(p, q, box, cut2)) out.push_back(q);
+            }
+          }
+        }
+      }
+      // ascending, like the brute-force reference — keeps the traversal (and
+      // thus the FP64 accumulation order) independent of the grid layout
+      std::sort(out.begin(), out.end());
+    }
+  }
+
+  // Exact min-image AABB gap test (narrow phase) — single source for the grid
+  // path and the brute-force reference. Early exit once gap² > cut² cannot
+  // change the verdict (pure rejection shortcut).
+  bool aabb_close(int p, int q, const Box& box, double cut2) const {
+    double gap2 = 0.0;
+    for (int d = 0; d < 3; ++d) {
+      const double ha = hh_[d][p], hb = hh_[d][q];
+      double dc = cc_[d][p] - cc_[d][q];
+      if (box.periodic[d]) {
+        const double L = box.len(d);
+        dc -= L * std::round(dc / L);
+        // an AABB pair wider than the box can always touch through PBC
+        if (ha + hb >= 0.5 * L) continue;
+      }
+      const double g = std::fabs(dc) - ha - hb;
+      if (g > 0.0) {
+        gap2 += g * g;
+        if (gap2 > cut2) return false;
+      }
+    }
+    return gap2 <= cut2;
+  }
+
+  // Reference O(C²) pair list over the CURRENT clusters — the cross-test
+  // oracle for the grid cull (and nothing else: not used by production paths).
+  std::vector<std::vector<int>> build_pairs_bruteforce(const Box& box,
+                                                       double cutoff) const {
+    const int nc = int(clusters.size());
+    const double cut2 = cutoff * cutoff;
+    std::vector<std::vector<int>> out(nc);
+    for (int p = 0; p < nc; ++p)
+      for (int q = 0; q < nc; ++q)
+        if (aabb_close(p, q, box, cut2)) out[p].push_back(q);
+    return out;
   }
 
   std::vector<Cluster> clusters;
   std::vector<std::vector<int>> nbr;  // full neighbour lists (self included)
+
+ private:
+  std::vector<double> cc_[3], hh_[3];  // AABB centre/half mirrors (SoA)
 };
 
 } // namespace tdmd::core

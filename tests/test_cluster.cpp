@@ -274,3 +274,167 @@ TEST(Cluster, ClusteredRunIsBitwiseDeterministic) {
   EXPECT_TRUE(std::memcmp(a.x.data(), b.x.data(), a.n * sizeof(double)) == 0);
   EXPECT_TRUE(std::memcmp(a.vx.data(), b.vx.data(), a.n * sizeof(double)) == 0);
 }
+
+// M3: grid broad-phase culling must reproduce the O(C²) AABB pair list
+// EXACTLY (same sets, same ascending order) — PBC, free and mixed boundaries,
+// including boxes narrower than the cutoff (the "AABB wider than half box"
+// PBC branch).
+TEST(Cluster, GridCullMatchesBruteforce) {
+  struct Case {
+    int nx, ny, nz;
+    std::array<bool, 3> periodic;
+    double cutoff;
+  };
+  const Case cases[] = {
+      {3, 3, 2, {true, true, true}, 5.0},     // golden-size, wide-AABB branch
+      {4, 3, 3, {true, true, true}, 5.0},
+      {14, 14, 14, {true, true, true}, 5.0},  // CI-scale (10 976 atoms)
+      {4, 4, 4, {false, false, false}, 5.0},  // free boundaries
+      {4, 4, 4, {true, false, true}, 5.0},    // mixed
+      {2, 2, 1, {true, true, true}, 5.0},     // tiny: cutoff > half box
+  };
+  for (const Case& c : cases) {
+    core::Box box;
+    auto atoms = make_fcc(c.nx, c.ny, c.nz, box);
+    box.periodic = c.periodic;
+    core::ClusterSet cs;
+    cs.build(atoms, box, 2.33, c.cutoff);
+    const auto brute = cs.build_pairs_bruteforce(box, c.cutoff);
+    ASSERT_EQ(cs.nbr.size(), brute.size());
+    for (size_t p = 0; p < brute.size(); ++p)
+      EXPECT_EQ(cs.nbr[p], brute[p])
+          << "cluster " << p << " in case {" << c.nx << "," << c.ny << ","
+          << c.nz << " pbc=" << c.periodic[0] << c.periodic[1] << c.periodic[2]
+          << "}";
+  }
+
+  // degenerate free dim (flat monolayer, all z equal): span is floored to
+  // 1e-12 and the padded query index overflows int if converted naively —
+  // UB-regression case from the M3 review (cell_idx clamps in long long)
+  {
+    core::AtomSoA<double> atoms;
+    atoms.resize(64);
+    core::Box box;
+    box.lo = {0, 0, 0};
+    box.hi = {20, 20, 20};
+    box.periodic = {false, false, false};
+    for (int i = 0; i < 64; ++i) {
+      atoms.x[i] = 2.0 * (i % 8);
+      atoms.y[i] = 2.0 * (i / 8);
+      atoms.z[i] = 5.0;  // exactly coplanar
+      atoms.mass[i] = 26.9815;
+      atoms.type[i] = 1;
+    }
+    core::ClusterSet cs;
+    cs.build(atoms, box, 2.33, 5.0);
+    EXPECT_EQ(cs.nbr, cs.build_pairs_bruteforce(box, 5.0));
+  }
+}
+
+// M3 acceptance: "частота перестройки списка соответствует C1-оценке".
+// The auto step bounds the per-step displacement by C1·cell (buffer.hpp), so
+// after a rebuild the accumulated displacement reaches skin/2 no sooner than
+// k_min = ceil((skin/2)/(C1·cell)) steps. Ballistic gas makes the estimate
+// EXACT: no forces, constant v == v_max => displacement is C1·cell per step
+// and every rebuild interval equals k_min.
+TEST(Cluster, RebuildCadenceMatchesC1EstimateExactly) {
+  const double C1 = 0.1, cell = 2.33, skin = 1.0;
+  const int k_min = int(std::ceil(0.5 * skin / (C1 * cell)));  // = 3
+
+  // sparse simple-cubic gas: spacing 8 Å > rcut+skin => zero forces forever
+  core::AtomSoA<double> atoms;
+  atoms.resize(125);
+  core::Box box;
+  box.lo = {0, 0, 0};
+  box.hi = {40, 40, 40};
+  box.periodic = {true, true, true};
+  int k = 0;
+  for (int i = 0; i < 5; ++i)
+    for (int j = 0; j < 5; ++j)
+      for (int l = 0; l < 5; ++l) {
+        atoms.x[k] = 8.0 * i; atoms.y[k] = 8.0 * j; atoms.z[k] = 8.0 * l;
+        atoms.vx[k] = 2.33;                       // uniform drift => v_max const
+        atoms.mass[k] = 26.9815; atoms.type[k] = 1;
+        ++k;
+      }
+
+  potentials::ClusteredMorse<double> pot;  // skin=1.0, cell=2.33
+  core::SimOptions o;
+  o.steps = 30;
+  o.dt = C1 * cell / 2.33;                 // = the C1 target from step 1
+  o.auto_step = true;
+  o.ts = {C1, 50.0, 0.5, 1.5, cell, 0.2, 1e-6};
+  o.frame_every = 1;
+
+  std::vector<long> rebuild_steps;
+  long seen = 0;
+  auto res = core::run_simulation(atoms, box, pot, o, [&](long step) {
+    if (pot.rebuild_count != seen) {
+      seen = pot.rebuild_count;
+      rebuild_steps.push_back(step);
+    }
+  });
+  ASSERT_EQ(res.halt, core::Halt::None) << res.halt_msg;
+  ASSERT_GE(rebuild_steps.size(), 5u);
+  for (size_t i = 1; i < rebuild_steps.size(); ++i)
+    EXPECT_EQ(rebuild_steps[i] - rebuild_steps[i - 1], k_min)
+        << "interval " << i << " deviates from the C1 estimate";
+}
+
+// Thermal companion: under real dynamics C1 may not even be the binding
+// constraint (K2/dt_max can lower dt further), so the C1 cadence is a LOWER
+// bound. Verify intervals >= ceil((skin/2)/max measured per-step displacement)
+// and that the displacement stays within the C1 budget.
+TEST(Cluster, RebuildCadenceBoundUnderThermalDynamics) {
+  core::Box box;
+  auto atoms = make_fcc(4, 3, 3, box);  // 144 atoms
+  core::thermal::maxwell_init(atoms, 300.0, 42u);
+
+  potentials::ClusteredMorse<double> pot;
+  // Default skin=1.0 never rebuilds in a 300 K SOLID (vibration amplitude
+  // < skin/2 — that's what the skin is for; the cluster demo logs 1 rebuild
+  // per 300 steps). Shrink the skin so thermal vibrations cross skin/2 and
+  // the cadence bound becomes observable.
+  const double skin = 0.25;
+  pot.skin = skin;
+  core::SimOptions o;
+  o.steps = 300;
+  o.dt = 0.005;
+  o.auto_step = true;
+  o.ts = {0.1, 50.0, 0.5, 1.5, 2.33, 0.02, 1e-6};  // = config_auto.yaml
+  o.frame_every = 1;
+
+  std::vector<double> px(atoms.n), py(atoms.n), pz(atoms.n);  // by atom id
+  double max_disp = 0.0;
+  std::vector<long> rebuild_steps;
+  long seen = 0;
+  auto res = core::run_simulation(atoms, box, pot, o, [&](long step) {
+    for (int i = 0; i < atoms.n; ++i) {
+      const int s = atoms.id[i] - 1;
+      if (step > 0) {
+        const double dx = atoms.x[i] - px[s], dy = atoms.y[i] - py[s],
+                     dz = atoms.z[i] - pz[s];
+        max_disp = std::max(max_disp, std::sqrt(dx * dx + dy * dy + dz * dz));
+      }
+      px[s] = atoms.x[i]; py[s] = atoms.y[i]; pz[s] = atoms.z[i];
+    }
+    if (pot.rebuild_count != seen) {
+      seen = pot.rebuild_count;
+      rebuild_steps.push_back(step);
+    }
+  });
+  ASSERT_EQ(res.halt, core::Halt::None) << res.halt_msg;
+  ASSERT_GE(rebuild_steps.size(), 3u);
+
+  // C1 budget: v_max·dt <= C1·cell, with slack for one step of v growth
+  EXPECT_LT(max_disp, 1.5 * 0.1 * 2.33);
+  const long k_bound = long(std::ceil(0.5 * skin / max_disp));
+  long min_interval = 1 << 30;
+  for (size_t i = 1; i < rebuild_steps.size(); ++i)
+    min_interval = std::min(min_interval, rebuild_steps[i] - rebuild_steps[i - 1]);
+  std::printf(
+      "Test_Cluster: cadence — %zu rebuilds/300 steps, min interval %ld, "
+      "bound %ld (max disp %.3f Å)\n",
+      rebuild_steps.size(), min_interval, k_bound, max_disp);
+  EXPECT_GE(min_interval, k_bound);
+}
