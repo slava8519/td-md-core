@@ -23,7 +23,11 @@ struct SimOptions {
   long   frame_every = 0;       // 0 = no frame callbacks
 };
 
-enum class Halt { None, Overlap, Causality, NonFiniteEnergy };
+// StaleZone/Internal are conveyor-only (M3.5): StaleZone — an atom drifted
+// beyond its static zone slab by more than (width−r_cut)/2 (membership
+// migration is deferred to M4, the guard HALTs honestly instead of silently
+// missing pairs); Internal — a node thread died on a logic error.
+enum class Halt { None, Overlap, Causality, NonFiniteEnergy, StaleZone, Internal };
 
 struct SimResult {
   long   steps_done = 0;        // completed steps (HALT step excluded)

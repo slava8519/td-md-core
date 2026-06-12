@@ -22,7 +22,8 @@ enum class ZoneEvent { RECV, SPHERE, START, END, SEND };
 
 struct Zone {
   int      id = 0;
-  int      step_h = 0;          // time step this zone belongs to
+  long     step_h = 0;          // time step this zone belongs to (long: M3.5
+                                // review — int silently wraps past 2^31 passes)
   int      n_atoms = 0;
   ZoneType type = ZoneType::o;     // free at construction
   double   left_bound_glob = 0.0;  // zone left boundary (for FP32 offsets later)

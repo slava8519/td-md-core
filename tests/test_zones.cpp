@@ -10,9 +10,11 @@
 #include <algorithm>
 #include <cmath>
 #include <cstring>
+#include <limits>
 #include <map>
 #include <random>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -108,6 +110,21 @@ TEST(FixedAccum, QuantumAndRange) {
   f.reset();
   f.add(1.5 / core::fixed::ForceAccum::kScale);   // 1.5 quanta
   EXPECT_EQ(f.raw, 2);                            // ties-to-even: 1.5 -> 2
+}
+
+// Review M3.5: contributions beyond the int64 range (r^-13-class potentials
+// at sub-Å distances) and non-finite forces must THROW, never hit the UB of
+// an unrepresentable double->int64 conversion.
+TEST(FixedAccum, OutOfRangeContributionThrows) {
+  core::fixed::ForceAccum f;
+  EXPECT_THROW(f.add(9.3e18 / core::fixed::ForceAccum::kScale),
+               std::overflow_error);
+  EXPECT_THROW(f.add(std::numeric_limits<double>::infinity()),
+               std::overflow_error);
+  EXPECT_THROW(f.add(std::nan("")), std::overflow_error);
+  EXPECT_EQ(f.raw, 0);  // failed adds must not corrupt the accumulator
+  f.add(9.1e18 / core::fixed::ForceAccum::kScale);  // just inside the range
+  EXPECT_NE(f.raw, 0);
 }
 
 // --- zone decomposition ---

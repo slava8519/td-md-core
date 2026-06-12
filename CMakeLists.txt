@@ -141,6 +141,21 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_zones PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_Zones COMMAND test_zones)
 
+  find_package(Threads REQUIRED)                           # M3.5: jthread ring
+
+  add_executable(test_conveyor tests/test_conveyor.cpp)    # M3.5: TimeConveyor-CPU
+  target_link_libraries(test_conveyor PRIVATE tdmd_core GTest::gtest_main
+                        Threads::Threads)
+  add_test(NAME Test_Conveyor COMMAND test_conveyor)
+  # deadlock => hang; the timeout turns it into a failure, not a stuck CI
+  set_tests_properties(Test_Conveyor PROPERTIES TIMEOUT 300)
+
+  add_executable(test_nve_invariant tests/test_nve_invariant.cpp)  # M3.5: 50k NVE
+  target_link_libraries(test_nve_invariant PRIVATE tdmd_core GTest::gtest_main
+                        Threads::Threads)
+  add_test(NAME Test_NVE_Invariant COMMAND test_nve_invariant)
+  set_tests_properties(Test_NVE_Invariant PROPERTIES TIMEOUT 600)
+
   if(TDMD_WITH_CUDA)                                       # M2.7: toolchain smoke
     add_executable(test_cuda_smoke tests/test_cuda_smoke.cu)
     target_link_libraries(test_cuda_smoke PRIVATE GTest::gtest_main)

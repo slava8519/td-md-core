@@ -38,17 +38,48 @@ inline bool causality_ok(double v_max, double dt, double R_buf) {
   return v_max * dt <= R_buf;
 }
 
+// --- per-atom kernels (M3.5): shared by the whole-SoA reductions below and
+// the conveyor's per-zone locals, so both paths use bit-identical FP
+// expressions (INV-9). Bodies are verbatim the pre-refactor inline code. ---
+
+inline double speed2(double vx, double vy, double vz) {
+  return vx * vx + vy * vy + vz * vz;
+}
+
+inline double accel2(double fx, double fy, double fz, double mass) {
+  const double s = units::ftm2v / mass;
+  const double ax = s * fx, ay = s * fy, az = s * fz;
+  return ax * ax + ay * ay + az * az;
+}
+
+// Largest dt keeping THIS atom's per-step temperature rise <= K2 (see
+// temperature_limited_dt below for the derivation); +inf when unconstrained
+// (K2 disabled or zero acceleration).
+inline double k2_limited_dt_atom(double fx, double fy, double fz, double vx,
+                                 double vy, double vz, double mass, double K2) {
+  if (K2 <= 0.0) return std::numeric_limits<double>::infinity();
+  const double ax = units::ftm2v * fx / mass;
+  const double ay = units::ftm2v * fy / mass;
+  const double az = units::ftm2v * fz / mass;
+  const double v = std::sqrt(vx * vx + vy * vy + vz * vz);
+  const double acc = std::sqrt(ax * ax + ay * ay + az * az);
+  if (acc <= 0.0) return std::numeric_limits<double>::infinity();
+  // ΔT = (mvv2e·m/3kB)(2 v acc dt + acc^2 dt^2) <= K2 -> quadratic in dt.
+  // (T_atom = mvv2e·m·v²/(3kB); the mvv2e factor is essential — metal units.)
+  const double k = units::mvv2e * mass / (3.0 * units::kB);
+  const double A = k * acc * acc, B = 2.0 * k * v * acc, C = -K2;
+  const double disc = B * B - 4.0 * A * C;
+  return (-B + std::sqrt(disc)) / (2.0 * A);
+}
+
 // Local v_max (parallel reduction; serial here). Local to the node — NO global
 // all-reduce (A8): the node carries the whole model step (Гл.3.5).
 template <typename Real>
 double max_speed(const AtomSoA<Real>& a) {
   double v2max = 0.0;
-  for (int i = 0; i < a.n; ++i) {
-    const double v2 = double(a.vx[i]) * a.vx[i] +
-                      double(a.vy[i]) * a.vy[i] +
-                      double(a.vz[i]) * a.vz[i];
-    v2max = std::max(v2max, v2);
-  }
+  for (int i = 0; i < a.n; ++i)
+    v2max = std::max(v2max, speed2(double(a.vx[i]), double(a.vy[i]),
+                                   double(a.vz[i])));
   return std::sqrt(v2max);
 }
 
@@ -60,11 +91,8 @@ double max_speed(const AtomSoA<Real>& a) {
 template <typename Real>
 double max_accel(const AtomSoA<Real>& a) {
   double a2max = 0.0;
-  for (int i = 0; i < a.n; ++i) {
-    const double s = units::ftm2v / a.mass[i];
-    const double ax = s * a.fx[i], ay = s * a.fy[i], az = s * a.fz[i];
-    a2max = std::max(a2max, ax * ax + ay * ay + az * az);
-  }
+  for (int i = 0; i < a.n; ++i)
+    a2max = std::max(a2max, accel2(a.fx[i], a.fy[i], a.fz[i], a.mass[i]));
   return std::sqrt(a2max);
 }
 
@@ -79,23 +107,10 @@ template <typename Real>
 double temperature_limited_dt(const AtomSoA<Real>& a, double K2) {
   if (K2 <= 0.0) return std::numeric_limits<double>::infinity();
   double dt = std::numeric_limits<double>::infinity();
-  for (int i = 0; i < a.n; ++i) {
-    const double ax = units::ftm2v * a.fx[i] / a.mass[i];
-    const double ay = units::ftm2v * a.fy[i] / a.mass[i];
-    const double az = units::ftm2v * a.fz[i] / a.mass[i];
-    const double v = std::sqrt(double(a.vx[i]) * a.vx[i] +
-                               double(a.vy[i]) * a.vy[i] +
-                               double(a.vz[i]) * a.vz[i]);
-    const double acc = std::sqrt(ax * ax + ay * ay + az * az);
-    if (acc <= 0.0) continue;
-    // ΔT = (mvv2e·m/3kB)(2 v acc dt + acc^2 dt^2) <= K2 -> quadratic in dt.
-    // (T_atom = mvv2e·m·v²/(3kB); the mvv2e factor is essential — metal units.)
-    const double k = units::mvv2e * a.mass[i] / (3.0 * units::kB);
-    const double A = k * acc * acc, B = 2.0 * k * v * acc, C = -K2;
-    const double disc = B * B - 4.0 * A * C;
-    const double dt_i = (-B + std::sqrt(disc)) / (2.0 * A);
-    dt = std::min(dt, dt_i);
-  }
+  for (int i = 0; i < a.n; ++i)
+    dt = std::min(dt, k2_limited_dt_atom(a.fx[i], a.fy[i], a.fz[i],
+                                         double(a.vx[i]), double(a.vy[i]),
+                                         double(a.vz[i]), a.mass[i], K2));
   return dt;
 }
 

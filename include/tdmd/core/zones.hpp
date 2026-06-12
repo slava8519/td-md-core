@@ -61,6 +61,28 @@ struct ZoneDecomposition {
   }
 };
 
+// Shared per-pair geometry core — ONE source of the min-image/cutoff FP
+// expressions for the serial w-pass below AND the ring conveyor
+// (core/conveyor.hpp), so their per-pair math is bit-identical (INV-9).
+struct PairGeom {
+  double L[3];
+  bool per[3];
+  double rc2;
+  PairGeom(const Box& box, double rcut)
+      : L{box.len(0), box.len(1), box.len(2)},
+        per{box.periodic[0], box.periodic[1], box.periodic[2]},
+        rc2(rcut * rcut) {}
+  // Min-image reduction + acceptance — exactly the pre-refactor inline
+  // predicate: accept iff 1e-18 <= r2 < rc2.
+  bool reduce(double& dx, double& dy, double& dz, double& r2) const {
+    if (per[0]) dx -= L[0] * std::round(dx / L[0]);
+    if (per[1]) dy -= L[1] * std::round(dy / L[1]);
+    if (per[2]) dz -= L[2] * std::round(dz / L[2]);
+    r2 = dx * dx + dy * dy + dz * dz;
+    return r2 < rc2 && r2 >= 1e-18;
+  }
+};
+
 // One full force assembly over zone passes. PairFn: the drivers' contract —
 // void(double r, double& u, double& f_over_r), FP64 contributions with the
 // truncation scheme already applied (potentials/cutoff.hpp policy).
@@ -76,8 +98,7 @@ template <typename Real, typename PairFn, typename PairHook>
 double zone_force_pass(AtomSoA<Real>& a, const Box& box,
                        const ZoneDecomposition& zd, double rcut, PairFn&& pair,
                        const std::vector<int>& order, PairHook&& on_pair) {
-  const double rc2 = rcut * rcut;
-  const double L[3] = {box.len(0), box.len(1), box.len(2)};
+  const PairGeom geom(box, rcut);
 
   std::vector<fixed::ForceAccum> fx(a.n), fy(a.n), fz(a.n);
   fixed::EnergyAccum pe;
@@ -87,11 +108,8 @@ double zone_force_pass(AtomSoA<Real>& a, const Box& box,
     double dx = a.x[i] - a.x[j];
     double dy = a.y[i] - a.y[j];
     double dz = a.z[i] - a.z[j];
-    if (box.periodic[0]) dx -= L[0] * std::round(dx / L[0]);
-    if (box.periodic[1]) dy -= L[1] * std::round(dy / L[1]);
-    if (box.periodic[2]) dz -= L[2] * std::round(dz / L[2]);
-    const double r2 = dx * dx + dy * dy + dz * dz;
-    if (r2 >= rc2 || r2 < 1e-18) return;
+    double r2;
+    if (!geom.reduce(dx, dy, dz, r2)) return;
     double u, f_over_r;
     pair(std::sqrt(r2), u, f_over_r);
     on_pair(i, j);

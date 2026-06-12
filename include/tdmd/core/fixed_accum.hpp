@@ -1,7 +1,7 @@
 #pragma once
-#include <cassert>
 #include <cmath>
 #include <cstdint>
+#include <stdexcept>
 
 // B1 / INV-9 — fixed-point force accumulation (M3.5 first PR).
 // Numerically ≡ AMBER SPFP (Le Grand 2013; MIXED_PRECISION doc §2, ZoneFSM
@@ -29,9 +29,18 @@ struct FixedAccum {
 
   // Quantize one FP64 contribution and add. The quantization is a pure
   // function of x — independent of accumulation history/order.
+  // Out-of-range contributions THROW instead of hitting the UB of an
+  // unrepresentable double→int64 conversion (review M3.5: with Q24.40 an
+  // r^-13-class potential crosses ±2²³ eV/Å near r ≈ 0.86 Å — ABOVE the
+  // default overlap-halt radius, so a debug-only assert would mean silent
+  // force corruption in Release). The branch is predictable-not-taken; the
+  // M4 GPU path will use saturate+sticky-flag instead of throwing.
   void add(double x) {
     const double q = std::rint(x * kScale);
-    assert(std::fabs(q) < 9.2e18 && "FixedAccum overflow: contribution too large");
+    if (!(std::fabs(q) < 9.2e18))
+      throw std::overflow_error(
+          "FixedAccum: contribution exceeds the fixed-point range "
+          "(pathologically close pair / non-finite force?)");
     raw += int64_t(q);
   }
 
