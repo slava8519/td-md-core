@@ -64,8 +64,16 @@ struct CellGrid {
 inline CellGrid make_zone_grid(const double box_lo[3], const double box_len[3],
                                const bool periodic[3], double rcut,
                                int n_zones, int zone_id) {
+  // ulp-skin (the M3 loose-grid qpad lesson, re-confirmed by review: with
+  // cell == L/n a pair at r = rcut - 2e-15 can straddle TWO bin boundaries
+  // when fl(L/rcut) rounds up or the origin is non-commensurate): size cells
+  // against rcut + pad so FP boundary drift can never push an accepted pair
+  // beyond the +-1-cell neighborhood. The pad also budgets the coordinate
+  // fold of UNWRAPPED positions (drift never folds x): safe while
+  // 0.5*ulp(|x_raw|) < pad, i.e. |x_raw| up to ~1e7 box lengths.
   auto ncell = [&](double L, bool per) {
-    int n = int(L / rcut);
+    const double pad = 1e-9 * (L + rcut);
+    int n = int(L / (rcut + pad));
     if (n < 1) n = 1;
     if (per && n < 3) n = 1;  // avoid double-visiting images
     return n;
@@ -93,7 +101,7 @@ inline CellGrid make_zone_grid(const double box_lo[3], const double box_len[3],
     const double width = g.Lz / n_zones;
     const double range = width + 2.0 * rcut;
     g.loz = box_lo[2] + zone_id * width - rcut;
-    g.nz = int(range / rcut);
+    g.nz = int(range / (rcut + 1e-9 * (range + rcut)));  // ulp-skin (above)
     if (g.nz < 1) g.nz = 1;
     g.cz = range / g.nz;
     g.wrapz = false;
@@ -172,6 +180,10 @@ static __global__ void zone_pair_cells_kernel(
             double ddz = zi - a.bz[j];
             double r2;
             const bool ok = geom.reduce(ddx, ddy, ddz, r2);
+            // NB: mr2 here is the min over EXAMINED candidates only — it
+            // agrees with the tile path for the Overlap halt (any pair under
+            // rcut is in both candidate sets) but is NOT bitwise comparable
+            // across paths and must never feed anything else.
             mr2 = fmin(mr2, r2);
             if (!ok) continue;
             double u, f_over_r;

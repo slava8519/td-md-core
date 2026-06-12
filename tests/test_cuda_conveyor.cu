@@ -512,6 +512,25 @@ TEST(CudaConveyor, CellListsBitwiseVsTiles) {
     run_ab(ob, oa, 3, 2, "fuzz free outliers");
   }
 
+  // empty zones on the culled path (build/scan/query of zero atoms,
+  // including the rotated head position carrying the dt header)
+  {
+    core::Box eb;
+    eb.lo = {0.0, 0.0, 0.0};
+    eb.hi = {12.0, 12.0, 15.0};
+    eb.periodic = {true, true, true};
+    core::AtomSoA<double> ea;
+    ea.resize(4);
+    const double pos[4][3] = {
+        {3.0, 3.0, 2.0}, {6.0, 6.0, 2.5}, {9.0, 9.0, 3.0}, {4.0, 8.0, 2.2}};
+    for (int i = 0; i < 4; ++i) {
+      ea.x[i] = pos[i][0]; ea.y[i] = pos[i][1]; ea.z[i] = pos[i][2];
+      ea.type[i] = 1;
+      ea.mass[i] = 26.9815;
+    }
+    run_ab(eb, ea, 3, 2, "empty zones pbc");
+  }
+
   // mixed transport over the culled path
   auto om = opts_fixed(30, 4, 2, 0.002);
   om.mixed_transport = true;

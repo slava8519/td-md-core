@@ -318,6 +318,10 @@ class GpuTimeConveyor {
     res_.e0 = pe0 + core::kinetic_energy(atoms_);
     lam0_ = {core::buffer::max_speed(atoms_), core::buffer::max_accel(atoms_),
              core::buffer::temperature_limited_dt(atoms_, o_.ts.K2)};
+    if (o_.skip_t0_forces && !(lam0_.v > 0.0))
+      throw std::invalid_argument(
+          "skip_t0_forces needs a thermal start: with v=0 and a=0 the INV-4 "
+          "forecast gives R_buf=0 and any motion HALTs (bench-only flag)");
     res_.stats.assign(std::size_t(o_.steps), {});
     final_.assign(std::size_t(n_), HostZone{});
 
@@ -444,8 +448,9 @@ class GpuTimeConveyor {
       }
       if (o_.cell_lists) {
         nb.cubtmp_bytes = 0;  // CUB temp for the per-zone exclusive scan
-        cub::DeviceScan::ExclusiveSum(nullptr, nb.cubtmp_bytes, (int*)nullptr,
-                                      (int*)nullptr, ncells_);
+        TDMD_CU(cub::DeviceScan::ExclusiveSum(nullptr, nb.cubtmp_bytes,
+                                              (int*)nullptr, (int*)nullptr,
+                                              ncells_));
         TDMD_CU(cudaMalloc(&nb.d_cubtmp, nb.cubtmp_bytes));
       }
       TDMD_CU(cudaMalloc(&nb.d_v2, 8));
@@ -659,8 +664,10 @@ class GpuTimeConveyor {
           TDMD_CU(cudaGetLastError());
         }
         std::size_t tb = nb.cubtmp_bytes;
-        cub::DeviceScan::ExclusiveSum(nb.d_cubtmp, tb, d.counts(ncells_),
-                                      d.starts(ncells_), ncells_, nb.stream);
+        TDMD_CU(cub::DeviceScan::ExclusiveSum(nb.d_cubtmp, tb,
+                                              d.counts(ncells_),
+                                              d.starts(ncells_), ncells_,
+                                              nb.stream));
         TDMD_CU(cudaMemcpyAsync(d.cursor(ncells_), d.starts(ncells_),
                                 sizeof(int) * ncells_,
                                 cudaMemcpyDeviceToDevice, nb.stream));

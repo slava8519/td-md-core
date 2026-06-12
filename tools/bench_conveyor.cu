@@ -16,6 +16,7 @@
 #include <cuda_runtime.h>
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <string>
@@ -195,9 +196,16 @@ void mem_probe(int zones, int nodes, bool mixed) {
       grab(10ULL * 8 * cap);       // packed double arrays
       grab(3ULL * 8 * cap);        // raw accumulators
       if (mixed) grab(8ULL * cap + 36ULL * cap);  // int32 wire image
-      // cell lists: [cell_of cap][order cap][counts/starts/cursor NC]
-      const long ncells = (440 / 4) * (440 / 4) * 3;  // ~box(1e7)/rcut, slab z
-      grab(4ULL * (2 * cap + 3 * ncells));
+      // cell lists: [cell_of cap][order cap][counts/starts/cursor NC] —
+      // NC from the REAL grid arithmetic for an FCC box of N atoms
+      {
+        const double L = std::cbrt(double(N) / 4.0) * 4.05;
+        const double lo[3] = {0, 0, 0}, len[3] = {L, L, L};
+        const bool per[3] = {true, true, true};
+        const long nc = tdcu::make_zone_grid(lo, len, per, kRcut, zones, 0)
+                            .ncells();
+        grab(4ULL * (2 * cap + 3 * nc));
+      }
     }
   std::size_t freeb = 0, totb = 0;
   cudaMemGetInfo(&freeb, &totb);
