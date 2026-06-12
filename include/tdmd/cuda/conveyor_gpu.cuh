@@ -452,7 +452,8 @@ class GpuTimeConveyor {
     unsigned long long *d_v2{}, *d_a2{}, *d_kc{}, *d_mr2{};
     long long *d_ke{}, *d_pe{};
     int* d_flags{};
-    EndScalars* h_end{};  // pinned
+    EndScalars* h_end{};  // pinned, n_zones entries — per-position END
+                          // snapshots for the ONCE-PER-PASS batched sync
     void* d_cubtmp = nullptr;  // cell-list scan temp
     std::size_t cubtmp_bytes = 0;
   };
@@ -502,7 +503,7 @@ class GpuTimeConveyor {
       TDMD_CU(cudaMalloc(&nb.d_ke, 8));
       TDMD_CU(cudaMalloc(&nb.d_pe, 8));
       TDMD_CU(cudaMalloc(&nb.d_flags, 4));
-      TDMD_CU(cudaHostAlloc(&nb.h_end, sizeof(EndScalars), 0));
+      TDMD_CU(cudaHostAlloc(&nb.h_end, sizeof(EndScalars) * std::size_t(n_), 0));
     }
   }
 
@@ -579,6 +580,8 @@ class GpuTimeConveyor {
 
     std::vector<PassSlot> slot(static_cast<std::size_t>(n_));
     std::deque<int> outq;
+    std::vector<int> ended;  // END order (checks replay in this order)
+    bool synced = false;
     int sent = 0, arrived = 0;
     double dt = 0.0, R_buf = 0.0, dt_next = 0.0;
     Lambda agg{0.0, 0.0, std::numeric_limits<double>::infinity()};
@@ -753,8 +756,16 @@ class GpuTimeConveyor {
       TDMD_CU(cudaGetLastError());
     };
 
+    // T4 enqueue: kernels + an ASYNC snapshot of the END scalars into
+    // h_end[j]. NO host sync here — the per-zone D2H+sync was the ring's
+    // dominant overhead (NVTX: end+sync 32.6%). The guards (Overlap/
+    // overflow/StaleZone/INV-4) replay at sync_check(), ONCE per pass,
+    // before the LAST send: identical data, identical order, identical
+    // first failure — and a failed pass never emits its last zone, so
+    // downstream can never complete pass h+1 and the stats-prefix contract
+    // holds without extra bookkeeping.
     auto end_zone = [&](int j) -> bool {
-      NvtxScope nv("end+sync");
+      NvtxScope nv("end-enqueue");
       PassSlot& s = slot[std::size_t(j)];
       const DevSlot& d = nb.slot[std::size_t(s.dev)];
       const uint32_t want_mask = (j == 0) ? (defer_head ? 2u : 0u) : 1u;
@@ -779,56 +790,72 @@ class GpuTimeConveyor {
               nb.d_flags);  // bit1
         }
       }
-      // D2H the END scalars (pinned) + sync — the host decides like the CPU.
-      TDMD_CU(cudaMemcpyAsync(&nb.h_end->v2, nb.d_v2, 8, cudaMemcpyDeviceToHost, nb.stream));
-      TDMD_CU(cudaMemcpyAsync(&nb.h_end->a2, nb.d_a2, 8, cudaMemcpyDeviceToHost, nb.stream));
-      TDMD_CU(cudaMemcpyAsync(&nb.h_end->kc, nb.d_kc, 8, cudaMemcpyDeviceToHost, nb.stream));
-      TDMD_CU(cudaMemcpyAsync(&nb.h_end->min_r2, nb.d_mr2, 8, cudaMemcpyDeviceToHost, nb.stream));
-      TDMD_CU(cudaMemcpyAsync(&nb.h_end->ke, nb.d_ke, 8, cudaMemcpyDeviceToHost, nb.stream));
-      TDMD_CU(cudaMemcpyAsync(&nb.h_end->pe, nb.d_pe, 8, cudaMemcpyDeviceToHost, nb.stream));
-      TDMD_CU(cudaMemcpyAsync(&nb.h_end->flags, nb.d_flags, 4, cudaMemcpyDeviceToHost, nb.stream));
-      TDMD_CU(cudaStreamSynchronize(nb.stream));
-
-      double mr2, v2, a2, kc;
-      std::memcpy(&mr2, &nb.h_end->min_r2, 8);
-      std::memcpy(&v2, &nb.h_end->v2, 8);
-      std::memcpy(&a2, &nb.h_end->a2, 8);
-      std::memcpy(&kc, &nb.h_end->kc, 8);
-      if (mr2 < o_.r_min_halt * o_.r_min_halt)
-        return fail(core::Halt::Overlap,
-                    "atom overlap at step " + std::to_string(h) +
-                        ": min pair distance " + std::to_string(std::sqrt(mr2)) +
-                        " A < " + std::to_string(o_.r_min_halt) + " A");
-      if (nb.h_end->flags & 1)
-        return fail(core::Halt::Internal,
-                    "fixed-point overflow on GPU at step " + std::to_string(h));
-      if (nb.h_end->flags & 2)
-        return fail(core::Halt::StaleZone,
-                    "stale zone membership at step " + std::to_string(h) +
-                        " zone " + std::to_string(s.fsm.id) +
-                        ": atom left its slab by more than (width-r_cut)/2");
-      s.v_max = std::sqrt(v2);
-      s.a_max = std::sqrt(a2);
-      s.k2cap = kc;
-      s.ke_raw = nb.h_end->ke;
-      s.fsm.v_max_local = s.v_max;
-      s.fsm.R_buf_local = R_buf;
-      agg.v = std::max(agg.v, s.v_max);
-      agg.a = std::max(agg.a, s.a_max);
-      agg.k2cap = std::min(agg.k2cap, s.k2cap);
-      ke += double(s.ke_raw) / core::fixed::EnergyAccum::kScale;
-      if (!core::buffer::causality_ok(s.v_max, dt, R_buf)) {
-        char buf[176];
-        std::snprintf(buf, sizeof(buf),
-                      "causality (INV-4) at step %ld zone %d: "
-                      "v_max*dt=%.4g > R_buf=%.4g (dt=%.17g)",
-                      h, s.fsm.id, s.v_max * dt, R_buf, dt);
-        return fail(core::Halt::Causality, buf);
-      }
+      EndScalars* hs = &nb.h_end[std::size_t(j)];
+      TDMD_CU(cudaMemcpyAsync(&hs->v2, nb.d_v2, 8, cudaMemcpyDeviceToHost, nb.stream));
+      TDMD_CU(cudaMemcpyAsync(&hs->a2, nb.d_a2, 8, cudaMemcpyDeviceToHost, nb.stream));
+      TDMD_CU(cudaMemcpyAsync(&hs->kc, nb.d_kc, 8, cudaMemcpyDeviceToHost, nb.stream));
+      TDMD_CU(cudaMemcpyAsync(&hs->min_r2, nb.d_mr2, 8, cudaMemcpyDeviceToHost, nb.stream));
+      TDMD_CU(cudaMemcpyAsync(&hs->ke, nb.d_ke, 8, cudaMemcpyDeviceToHost, nb.stream));
+      TDMD_CU(cudaMemcpyAsync(&hs->pe, nb.d_pe, 8, cudaMemcpyDeviceToHost, nb.stream));
+      TDMD_CU(cudaMemcpyAsync(&hs->flags, nb.d_flags, 4, cudaMemcpyDeviceToHost, nb.stream));
+      ended.push_back(j);
       core::ZoneFSM::apply(s.fsm, core::ZoneEvent::END);  // T4
       outq.push_back(j);
       return true;
     };
+
+    // The batched END sync: ONE cudaStreamSynchronize per pass, guards
+    // replayed over the snapshots in END order — same data, same order,
+    // same first failure as the old per-zone path; bitwise-identical agg,
+    // ke and dt decisions.
+    auto sync_check = [&]() -> bool {
+      if (synced) return true;
+      NvtxScope nv("end+sync");
+      TDMD_CU(cudaStreamSynchronize(nb.stream));
+      synced = true;
+      for (int q : ended) {
+        PassSlot& s = slot[std::size_t(q)];
+        const EndScalars& e = nb.h_end[std::size_t(q)];
+        double mr2, v2, a2, kc;
+        std::memcpy(&mr2, &e.min_r2, 8);
+        std::memcpy(&v2, &e.v2, 8);
+        std::memcpy(&a2, &e.a2, 8);
+        std::memcpy(&kc, &e.kc, 8);
+        if (mr2 < o_.r_min_halt * o_.r_min_halt)
+          return fail(core::Halt::Overlap,
+                      "atom overlap at step " + std::to_string(h) +
+                          ": min pair distance " +
+                          std::to_string(std::sqrt(mr2)) + " A < " +
+                          std::to_string(o_.r_min_halt) + " A");
+        if (e.flags & 1)
+          return fail(core::Halt::Internal,
+                      "fixed-point overflow on GPU at step " + std::to_string(h));
+        if (e.flags & 2)
+          return fail(core::Halt::StaleZone,
+                      "stale zone membership at step " + std::to_string(h) +
+                          " zone " + std::to_string(s.fsm.id) +
+                          ": atom left its slab by more than (width-r_cut)/2");
+        s.v_max = std::sqrt(v2);
+        s.a_max = std::sqrt(a2);
+        s.k2cap = kc;
+        s.fsm.v_max_local = s.v_max;
+        s.fsm.R_buf_local = R_buf;
+        agg.v = std::max(agg.v, s.v_max);
+        agg.a = std::max(agg.a, s.a_max);
+        agg.k2cap = std::min(agg.k2cap, s.k2cap);
+        ke += double(e.ke) / core::fixed::EnergyAccum::kScale;
+        if (!core::buffer::causality_ok(s.v_max, dt, R_buf)) {
+          char buf[176];
+          std::snprintf(buf, sizeof(buf),
+                        "causality (INV-4) at step %ld zone %d: "
+                        "v_max*dt=%.4g > R_buf=%.4g (dt=%.17g)",
+                        h, s.fsm.id, s.v_max * dt, R_buf, dt);
+          return fail(core::Halt::Causality, buf);
+        }
+      }
+      return true;
+    };
+
 
     auto flush_sends = [&]() -> bool {
       if (outq.empty()) return !halt_on_.load(std::memory_order_relaxed);
@@ -870,6 +897,7 @@ class GpuTimeConveyor {
           // M5a boundary: stage the wire image to pinned host memory and hand
           // it to the edge (D2H -> MPI -> H2D on the peer). One staging
           // buffer suffices: send() returns only when it may be reused.
+          if (sent + 1 >= n_ && !sync_check()) return false;  // agg + guards
           GpuHeader gh;
           gh.hdr.zone_id = s.fsm.id;
           gh.hdr.step_h = h;
@@ -941,6 +969,7 @@ class GpuTimeConveyor {
         // my source slot becomes reusable once that copy has READ it
         free_src(s.dev);
 
+        if (sent + 1 >= n_ && !sync_check()) return false;  // agg + guards
         GpuHeader gh;
         gh.hdr.zone_id = s.fsm.id;
         gh.hdr.step_h = h;
@@ -1008,6 +1037,7 @@ class GpuTimeConveyor {
       if (!compute_zone(j)) return false;
     }
     if (!flush_sends()) return false;
+    if (!sync_check()) return false;  // final pass has no sends — sync here
 
     if (preload && !self_loop_) {
       // pass 1 done: the upload reserve joins the main circulation. Intra
@@ -1027,16 +1057,18 @@ class GpuTimeConveyor {
     }
 
     if (o_.mixed_transport) {  // pack-overflow flags from this pass's sends
-      TDMD_CU(cudaMemcpyAsync(&nb.h_end->flags, nb.d_flags, 4,
+      TDMD_CU(cudaMemcpyAsync(&nb.h_end[0].flags, nb.d_flags, 4,
                               cudaMemcpyDeviceToHost, nb.stream));
       TDMD_CU(cudaStreamSynchronize(nb.stream));
-      if (nb.h_end->flags & 4)
+      if (nb.h_end[0].flags & 4)
         return fail(core::Halt::Internal,
                     "production_mixed transport range overflow at step " +
                         std::to_string(h) +
                         " (atom beyond the int32 offset range)");
     }
-    const double pass_pe = double(nb.h_end->pe) / core::fixed::EnergyAccum::kScale;
+    const double pass_pe =
+        double(nb.h_end[std::size_t(ended.back())].pe) /
+        core::fixed::EnergyAccum::kScale;
     if (!std::isfinite(pass_pe + ke))
       return fail(core::Halt::NonFiniteEnergy,
                   "non-finite energy at step " + std::to_string(h));
