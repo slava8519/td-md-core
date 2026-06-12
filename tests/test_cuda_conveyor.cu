@@ -25,6 +25,7 @@
 #include "tdmd/potentials/cutoff.hpp"
 #include "tdmd/potentials/morse.hpp"
 #include "tdmd/potentials/pair_lj.hpp"
+#include "tdmd/units.hpp"
 
 using namespace tdmd;
 
@@ -350,6 +351,76 @@ TEST(CudaConveyor, MixedTransportRangeHalts) {
   auto r = cuda::run_conveyor_gpu(a, box, kRcut, make_lj_f32(0.4f, 2.55f, kRcut), o);
   EXPECT_EQ(r.halt, core::Halt::Internal) << r.halt_msg;
   EXPECT_NE(r.halt_msg.find("transport range"), std::string::npos) << r.halt_msg;
+}
+
+// --- anti-deadlock on the GPU ring (§7.4): odd and even stream counts,
+// >= 2z steps each (M4 criterion: the M3.5 test set on the GPU). ---
+
+TEST(CudaConveyor, AntiDeadlockOddEvenRings) {
+  core::Box box;
+  auto init = make_fcc(box, 2, 2, 6, /*pz=*/false);
+  const auto lj = make_lj(0.4, 2.55, kRcut);
+  for (int z = 1; z <= 5; ++z) {
+    const long steps = 2 * z + 3;
+    core::AtomSoA<double> a = init;
+    auto r = cuda::run_conveyor_gpu(a, box, kRcut, lj,
+                                    opts_fixed(steps, 4, z, 0.002));
+    EXPECT_EQ(r.halt, core::Halt::None) << "z=" << z << ": " << r.halt_msg;
+    EXPECT_EQ(r.steps_done, steps) << "z=" << z;
+  }
+}
+
+// --- NVE invariant on the GPU (M3.5 methodology): 50k steps, dt=1 fs,
+// T=300 K; multizone ring bitwise == single-zone (B1 on the device); secular
+// trend in kT/(ns·dof) under the CPU-calibrated ceiling (the floor is the
+// shift-truncation force discontinuity, not the conveyor). ---
+
+TEST(CudaConveyor, NveInvariant50kOnGpu) {
+  core::Box box;
+  core::AtomSoA<double> init;
+  ASSERT_TRUE(io::read_lammps_data(
+      project_root() + "/reference_data/al_fcc_72.data", init, box));
+  box.periodic = {false, false, false};
+  core::thermal::maxwell_init(init, 300.0, 1);
+  const auto p0 = core::thermal::momentum(init);
+  const auto mo = make_morse(kRcut);
+
+  auto o = opts_fixed(50000, 1, 1, 0.001);
+  core::ConveyorResult r1, r2;
+  auto a1 = run_gpu(init, box, o, mo, &r1);
+  o.n_zones = 2;
+  o.n_nodes = 2;
+  auto a2 = run_gpu(init, box, o, mo, &r2);
+
+  EXPECT_TRUE(bitwise_eq(a1, a2));  // multizone == single-zone, bitwise
+  ASSERT_EQ(r1.stats.size(), r2.stats.size());
+  for (std::size_t i = 0; i < r1.stats.size(); ++i)
+    ASSERT_EQ(r1.stats[i].pe, r2.stats[i].pe) << "pass " << i + 1;
+
+  // secular trend (LSQ over E(t)), kT/(ns·dof)
+  const std::size_t n = r1.stats.size();
+  double tm = 0.0, em = 0.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    tm += double(i + 1) * 0.001;
+    em += r1.stats[i].pe + r1.stats[i].ke;
+  }
+  tm /= double(n);
+  em /= double(n);
+  double num = 0.0, den = 0.0;
+  for (std::size_t i = 0; i < n; ++i) {
+    const double dt_i = double(i + 1) * 0.001 - tm;
+    num += dt_i * (r1.stats[i].pe + r1.stats[i].ke - em);
+    den += dt_i * dt_i;
+  }
+  const int dof = core::thermal::dof_thermal(init.n);
+  const double trend = (num / den) * 1000.0 / (units::kB * 300.0 * dof);
+  std::printf("Test_CUDA_Conveyor[nve]: secular trend %.3e kT/(ns·dof) "
+              "[deterministic_fp64, morse+shift, dt=1fs, 50k, GPU ring]\n",
+              trend);
+  EXPECT_LT(std::fabs(trend), 3.7e-2);  // CPU-calibrated ceiling (M3.5)
+
+  const auto p = core::thermal::momentum(a2);
+  for (int d = 0; d < 3; ++d) EXPECT_NEAR(p[d], p0[d], 1e-8) << "axis " << d;
 }
 
 // --- INV-4 fires through the device reduction path ---
