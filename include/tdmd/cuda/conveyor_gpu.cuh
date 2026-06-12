@@ -305,7 +305,22 @@ class GpuTimeConveyor {
     z_ = (part_.z_global > 0) ? part_.z_local : o_.n_nodes;
     Z_ = (part_.z_global > 0) ? part_.z_global : z_;
     node0_ = part_.node0;
-    S_ = n_ + 2;  // slots per node
+    // INV-7 slot-pool sizing. The ring as a WHOLE holds all n zones at all
+    // times, so Z·S >= n + slack is a LAW, not a tunable: a constant S
+    // deadlocks once Z·S - n loses its slack (measured: z=2, n=16, S=8 —
+    // 16 = n exactly — wedged with node 0 awaiting downstream credits and
+    // node 1 awaiting node-0 slots hoarded by the preload reserve). This is
+    // the dissertation's own '>= 6 зон на процессор' for 80 zones / 13
+    // procs ~ n/z. Hence S = ceil(n/Z) + 4 (pipeline slack; the pass-1
+    // liveness inequality n <= S + (S - W_res) then holds with margin),
+    // floored by the per-node working window (~8: positions j, j+1, ENDed
+    // pending, the held PBC head, deposits). A single-node ring holds
+    // everything: S = n+2. P1's preload is STREAMED (lazy per-zone uploads
+    // from atoms_) out of a reserved sub-pool of W_res = min(n, 6) slots.
+    self_loop_ = (part_.z_global == 0 && z_ == 1);
+    S_ = self_loop_
+             ? n_ + 2
+             : std::min(n_ + 2, std::max(8, (n_ + Z_ - 1) / Z_ + 4));
     pbc_z_ = box_.periodic[2];
     for (const auto& m : zd_.members) cap_ = std::max(cap_, int(m.size()));
     cap_ = std::max(cap_, 1);
@@ -343,21 +358,28 @@ class GpuTimeConveyor {
       ncells_ = make_zone_grid(box_.lo.data(), len, per, rcut_, n_, 0).ncells();
     }
     alloc_nodes();
-    if (node0_ == 0) preload_node0();  // §7.3: only the rank owning P1
+    // Pool partition: ids [0, S-W) circulate as producer credits / the
+    // boundary free list; ids [S-W, S) are node 0's pass-1 upload reserve
+    // (drained into the main pool after pass 1). Self-loop: ONE pool.
+    const bool owns0 = (node0_ == 0);
+    const int W = self_loop_ ? S_ : (owns0 ? std::min(n_, 6) : 0);
+    if (owns0)
+      for (int s2 = S_ - W; s2 < S_; ++s2) p1free_.push_back(s2);
     transport_ = std::make_unique<StreamTransport>(z_, S_, std::size_t(n_) + 2);
     for (int k = 0; k < z_; ++k) {  // intra edge k feeds local node (k+1)%z
       if (part_.in && k == z_ - 1) continue;  // wrap edge replaced by boundary
+      if (self_loop_) continue;               // single pool, no channel
       const int kn = (k + 1) % z_;
-      for (int s2 = (kn == 0 && !part_.in && node0_ == 0 ? n_ : 0); s2 < S_; ++s2)
-        transport_->edge(k).credits_.send(int(s2));
+      const int hi = (kn == 0 && !part_.in && owns0) ? S_ - W : S_;
+      for (int s2 = 0; s2 < hi; ++s2) transport_->edge(k).credits_.send(int(s2));
     }
     if (part_.in) {  // local node 0 manages its own slot pool + host staging
-      for (int s2 = (node0_ == 0 ? n_ : 0); s2 < S_; ++s2)
-        bfree_.push_back(s2);
+      for (int s2 = 0; s2 < S_ - W; ++s2) bfree_.push_back(s2);
       TDMD_CU(cudaHostAlloc(&in_stage_, wire_bytes(), 0));
       TDMD_CU(cudaHostAlloc(&out_stage_, wire_bytes(), 0));
       TDMD_CU(cudaEventCreateWithFlags(&in_evt_, cudaEventDisableTiming));
     }
+    if (owns0) p1host_.resize(DevSlot::kArrays * std::size_t(cap_));
 
     {
       std::vector<std::jthread> nodes;
@@ -483,29 +505,29 @@ class GpuTimeConveyor {
     node_.clear();
   }
 
-  // §7.3: P1 starts with every zone in d — upload t0 state into node 0
-  // slots 0..n-1. Λ pre-history and dt(1) are synthesized like the CPU.
-  void preload_node0() {
-    std::vector<double> h(DevSlot::kArrays * std::size_t(cap_), 0.0);
-    for (int j = 0; j < n_; ++j) {
-      const auto& mem = zd_.members[std::size_t(j)];
-      for (std::size_t t = 0; t < mem.size(); ++t) {
-        const int i = mem[t];
-        h[0 * cap_ + t] = atoms_.x[i];
-        h[1 * cap_ + t] = atoms_.y[i];
-        h[2 * cap_ + t] = atoms_.z[i];
-        h[3 * cap_ + t] = atoms_.vx[i];
-        h[4 * cap_ + t] = atoms_.vy[i];
-        h[5 * cap_ + t] = atoms_.vz[i];
-        h[6 * cap_ + t] = atoms_.fx[i];
-        h[7 * cap_ + t] = atoms_.fy[i];
-        h[8 * cap_ + t] = atoms_.fz[i];
-        h[9 * cap_ + t] = atoms_.mass[i];
-      }
-      TDMD_CU(cudaMemcpy(node_[0].slot[std::size_t(j)].base, h.data(),
-                         DevSlot::kArrays * sizeof(double) * cap_,
-                         cudaMemcpyHostToDevice));
+  // §7.3 streamed preload: upload zone `zone_id`'s t0 state into the given
+  // slot ON DEMAND (gathered from atoms_ — no bulk host image). Synchronous
+  // memcpy on the legacy default stream: ordered after any enqueued reads of
+  // a recycled slot, and the gather buffer is reused safely.
+  void upload_zone(int dev_slot, int zone_id) {
+    const auto& mem = zd_.members[std::size_t(zone_id)];
+    std::fill(p1host_.begin(), p1host_.end(), 0.0);
+    for (std::size_t t = 0; t < mem.size(); ++t) {
+      const int i = mem[t];
+      p1host_[0 * cap_ + t] = atoms_.x[i];
+      p1host_[1 * cap_ + t] = atoms_.y[i];
+      p1host_[2 * cap_ + t] = atoms_.z[i];
+      p1host_[3 * cap_ + t] = atoms_.vx[i];
+      p1host_[4 * cap_ + t] = atoms_.vy[i];
+      p1host_[5 * cap_ + t] = atoms_.vz[i];
+      p1host_[6 * cap_ + t] = atoms_.fx[i];
+      p1host_[7 * cap_ + t] = atoms_.fy[i];
+      p1host_[8 * cap_ + t] = atoms_.fz[i];
+      p1host_[9 * cap_ + t] = atoms_.mass[i];
     }
+    TDMD_CU(cudaMemcpy(node_[0].slot[std::size_t(dev_slot)].base,
+                       p1host_.data(), DevSlot::kArrays * sizeof(double) * cap_,
+                       cudaMemcpyHostToDevice));
   }
 
   void node_main(int k) {
@@ -554,7 +576,11 @@ class GpuTimeConveyor {
         PassSlot& s = slot[std::size_t(arrived)];
         const int want_id = (r + arrived) % n_;
         if (preload) {
-          s.dev = arrived;  // preload occupies slots 0..n-1
+          if (p1free_.empty())
+            throw std::logic_error("gpu conveyor: preload reserve exhausted");
+          s.dev = p1free_.front();
+          p1free_.pop_front();
+          upload_zone(s.dev, want_id);  // streamed §7.3 (INV-7 pool)
           s.n_atoms = int(zd_.members[std::size_t(want_id)].size());
           s.lam_in = lam0_;
           if (arrived == 0) dt = o_.dt_initial;
@@ -784,6 +810,20 @@ class GpuTimeConveyor {
         outq.pop_front();
         PassSlot& s = slot[std::size_t(j)];
         const DevSlot& src = nb.slot[std::size_t(s.dev)];
+        // freeing a source slot back to its owner pool: the pass-1 reserve
+        // recycles uploads; the self-loop keeps ONE pool; boundary-fed node
+        // 0 uses its local list (stream order covers reuse); intra-fed
+        // nodes pair a recorded free event with an upstream credit.
+        auto free_src = [&](int dev) {
+          if (self_loop_ || preload) {
+            p1free_.push_back(dev);
+          } else if (b_in) {
+            bfree_.push_back(dev);
+          } else {
+            TDMD_CU(cudaEventRecord(in.free_[std::size_t(dev)], nb.stream));
+            in.credits_.send(int(dev));
+          }
+        };
         if (h == o_.steps) {  // ring ends — land the payload on the host
           HostZone& hz = final_[std::size_t(s.fsm.id)];
           hz.n = s.n_atoms;
@@ -793,6 +833,7 @@ class GpuTimeConveyor {
                                   cudaMemcpyDeviceToHost, nb.stream));
           TDMD_CU(cudaStreamSynchronize(nb.stream));
           final_seen_.store(true, std::memory_order_release);
+          free_src(s.dev);  // streamed-preload uploads need recycled slots
           continue;
         }
         const int kn = (k + 1) % z_;
@@ -835,20 +876,19 @@ class GpuTimeConveyor {
           TDMD_CU(cudaStreamSynchronize(nb.stream));
           core::ZoneFSM::apply(s.fsm, core::ZoneEvent::SEND);  // T5
           part_.out->send(gh, out_stage_, wire_bytes());
-          // free MY source slot: if this node's in-edge is the boundary, the
-          // pool is local (stream order serializes the read-out above vs any
-          // later H2D into the slot); otherwise the usual event+credit.
-          if (b_in) {
-            bfree_.push_back(s.dev);
-          } else {
-            TDMD_CU(cudaEventRecord(in.free_[std::size_t(s.dev)], nb.stream));
-            in.credits_.send(int(s.dev));
-          }
+          free_src(s.dev);
           ++sent;
           continue;
         }
         int dst = -1;
-        if (!out.credits_.recv(dst)) return false;  // free-slot credit
+        if (self_loop_) {  // one node, one thread, one pool
+          if (p1free_.empty())
+            throw std::logic_error("gpu conveyor: self-loop pool exhausted");
+          dst = p1free_.front();
+          p1free_.pop_front();
+        } else if (!out.credits_.recv(dst)) {
+          return false;  // free-slot credit (shutdown)
+        }
         // slot-reuse safety: the credit is pushed only after the consumer
         // recorded free_[dst], so this wait is never a no-op on a live slot
         TDMD_CU(cudaStreamWaitEvent(nb.stream, out.free_[std::size_t(dst)], 0));
@@ -870,16 +910,8 @@ class GpuTimeConveyor {
                                   cudaMemcpyDeviceToDevice, nb.stream));
         }
         TDMD_CU(cudaEventRecord(out.arrival_[std::size_t(dst)], nb.stream));
-        // my source slot becomes reusable once that copy has READ it: if the
-        // in-edge is the process boundary the pool is local and stream order
-        // suffices; otherwise record the event FIRST, then hand the credit
-        // back upstream
-        if (b_in) {
-          bfree_.push_back(s.dev);
-        } else {
-          TDMD_CU(cudaEventRecord(in.free_[std::size_t(s.dev)], nb.stream));
-          in.credits_.send(int(s.dev));
-        }
+        // my source slot becomes reusable once that copy has READ it
+        free_src(s.dev);
 
         GpuHeader gh;
         gh.hdr.zone_id = s.fsm.id;
@@ -945,6 +977,23 @@ class GpuTimeConveyor {
       if (!compute_zone(j)) return false;
     }
     if (!flush_sends()) return false;
+
+    if (preload && !self_loop_) {
+      // pass 1 done: the upload reserve joins the main circulation. Intra
+      // consumers pair credits with RECORDED free events (the unrecorded-
+      // event wait is a no-op — the M5a lesson), so record them now: every
+      // pending read of these slots is already enqueued on this stream.
+      while (!p1free_.empty()) {
+        const int dev = p1free_.front();
+        p1free_.pop_front();
+        if (b_in) {
+          bfree_.push_back(dev);
+        } else {
+          TDMD_CU(cudaEventRecord(in.free_[std::size_t(dev)], nb.stream));
+          in.credits_.send(int(dev));
+        }
+      }
+    }
 
     if (o_.mixed_transport) {  // pack-overflow flags from this pass's sends
       TDMD_CU(cudaMemcpyAsync(&nb.h_end->flags, nb.d_flags, 4,
@@ -1023,6 +1072,9 @@ class GpuTimeConveyor {
   int ncells_ = 1;
   int node0_ = 0;
   std::deque<int> bfree_;          // local slot pool of a boundary-fed node 0
+  std::deque<int> p1free_;         // pass-1 upload reserve / self-loop pool
+  std::vector<double> p1host_;     // reusable gather buffer (node 0 thread)
+  bool self_loop_ = false;
   double* in_stage_ = nullptr;     // pinned boundary staging (M5a)
   double* out_stage_ = nullptr;
   cudaEvent_t in_evt_{};

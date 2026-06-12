@@ -178,7 +178,7 @@ double run_ring(const core::AtomSoA<double>& init, const core::Box& box,
 void mem_probe(int zones, int nodes, bool mixed) {
   const long N = 10'000'000;
   const int cap = int((N + zones - 1) / zones);
-  const int S = zones + 2;
+  const int S = std::min(zones + 2, std::max(8, (zones + nodes - 1) / nodes + 4));  // INV-7
   std::size_t total = 0;
   std::vector<void*> blocks;
   auto grab = [&](std::size_t bytes) {

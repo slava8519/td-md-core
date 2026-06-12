@@ -541,6 +541,39 @@ TEST(CudaConveyor, CellListsBitwiseVsTiles) {
   EXPECT_TRUE(bitwise_eq(mt, mc));
 }
 
+// --- INV-7 slot-pool reduction: n_zones = 16 > S = 8 (z >= 2) with the
+// streamed P1 preload. The CPU ring keeps its full pool — bitwise equality
+// proves the pool size and upload order are protocol-invisible. z = 1 takes
+// the self-loop path (S = n+2, single pool) with the same streamed preload. ---
+
+TEST(CudaConveyor, SlotPoolReductionBitwise) {
+  core::Box box;
+  auto init = make_fcc(box, 2, 2, 32, /*pz=*/false);  // 512 atoms, 16 slabs
+  core::thermal::maxwell_init(init, 300.0, 89);
+  const auto lj = make_lj(0.4, 2.55, kRcut);
+  const auto o1 = opts_fixed(40, 16, 1, 0.002);
+
+  auto cpu = run_cpu(init, box, o1, lj);
+  for (int z : {1, 2, 3}) {
+    auto oz = o1;
+    oz.n_nodes = z;
+    auto gpu = run_gpu(init, box, oz, lj);
+    EXPECT_TRUE(bitwise_eq(cpu, gpu)) << "z=" << z;
+  }
+
+  core::Box pb = box;             // PBC closure with the reduced pool
+  pb.periodic = {true, true, true};
+  auto pinit = make_fcc(pb, 2, 2, 32, /*pz=*/true);
+  core::thermal::maxwell_init(pinit, 300.0, 97);
+  auto pcpu = run_cpu(pinit, pb, o1, lj);
+  for (int z : {2, 3}) {
+    auto oz = o1;
+    oz.n_nodes = z;
+    auto pgpu = run_gpu(pinit, pb, oz, lj);
+    EXPECT_TRUE(bitwise_eq(pcpu, pgpu)) << "pbc z=" << z;
+  }
+}
+
 // --- INV-4 fires through the device reduction path ---
 
 TEST(CudaConveyor, CausalityHaltFires) {

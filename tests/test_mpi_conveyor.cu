@@ -281,6 +281,14 @@ int main(int argc, char** argv) {
   run_case("lj fixed pbc-z", pinit, pbox, o, make_lj64(), rank, nranks);
   run_case("lj fixed pbc-z", pinit, pbox, o, make_lj64(), rank, nranks, 2);
 
+  // INV-7 reduced slot pool over MPI: n_zones=16 > S=8 per logical node
+  core::Box sb;
+  auto sinit = make_fcc(sb, 2, 2, 32);
+  core::thermal::maxwell_init(sinit, 300.0, 91);
+  auto os = o;
+  os.n_zones = 16;
+  run_case("lj fixed n16 S8", sinit, sb, os, make_lj64(), rank, nranks, 2);
+
   // k steps per node (M5a, Гл. 3.4): bitwise vs Z = np*k single-process
   run_case("lj fixed fp64", init, box, o, make_lj64(), rank, nranks, 2);
   run_case("lj auto fp64", init, box, oa, make_lj64(), rank, nranks, 3);
