@@ -80,3 +80,29 @@ The single-zone-underfill conclusion holds across plausible profiles, so it does
 ```
 
 **Tier-2 (on GPU, M2.7+):** device limits via `tools/devprobe` (`cudaGetDeviceProperties` + `cudaOccupancyMaxActiveBlocksPerMultiprocessor` on a reference kernel); achieved occupancy via Nsight Compute `sm__warps_active.avg.pct_of_peak_sustained_active` on the real force kernel — lands with the M3 prototype.
+
+---
+
+## Tier-2 update (2026-06-12): real kernel measurements — M3 prototype
+
+`tests/test_cuda_cluster.cu` (block 128 = 4 warp-clusters, shared staging 3 KiB/block,
+owner-writes, no atomics), measured via `cudaFuncGetAttributes` +
+`cudaOccupancyMaxActiveBlocksPerMultiprocessor` on the live RTX 5080:
+
+| instantiation | regs/thread | blocks/SM | theoretical occupancy |
+|---|--:|--:|--:|
+| fp64 pair math | **56** | 9 | **75%** |
+| fp32 pair math | **62** (double↔float conversions add temporaries) | 8 | **67%** |
+
+- The Tier-1 model with these regs reproduces the runtime-API numbers exactly
+  (it is the same arithmetic): the **40-regs input was optimistic** — at 56–62 regs
+  the kernel is register-limited below the 100% line (42.7 regs at block 128),
+  but comfortably above the 50% A2 red-flag.
+- Correctness: GPU ≡ CPU clustered ≤ 5.1e-15 eV/Å (N=10 976); fp32 path 1.6e-6;
+  compute-sanitizer memcheck/racecheck clean.
+- **Achieved** occupancy via `ncu sm__warps_active...` blocked by
+  ERR_NVGPUCTRPERM (GPU perf counters need `NVreg_RestrictProfilingToAdminUsers=0`
+  + reboot, or root) — deferred, not a CI gate. Theoretical-vs-model match is exact.
+- Register pressure is the M4 optimization lever (lower precision of min-image
+  arithmetic, fewer live temporaries); zones-to-saturate at 75% occupancy: ~12
+  instead of ~9 (same conclusion: batching required).

@@ -138,5 +138,13 @@ if(TDMD_BUILD_TESTS)
     target_link_libraries(test_cuda_smoke PRIVATE GTest::gtest_main)
     add_test(NAME Test_CUDA_Smoke COMMAND test_cuda_smoke)
     set_tests_properties(Test_CUDA_Smoke PROPERTIES LABELS cuda)
+
+    add_executable(test_cuda_cluster tests/test_cuda_cluster.cu)  # M3 Tier-2
+    target_link_libraries(test_cuda_cluster PRIVATE tdmd_core GTest::gtest_main)
+    # real regs/thread for the occupancy model (Tier-2): keep -Xptxas -v in the log
+    target_compile_options(test_cuda_cluster PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
+    add_test(NAME Test_CUDA_Cluster COMMAND test_cuda_cluster)
+    set_tests_properties(Test_CUDA_Cluster PROPERTIES LABELS cuda)
   endif()
 endif()

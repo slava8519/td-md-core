@@ -16,7 +16,7 @@ echo "=== gpu_gate: ctest -L cuda ==="
 ctest --test-dir "$BUILD" -L cuda --output-on-failure
 
 SANITIZER="${COMPUTE_SANITIZER:-compute-sanitizer}"
-for bin in "$BUILD"/test_cuda_smoke; do
+for bin in "$BUILD"/test_cuda_*; do
   [[ -x "$bin" ]] || continue
   for tool in memcheck racecheck; do
     echo "=== gpu_gate: $SANITIZER --tool $tool $(basename "$bin") ==="
