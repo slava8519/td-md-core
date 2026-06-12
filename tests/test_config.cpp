@@ -77,12 +77,14 @@ TEST(Config, ValidConfigParses) {
 TEST(Config, ShippedConfigsAreValid) {
   EXPECT_NO_THROW(io::load_config(project_root() + "/config/config_m0.yaml"));
   EXPECT_NO_THROW(io::load_config(project_root() + "/config/config_auto.yaml"));
+  EXPECT_NO_THROW(io::load_config(project_root() + "/config/config_ring.yaml"));
 }
 
 TEST(Config, ShippedConfigsEmitNoWarnings) {
   testing::internal::CaptureStderr();
   io::load_config(project_root() + "/config/config_m0.yaml");
   io::load_config(project_root() + "/config/config_auto.yaml");
+  io::load_config(project_root() + "/config/config_ring.yaml");
   const std::string err = testing::internal::GetCapturedStderr();
   EXPECT_EQ(err.find("[config] warning"), std::string::npos) << err;
 }
@@ -256,6 +258,37 @@ geometry: { file: reference_data/al_fcc_72.data }
 potential: { type: morse, r_cut: 4.0, lj: { epsilon: -1.0 } }
 )");
   EXPECT_NO_THROW(io::load_config(morse_with_bad_lj.path()));
+}
+
+// --- M4: decomposition / ring keys (CLI conveyor path) ---
+
+TEST(Config, RingKeysParse) {
+  TempConfig cfg(std::string(kValid) +
+                 "\ndecomposition: { axis: z, mode: by_n_zones, n_zones: 2, "
+                 "ring: { backend: streams, n_nodes: 4 } }\n");
+  io::Config c = io::load_config(cfg.path());
+  EXPECT_EQ(c.n_zones, 2);
+  EXPECT_EQ(c.ring_nodes, 4);
+  EXPECT_EQ(c.ring_backend, "streams");
+}
+
+TEST(Config, ZoneWidthBelowRcutIsFatal) {  // ConfigSchema: причинность
+  expect_throws_with(std::string(kValid) +
+                         "\ndecomposition: { mode: by_zone_width, "
+                         "zone_width: 2.0 }\n",
+                     "zone_width");
+}
+
+TEST(Config, StepsPerNodeBeyondOneIsFatal) {  // k>1 — M5a (Гл. 3.4)
+  expect_throws_with(std::string(kValid) +
+                         "\ndecomposition: { ring: { steps_per_node: 3 } }\n",
+                     "steps_per_node");
+}
+
+TEST(Config, BadRingBackendIsFatal) {
+  expect_throws_with(std::string(kValid) +
+                         "\ndecomposition: { ring: { backend: warp } }\n",
+                     "decomposition.ring.backend");
 }
 
 // Review M3: a scheme name in the legacy bool key is the likely migration

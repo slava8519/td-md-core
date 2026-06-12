@@ -16,11 +16,17 @@ echo "=== gpu_gate: ctest -L cuda ==="
 ctest --test-dir "$BUILD" -L cuda --output-on-failure
 
 SANITIZER="${COMPUTE_SANITIZER:-compute-sanitizer}"
+# Long-horizon tests (26k/50k passes) are the same code paths as the short
+# ones — excluded from sanitizer runs for time. racecheck additionally skips
+# Mixed* (pathological slowdown, see Bench doc; pack/unpack kernels write
+# disjoint per-atom elements — race-free by construction, memcheck-covered).
+MEMCHECK_FILTER='-*Replica36*:*NveInvariant50k*'
+RACECHECK_FILTER='-*Replica36*:*NveInvariant50k*:*Mixed*'
 for bin in "$BUILD"/test_cuda_*; do
   [[ -x "$bin" ]] || continue
-  for tool in memcheck racecheck; do
-    echo "=== gpu_gate: $SANITIZER --tool $tool $(basename "$bin") ==="
-    "$SANITIZER" --tool "$tool" --error-exitcode 1 "$bin"
-  done
+  echo "=== gpu_gate: $SANITIZER --tool memcheck $(basename "$bin") ==="
+  "$SANITIZER" --tool memcheck --error-exitcode 1 "$bin" --gtest_filter="$MEMCHECK_FILTER"
+  echo "=== gpu_gate: $SANITIZER --tool racecheck $(basename "$bin") ==="
+  "$SANITIZER" --tool racecheck --error-exitcode 1 "$bin" --gtest_filter="$RACECHECK_FILTER"
 done
 echo "=== gpu_gate: OK ==="

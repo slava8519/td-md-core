@@ -1,0 +1,13 @@
+# === TD-MD Core — TD ring demo (M4): CPU reference conveyor ===
+# Golden Al-72, free boundaries, 2 zones (bipartition, width 4.05 >= r_cut),
+# 2 ring nodes, auto-step — the §3.6-style configuration via the CLI.
+run: { steps: 200, ensemble: nve, seed: 1, init_temperature: 300.0 }
+units: metal
+precision: { mode: deterministic_fp64 }
+geometry: { file: reference_data/al_fcc_72.data, format: lammps_data }
+boundary: { x: free, y: free, z: free }
+decomposition: { axis: z, mode: by_n_zones, n_zones: 2, cell_size: 2.33, ring: { backend: streams, n_nodes: 2 } }
+potential: { type: morse, r_cut: 4.0, truncation: shift, morse: { D: 0.29614, alpha: 1.11892, r0: 3.29692 } }
+timestep: { mode: auto, dt_initial: 0.001, dt_max: 0.02, C1: 0.1, K2: 50.0, C3: 0.5, C_buf: 1.5 }
+integrator: velocity_verlet
+io: { rescue: { enabled: true, file: rescue.xyz } }

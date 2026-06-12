@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cstdio>
 #include <string>
 #include <cmath>
@@ -6,15 +7,42 @@
 #include "tdmd/io/reader_lammps.hpp"
 #include "tdmd/io/writer.hpp"
 #include "tdmd/io/rescue.hpp"
+#include "tdmd/core/conveyor.hpp"
 #include "tdmd/core/soa.hpp"
 #include "tdmd/core/simulation.hpp"
 #include "tdmd/core/thermal.hpp"
+#include "tdmd/potentials/cutoff.hpp"
 #include "tdmd/potentials/morse.hpp"
 #include "tdmd/potentials/clustered_morse.hpp"
 #include "tdmd/potentials/lj.hpp"
+#include "tdmd/potentials/pair_lj.hpp"
+#include "tdmd/potentials/pair_morse.hpp"
 #include "tdmd/units.hpp"
 
 using namespace tdmd;
+
+namespace {
+
+// Ring-path pair functors (the conveyor PairFn contract: FP64, truncation
+// applied, const-callable and stateless — invoked from every node thread).
+struct RingMorse {
+  potentials::MorseParams<double> prm;
+  potentials::CutoffScheme cs;
+  void operator()(double r, double& u, double& f_over_r) const {
+    potentials::pair_morse(r, prm, u, f_over_r);
+    cs.apply(r, u, f_over_r);
+  }
+};
+struct RingLJ {
+  potentials::LJParams<double> prm;
+  potentials::CutoffScheme cs;
+  void operator()(double r, double& u, double& f_over_r) const {
+    potentials::pair_lj(r, prm, u, f_over_r);
+    cs.apply(r, u, f_over_r);
+  }
+};
+
+}  // namespace
 
 int main(int argc, char** argv) {
   const std::string cfg_path = (argc > 1) ? argv[1] : "config/config_m0.yaml";
@@ -91,6 +119,70 @@ int main(int argc, char** argv) {
     std::printf("auto-step    : C1=%g K2=%g C3=%g C_buf=%g cell=%g dt_max=%g\n",
                 opt.ts.C1, opt.ts.K2, opt.ts.C3, opt.ts.C_buf,
                 opt.ts.cell_size, opt.ts.dt_max);
+
+  // --- M4: TD ring path (CPU reference conveyor) when decomposition asks ---
+  int n_zones = cfg.n_zones;
+  if (cfg.decomp_mode == "by_zone_width" && cfg.zone_width > 0.0)
+    n_zones = std::max(1, int(box.len(2) / cfg.zone_width));
+  if (n_zones > 1 || cfg.ring_nodes > 1) {
+    std::printf("ring         : CPU reference conveyor  zones=%d  nodes=%d\n"
+                "               (io.trajectory/neighbor.mode не действуют на "
+                "кольцевом пути — M4)\n",
+                n_zones, cfg.ring_nodes);
+    core::ConveyorOptions co;
+    co.steps = cfg.steps;
+    co.n_zones = n_zones;
+    co.n_nodes = cfg.ring_nodes;
+    co.auto_step = (cfg.ts_mode == "auto");
+    co.dt_initial = cfg.dt;
+    co.ts = {cfg.C1, cfg.K2, cfg.C3, cfg.C_buf, cfg.cell_size, cfg.dt_max, 1e-6};
+
+    const potentials::Truncation rtr =
+        cfg.truncation == "cut"           ? potentials::Truncation::Cut
+        : cfg.truncation == "force_shift" ? potentials::Truncation::ForceShift
+                                          : potentials::Truncation::Shift;
+    core::ConveyorResult rc;
+    try {
+      if (cfg.pot_type == "lj") {
+        potentials::LJParams<double> p{cfg.lj_epsilon, cfg.lj_sigma};
+        RingLJ pair{p, potentials::CutoffScheme::make(
+                           rtr, cfg.rcut, [&](double r, double& u, double& f) {
+                             potentials::pair_lj(r, p, u, f);
+                           })};
+        rc = core::run_conveyor(atoms, box, cfg.rcut, pair, co);
+      } else {
+        potentials::MorseParams<double> p{cfg.D, cfg.alpha, cfg.r0};
+        RingMorse pair{p, potentials::CutoffScheme::make(
+                              rtr, cfg.rcut, [&](double r, double& u, double& f) {
+                                potentials::pair_morse(r, p, u, f);
+                              })};
+        rc = core::run_conveyor(atoms, box, cfg.rcut, pair, co);
+      }
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "[fatal] ring: %s\n", e.what());
+      return 1;
+    }
+    if (rc.halt != core::Halt::None) {
+      std::fprintf(stderr, "[HALT] %s\n", rc.halt_msg.c_str());
+      if (cfg.rescue_enabled) {
+        // ring halt: atoms hold the t0 state (a consistent mid-ring geometry
+        // does not exist — ZoneFSM §9; the in-flight dump is an M4+ item)
+        io::write_rescue_xyz(cfg.rescue_file, atoms, box,
+                             rc.halt_msg + " [ring: t0 state]");
+        std::fprintf(stderr, "[HALT] rescue dump (t0 state): %s\n",
+                     cfg.rescue_file.c_str());
+      }
+      return 3;
+    }
+    const auto& last = rc.stats.back();
+    std::printf("step 0       : E=%.10f eV\n", rc.e0);
+    std::printf("after %ld    : E=%.10f eV  (pe=%.10f ke=%.10f)\n",
+                rc.steps_done, last.pe + last.ke, last.pe, last.ke);
+    if (co.auto_step)
+      std::printf("final dt     : %.5g ps  (v_max=%.4g Å/ps)\n", last.dt,
+                  last.v_max);
+    return 0;
+  }
 
   std::printf("neighbor     : %s%s\n", cfg.neighbor_mode.c_str(),
               cfg.neighbor_mode == "cluster"

@@ -67,8 +67,9 @@ target_link_libraries(tdmd_config PUBLIC yaml-cpp)
 target_compile_options(tdmd_config PRIVATE -Wall -Wextra)
 
 # --- engine executable ---
+find_package(Threads REQUIRED)   # M4: the CLI ring path runs on std::jthread
 add_executable(tdmd src/main.cpp)
-target_link_libraries(tdmd PRIVATE tdmd_core tdmd_config)
+target_link_libraries(tdmd PRIVATE tdmd_core tdmd_config Threads::Threads)
 target_compile_options(tdmd PRIVATE -Wall -Wextra)
 
 # --- M2.5 Tier-1 occupancy probe (CUDA-free analytical tool) ---

@@ -112,7 +112,7 @@ logging:
 |------|------------------|---------------------|
 | `precision.mode` | enum | `deterministic_fp64` ⇒ форсить fp64 везде |
 | `decomposition.zone_width` | float ≥ `potential.r_cut` | иначе **fatal** (нарушение причинности) |
-| `decomposition.ring.n_nodes` | int ≥ 2 | минимум памяти INV-7 |
+| `decomposition.ring.n_nodes` | int ≥ 1 | 1 = одноузловой эталонный прогон; минимум памяти INV-7 |
 | `decomposition.ring.backend` | enum | `streams` ⇒ 1 GPU; `multi_gpu` ⇒ проверить число GPU |
 | `boundary.<axis>` | periodic/free | PBC по оси декомпозиции ⇒ включить замыкание кольца (A7) |
 | `potential.r_cut` | float ≤ ½·мин. ребро бокса | для min-image при PBC |

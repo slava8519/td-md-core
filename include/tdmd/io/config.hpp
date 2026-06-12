@@ -35,6 +35,15 @@ struct Config {
   // neighbor (M3)
   std::string neighbor_mode = "direct";  // direct (O(N²) reference) | cluster
   double skin = 1.0;                     // Å, pair-list skin (neighbor.skin)
+  // decomposition (M4: the CLI drives the CPU reference ring when
+  // n_zones > 1 or ring.n_nodes > 1; the GPU ring is bench/test-driven)
+  std::string decomp_axis = "z";           // z (the only axis, дисс. Гл. 2.1)
+  std::string decomp_mode = "by_n_zones";  // by_n_zones | by_zone_width
+  int    n_zones = 1;
+  double zone_width = 0.0;                 // Å (mode by_zone_width; >= r_cut)
+  std::string ring_backend = "streams";    // streams | multi_gpu (M5b)
+  int    ring_nodes = 1;
+  int    steps_per_node = 1;               // k steps/node — M5a (must be 1)
   // io
   std::string traj_file  = "traj.lammpstrj";
   long        traj_every = 50;

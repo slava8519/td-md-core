@@ -198,12 +198,35 @@ Config load_config(const std::string& path) {
   if (auto d = root["decomposition"]) {
     warn_unknown_keys(d, "decomposition",
                       {"axis", "mode", "zone_width", "n_zones", "cell_size", "ring"});
-    if (auto r = d["ring"])
+    if (d["axis"])       c.decomp_axis = d["axis"].as<std::string>();
+    if (d["mode"])       c.decomp_mode = d["mode"].as<std::string>();
+    if (d["n_zones"] && !d["n_zones"].IsNull())
+      c.n_zones = d["n_zones"].as<int>();
+    if (d["zone_width"] && !d["zone_width"].IsNull())
+      c.zone_width = d["zone_width"].as<double>();
+    if (auto r = d["ring"]) {
       warn_unknown_keys(r, "decomposition.ring",
                         {"backend", "n_nodes", "steps_per_node", "transport"});
+      if (r["backend"])        c.ring_backend  = r["backend"].as<std::string>();
+      if (r["n_nodes"])        c.ring_nodes    = r["n_nodes"].as<int>();
+      if (r["steps_per_node"]) c.steps_per_node = r["steps_per_node"].as<int>();
+    }
     if (d["cell_size"]) c.cell_size = d["cell_size"].as<double>();
   }
   v.check(c.cell_size > 0.0, "decomposition.cell_size must be > 0");
+  v.check_enum(c.decomp_axis, "decomposition.axis", {"z"});
+  v.check_enum(c.decomp_mode, "decomposition.mode",
+               {"by_n_zones", "by_zone_width"});
+  v.check(c.n_zones >= 1, "decomposition.n_zones must be >= 1");
+  if (c.decomp_mode == "by_zone_width" || c.zone_width != 0.0)
+    v.check(c.zone_width >= c.rcut,
+            "decomposition.zone_width must be >= potential.r_cut "
+            "(нарушение причинности — ConfigSchema)");
+  v.check_enum(c.ring_backend, "decomposition.ring.backend",
+               {"streams", "multi_gpu"});
+  v.check(c.ring_nodes >= 1, "decomposition.ring.n_nodes must be >= 1");
+  v.check(c.steps_per_node == 1,
+          "decomposition.ring.steps_per_node: k>1 lands at M5a (Гл. 3.4)");
 
   if (auto nb = root["neighbor"]) {
     warn_unknown_keys(nb, "neighbor", {"mode", "skin"});
