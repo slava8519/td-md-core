@@ -137,6 +137,10 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_lj_nist PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_LJ_NIST COMMAND test_lj_nist)
 
+  add_executable(test_zones tests/test_zones.cpp)          # M3.5: B1 + w-assembly
+  target_link_libraries(test_zones PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_Zones COMMAND test_zones)
+
   if(TDMD_WITH_CUDA)                                       # M2.7: toolchain smoke
     add_executable(test_cuda_smoke tests/test_cuda_smoke.cu)
     target_link_libraries(test_cuda_smoke PRIVATE GTest::gtest_main)
