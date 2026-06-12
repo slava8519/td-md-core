@@ -62,9 +62,14 @@ SimResult run_simulation(AtomSoA<Real>& atoms, const Box& box, Pot& pot,
 
   double dt = o.dt;
   double v_max_prev = buffer::max_speed(atoms);  // local v_max (A8)
+  double a_max_prev = buffer::max_accel(atoms);  // forces are current (computed above)
   for (long step = 1; step <= o.steps; ++step) {
-    // Buffer for this step uses the previous pass's (conservative) v_max (A8).
-    const double R_buf = buffer::compute_R_buf(v_max_prev, dt, o.ts.C_buf);
+    // Buffer for this step is sized from the speed an atom may REACH during
+    // the step: v_pred = v_max + a_max·dt (A8; [ENG] refinement of eq.33's
+    // v̄_max — see buffer::max_accel). Everything is known BEFORE the step:
+    // v_max and forces of the last completed pass — no global reduce.
+    const double v_pred = v_max_prev + a_max_prev * dt;
+    const double R_buf = buffer::compute_R_buf(v_pred, dt, o.ts.C_buf);
 
     VelocityVerlet<Real>::first_half(atoms, dt);
     zero_forces(atoms);
@@ -83,9 +88,11 @@ SimResult run_simulation(AtomSoA<Real>& atoms, const Box& box, Pot& pot,
     const double v_max_now = buffer::max_speed(atoms);
     // INV-4: no atom may cross the buffer — checked in BOTH fixed and auto
     // modes (B10/M12; ZoneFSM §6 says "always", eq.33 is unconditional).
-    // step>1 skips the rest-start transient where the stale v_max (=0) would
-    // give a meaningless R_buf.
-    if (step > 1 && !buffer::causality_ok(v_max_now, dt, R_buf)) {
+    // The v_pred-sized buffer covers the rest-start ballistic ramp, so the
+    // check holds from step 1; what still trips it is force appearing FASTER
+    // than the entry-state forecast (e.g. flying through the cutoff into the
+    // repulsive wall) — a true causality hazard.
+    if (!buffer::causality_ok(v_max_now, dt, R_buf)) {
       r.halt = Halt::Causality;
       char buf[160];
       std::snprintf(buf, sizeof(buf),
@@ -100,6 +107,7 @@ SimResult run_simulation(AtomSoA<Real>& atoms, const Box& box, Pot& pot,
     if (o.frame_every > 0 && step % o.frame_every == 0) on_frame(step);
 
     v_max_prev = v_max_now;
+    a_max_prev = buffer::max_accel(atoms);  // forces of this completed pass
     if (o.auto_step)
       dt = buffer::auto_dt(v_max_now, dt, o.ts,
                            buffer::temperature_limited_dt(atoms, o.ts.K2));

@@ -52,6 +52,22 @@ double max_speed(const AtomSoA<Real>& a) {
   return std::sqrt(v2max);
 }
 
+// Local a_max from the current forces (metal units: Å/ps²). Used to size the
+// buffer for the speed an atom may REACH during the step, not just the speed
+// it enters with: v_pred = v_max + a_max·dt. [ENG] refinement of eq.33's
+// v̄_max — without it any cold start (v=0) trips INV-4 at step 2, because the
+// ballistic ramp doubles v_max per step and no constant C_buf can absorb that.
+template <typename Real>
+double max_accel(const AtomSoA<Real>& a) {
+  double a2max = 0.0;
+  for (int i = 0; i < a.n; ++i) {
+    const double s = units::ftm2v / a.mass[i];
+    const double ax = s * a.fx[i], ay = s * a.fy[i], az = s * a.fz[i];
+    a2max = std::max(a2max, ax * ax + ay * ay + az * az);
+  }
+  return std::sqrt(a2max);
+}
+
 // Best-effort per-atom temperature-rise limit (coefficient K2, in K).
 // VERIFIED 2026-06-11: the dissertation gives NO formula for K2 — only the
 // verbal definition (Гл.3.5): "приращение температуры любого атома за один шаг

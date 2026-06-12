@@ -78,8 +78,10 @@ TEST(Determinism, RunToRunBitwiseAutoDt) {
 }
 
 // B10/M12: INV-4 fires in FIXED mode too (was gated on timestep.mode=auto).
-// Two light atoms on the repulsive Morse wall: per-step acceleration multiplies
-// v_max by far more than C_buf allows, so v_max·dt outruns R_buf at step 2.
+// Two light atoms fly at each other from OUTSIDE the cutoff (zero force, so
+// the entry-state forecast v_pred = v + a·dt sees nothing) and punch into the
+// repulsive wall within one step — force appears faster than the forecast,
+// v_max outruns the buffer. This is the true causality hazard INV-4 guards.
 TEST(Determinism, CausalityHaltFiresInFixedMode) {
   core::AtomSoA<double> atoms;
   atoms.resize(2);
@@ -87,21 +89,41 @@ TEST(Determinism, CausalityHaltFiresInFixedMode) {
   box.lo = {0, 0, 0};
   box.hi = {20, 20, 20};
   box.periodic = {true, true, true};
-  atoms.x[0] = 8.0; atoms.x[1] = 11.0;        // r = 3.0 Å — repulsive side
+  atoms.x[0] = 7.9; atoms.x[1] = 12.1;        // r = 4.2 Å — beyond r_cut = 4.0
   atoms.y[0] = atoms.y[1] = 10.0;
   atoms.z[0] = atoms.z[1] = 10.0;
   atoms.mass[0] = atoms.mass[1] = 1.0;        // light => huge acceleration
-  atoms.vx[0] = 0.05; atoms.vx[1] = -0.05;    // tiny v_max_prev => tiny R_buf
+  atoms.vx[0] = 20.0; atoms.vx[1] = -20.0;    // 0.8 Å closing per step
 
   potentials::MorsePotential<double> morse;
   core::SimOptions o;
   o.steps = 50;
-  o.dt = 0.005;
+  o.dt = 0.02;
   o.auto_step = false;                        // the whole point
   o.ts = {0.1, 50.0, 0.5, 1.5, 2.33, 0.02, 1e-6};
   auto res = core::run_simulation(atoms, box, morse, o, [](long) {});
   EXPECT_EQ(res.halt, core::Halt::Causality) << res.halt_msg;
   EXPECT_NE(res.halt_msg.find("INV-4"), std::string::npos);
+}
+
+// Regression (M3): a cold start (v=0, fixed dt) must NOT trip INV-4 — the
+// ballistic ramp doubles v_max per step, which no constant C_buf can absorb;
+// the v_pred = v + a·dt buffer sizing covers it (this is config_m0.yaml).
+TEST(Determinism, ColdStartFixedDtRunsClean) {
+  core::AtomSoA<double> atoms;
+  core::Box box;
+  box.periodic = {true, true, true};
+  ASSERT_TRUE(io::read_lammps_data(
+      project_root() + "/reference_data/al_fcc_72.data", atoms, box));
+  potentials::MorsePotential<double> morse;
+  core::SimOptions o;
+  o.steps = 100;
+  o.dt = 0.005;                                // = config_m0.yaml
+  o.auto_step = false;
+  o.ts = {0.1, 50.0, 0.5, 1.5, 2.33, 0.02, 1e-6};
+  auto res = core::run_simulation(atoms, box, morse, o, [](long) {});
+  EXPECT_EQ(res.halt, core::Halt::None) << res.halt_msg;
+  EXPECT_EQ(res.steps_done, 100);
 }
 
 // Overlap HALT at the simulation-driver level (engine smoke covered exit code).
