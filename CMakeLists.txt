@@ -25,6 +25,9 @@ if(TDMD_WITH_CUDA)
   if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES OR CMAKE_CUDA_ARCHITECTURES STREQUAL "")
     set(CMAKE_CUDA_ARCHITECTURES 120-real)
   endif()
+  # M4: the GPU conveyor headers include the M3.5 host conveyor (std::jthread)
+  set(CMAKE_CUDA_STANDARD 20)
+  set(CMAKE_CUDA_STANDARD_REQUIRED ON)
   enable_language(CUDA)
 endif()
 
@@ -180,5 +183,13 @@ if(TDMD_BUILD_TESTS)
       $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false -Xptxas=-v>)
     add_test(NAME Test_CUDA_Zones COMMAND test_cuda_zones)
     set_tests_properties(Test_CUDA_Zones PROPERTIES LABELS cuda)
+
+    add_executable(test_cuda_conveyor tests/test_cuda_conveyor.cu)  # M4: GPU ring
+    target_link_libraries(test_cuda_conveyor PRIVATE tdmd_core GTest::gtest_main
+                          Threads::Threads)
+    target_compile_options(test_cuda_conveyor PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false -Xptxas=-v>)
+    add_test(NAME Test_CUDA_Conveyor COMMAND test_cuda_conveyor)
+    set_tests_properties(Test_CUDA_Conveyor PROPERTIES LABELS cuda TIMEOUT 600)
   endif()
 endif()

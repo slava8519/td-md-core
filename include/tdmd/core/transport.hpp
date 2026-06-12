@@ -49,11 +49,15 @@ struct ZoneMsg {
 
 // Bounded SPSC channel. shutdown() (HALT path) wakes every blocked side:
 // send becomes a no-op, recv returns false — node threads unwind cleanly.
-class SpscChannel {
+// Templated (M4): the CPU ring ships whole ZoneMsg payloads through it; the
+// GPU ring ships only small zone HEADERS host-side while payloads move
+// device-side (cudaMemcpyAsync + events — conveyor_gpu.cuh StreamTransport).
+template <typename Msg>
+class SpscChannelT {
  public:
-  explicit SpscChannel(std::size_t capacity) : cap_(capacity) {}
+  explicit SpscChannelT(std::size_t capacity) : cap_(capacity) {}
 
-  void send(ZoneMsg&& m) {
+  void send(Msg&& m) {
     std::unique_lock lk(mu_);
     cv_send_.wait(lk, [&] { return q_.size() < cap_ || down_; });
     if (down_) return;
@@ -61,7 +65,7 @@ class SpscChannel {
     cv_recv_.notify_one();
   }
 
-  bool recv(ZoneMsg& out) {
+  bool recv(Msg& out) {
     std::unique_lock lk(mu_);
     cv_recv_.wait(lk, [&] { return !q_.empty() || down_; });
     if (down_) return false;
@@ -79,11 +83,13 @@ class SpscChannel {
 
  private:
   std::size_t cap_;
-  std::deque<ZoneMsg> q_;
+  std::deque<Msg> q_;
   std::mutex mu_;
   std::condition_variable cv_send_, cv_recv_;
   bool down_ = false;
 };
+
+using SpscChannel = SpscChannelT<ZoneMsg>;
 
 struct ITransport {
   virtual void send(int edge, ZoneMsg&& m) = 0;
