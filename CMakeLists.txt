@@ -20,6 +20,8 @@ option(TDMD_BUILD_TESTS "Build unit tests (Test_0_Step, NVE drift)" ON)
 option(TDMD_WITH_CUDA "Build CUDA components (tools/devprobe, Test_CUDA_Smoke)" OFF)
 # M5a: the MPI ring test (mpirun, ranks share one GPU). Needs TDMD_WITH_CUDA.
 option(TDMD_WITH_MPI "Build the M5a MPI ring test (needs CUDA + MPI)" OFF)
+# NVTX phase markers in the GPU ring (header-only NVTX3; nsys range profiling)
+option(TDMD_WITH_NVTX "Annotate the GPU conveyor with NVTX ranges" ON)
 
 if(TDMD_WITH_CUDA)
   # 120-real: SASS for the RTX 5080 dev box, no PTX (bare "120" would embed PTX
@@ -89,6 +91,18 @@ if(TDMD_WITH_CUDA)
   target_link_libraries(bench_conveyor PRIVATE tdmd_core Threads::Threads)
   target_compile_options(bench_conveyor PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+
+  # production-FMA twin (post-M5a lever): same source, FMA contraction ON.
+  # GPU-internal bitwise determinism survives FMA (B1); CPU<->GPU bitwise is
+  # a verify-build-only claim. Check with: bench_conveyor_fma --verify-det
+  add_executable(bench_conveyor_fma tools/bench_conveyor.cu)
+  target_link_libraries(bench_conveyor_fma PRIVATE tdmd_core Threads::Threads)
+
+  if(TDMD_WITH_NVTX)
+    foreach(tgt bench_conveyor bench_conveyor_fma)
+      target_compile_definitions(${tgt} PRIVATE TDMD_WITH_NVTX)
+    endforeach()
+  endif()
 endif()
 
 # --- M3 timing evidence: direct vs clustered (manual tool, not a CI gate) ---
@@ -211,6 +225,12 @@ if(TDMD_BUILD_TESTS)
     endif()
 
     add_executable(test_cuda_conveyor tests/test_cuda_conveyor.cu)  # M4: GPU ring
+    if(TDMD_WITH_NVTX)
+      target_compile_definitions(test_cuda_conveyor PRIVATE TDMD_WITH_NVTX)
+      if(TDMD_WITH_MPI)
+        target_compile_definitions(test_mpi_conveyor PRIVATE TDMD_WITH_NVTX)
+      endif()
+    endif()
     target_link_libraries(test_cuda_conveyor PRIVATE tdmd_core GTest::gtest_main
                           Threads::Threads)
     target_compile_options(test_cuda_conveyor PRIVATE

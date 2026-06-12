@@ -48,6 +48,18 @@
 #include <thread>
 #include <vector>
 
+// NVTX phase markers (M4 deferral; tech-stack item). Header-only NVTX3 from
+// the toolkit; zero-cost no-ops unless TDMD_WITH_NVTX. Host-side ranges —
+// nsys correlates the enqueued kernels/copies itself.
+#ifdef TDMD_WITH_NVTX
+#include <nvtx3/nvToolsExt.h>
+#define TDMD_NVTX_PUSH(msg) nvtxRangePushA(msg)
+#define TDMD_NVTX_POP() nvtxRangePop()
+#else
+#define TDMD_NVTX_PUSH(msg) ((void)0)
+#define TDMD_NVTX_POP() ((void)0)
+#endif
+
 #include "tdmd/core/buffer.hpp"
 #include "tdmd/core/conveyor.hpp"
 #include "tdmd/core/fsm.hpp"
@@ -160,6 +172,14 @@ static __global__ void unpack_zone_kernel(const double* pk_mass,
   base[8 * cap + i] = double(pk[8 * cap + i]) * qf;
   base[9 * cap + i] = pk_mass[i];
 }
+
+// Scoped NVTX range (RAII — survives the early returns of run_pass).
+struct NvtxScope {
+  explicit NvtxScope(const char* msg) { TDMD_NVTX_PUSH(msg); }
+  ~NvtxScope() { TDMD_NVTX_POP(); }
+  NvtxScope(const NvtxScope&) = delete;
+  NvtxScope& operator=(const NvtxScope&) = delete;
+};
 
 // --- StreamTransport ------------------------------------------------------
 
@@ -543,6 +563,10 @@ class GpuTimeConveyor {
   }
 
   bool run_pass(int k, long h) {
+    char nvtx_name[48];
+    std::snprintf(nvtx_name, sizeof(nvtx_name), "pass %ld @node %ld", h,
+                  long(node0_ + k));
+    NvtxScope nvtx_pass(nvtx_name);
     NodeBuf& nb = node_[std::size_t(k)];
     StreamEdge& in = transport_->edge((k - 1 + z_) % z_);
     StreamEdge& out = transport_->edge(k);
@@ -668,6 +692,7 @@ class GpuTimeConveyor {
     auto ensure_drift = [&](int j) {
       PassSlot& s = slot[std::size_t(j)];
       if (s.drifted) return;
+      NvtxScope nv("drift+cells");
       const DevSlot& d = nb.slot[std::size_t(s.dev)];
       if (s.n_atoms > 0) {
         const int grid = (s.n_atoms + kIntBlock - 1) / kIntBlock;
@@ -729,6 +754,7 @@ class GpuTimeConveyor {
     };
 
     auto end_zone = [&](int j) -> bool {
+      NvtxScope nv("end+sync");
       PassSlot& s = slot[std::size_t(j)];
       const DevSlot& d = nb.slot[std::size_t(s.dev)];
       const uint32_t want_mask = (j == 0) ? (defer_head ? 2u : 0u) : 1u;
@@ -805,6 +831,8 @@ class GpuTimeConveyor {
     };
 
     auto flush_sends = [&]() -> bool {
+      if (outq.empty()) return !halt_on_.load(std::memory_order_relaxed);
+      NvtxScope nv("flush");
       while (!outq.empty()) {
         const int j = outq.front();
         outq.pop_front();
@@ -946,19 +974,22 @@ class GpuTimeConveyor {
       if (j > 0 && !slot[std::size_t(j - 1)].computed)
         throw std::logic_error("gpu conveyor: INV-1 violated");
       core::ZoneFSM::apply(s.fsm, core::ZoneEvent::START);  // T3
-      launch_pairs(s, s, /*same=*/true, /*energy=*/true);
-      if (j + 1 < n_) {
-        PassSlot& nx = slot[std::size_t(j + 1)];
-        core::ZoneFSM::apply(nx.fsm, core::ZoneEvent::SPHERE);  // T2
-        nx.fsm.contrib_mask |= 1u;
-        launch_pairs(s, nx, false, true);   // A-side: energy once
-        launch_pairs(nx, s, false, false);  // B-side: Newton-3 partner
-      } else if (defer_head && j == n_ - 1) {
-        PassSlot& hd = slot[0];
-        hd.fsm.contrib_mask |= 2u;
-        launch_pairs(s, hd, false, true);   // closure (rotation §7.2)
-        launch_pairs(hd, s, false, false);
-      }
+      {
+        NvtxScope nv("pairs");
+        launch_pairs(s, s, /*same=*/true, /*energy=*/true);
+        if (j + 1 < n_) {
+          PassSlot& nx = slot[std::size_t(j + 1)];
+          core::ZoneFSM::apply(nx.fsm, core::ZoneEvent::SPHERE);  // T2
+          nx.fsm.contrib_mask |= 1u;
+          launch_pairs(s, nx, false, true);   // A-side: energy once
+          launch_pairs(nx, s, false, false);  // B-side: Newton-3 partner
+        } else if (defer_head && j == n_ - 1) {
+          PassSlot& hd = slot[0];
+          hd.fsm.contrib_mask |= 2u;
+          launch_pairs(s, hd, false, true);   // closure (rotation §7.2)
+          launch_pairs(hd, s, false, false);
+        }
+        }
       s.computed = true;
       if (!(defer_head && j == 0) && !end_zone(j)) return false;
       if (defer_head && j == n_ - 1 && !end_zone(0)) return false;

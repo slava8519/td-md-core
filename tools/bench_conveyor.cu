@@ -173,6 +173,39 @@ double run_ring(const core::AtomSoA<double>& init, const core::Box& box,
   return t;
 }
 
+// FMA-build determinism check: GPU-INTERNAL bitwise invariants (run-to-run,
+// 1 vs N streams) must survive FMA contraction — it changes contribution
+// VALUES deterministically, and B1 keeps the sums order-free. (CPU<->GPU
+// bitwise is a verify-build-only claim — fmad=false there by design.)
+template <typename PairF>
+int verify_det(const core::AtomSoA<double>& init, const core::Box& box,
+               const PairF& pot, int zones, double dt) {
+  auto run1 = [&](int nodes) {
+    core::ConveyorOptions o;
+    o.steps = 40;
+    o.n_zones = zones;
+    o.n_nodes = nodes;
+    o.dt_initial = dt;
+    core::AtomSoA<double> a = init;
+    auto r = tdcu::run_conveyor_gpu(a, box, kRcut, pot, o);
+    if (r.halt != core::Halt::None) std::printf("verify-det: HALT\n");
+    return a;
+  };
+  auto eq = [](const core::AtomSoA<double>& a, const core::AtomSoA<double>& b) {
+    auto c = [&](const std::vector<double>& u, const std::vector<double>& v) {
+      return std::memcmp(u.data(), v.data(), u.size() * 8) == 0;
+    };
+    return c(a.x, b.x) && c(a.y, b.y) && c(a.z, b.z) && c(a.vx, b.vx) &&
+           c(a.vy, b.vy) && c(a.vz, b.vz);
+  };
+  const auto r1a = run1(1), r1b = run1(1), r2 = run1(2), r4 = run1(4);
+  const bool rr = eq(r1a, r1b), z2 = eq(r1a, r2), z4 = eq(r1a, r4);
+  std::printf("verify-det: run-to-run %s, 1-vs-2 %s, 1-vs-4 %s\n",
+              rr ? "BITWISE" : "DIVERGED", z2 ? "BITWISE" : "DIVERGED",
+              z4 ? "BITWISE" : "DIVERGED");
+  return (rr && z2 && z4) ? 0 : 1;
+}
+
 // Memory checkpoint (Roadmap M4): the device-buffer budget of the ring at
 // N=1e7 — allocate exactly the conveyor's slot-pool layout and report.
 void mem_probe(int zones, int nodes, bool mixed) {
@@ -224,7 +257,7 @@ int main(int argc, char** argv) {
   int cells = 14, zones = 8, nodes = 4;
   long steps = 30;
   bool mixed = false, probe = false, use_cells = true, skip_t0 = false,
-       ring_only = false;
+       ring_only = false, vdet = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&] { return std::stol(argv[++i]); };
@@ -237,6 +270,7 @@ int main(int argc, char** argv) {
     else if (a == "--no-cells") use_cells = false;
     else if (a == "--skip-t0") skip_t0 = true;
     else if (a == "--ring-only") ring_only = true;  // baseline O(N²) infeasible at 1e6
+    else if (a == "--verify-det") vdet = true;
   }
 
   cudaDeviceProp p{};
@@ -255,6 +289,12 @@ int main(int argc, char** argv) {
   core::Box box;
   auto atoms = make_fcc(box, cells);
   core::thermal::maxwell_init(atoms, 300.0, 7);
+  if (vdet) {
+    core::Box vb;
+    auto va = make_fcc(vb, 6);  // 864 atoms, real grids
+    core::thermal::maxwell_init(va, 300.0, 7);
+    return verify_det(va, vb, make_lj64(), 4, 0.002);
+  }
   // t0 forces for the baseline path (the ring computes its own)
   core::AtomSoA<double> base_init = atoms;
   if (!skip_t0) {
