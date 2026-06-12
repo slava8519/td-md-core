@@ -60,10 +60,18 @@ neighbor:
                              # Варлета, R_k−R_max); перестройка при смещении > skin/2 (M3)
 
 potential:
-  type: morse                # morse | eam | fs | meam | ml
+  type: morse                # morse | lj (M3) | eam | fs | meam | ml (backlog)
   r_cut: 4.0                 # Å
-  shift: true                # энергетический сдвиг на R_cut (pair_modify shift yes)
+  truncation: shift          # cut | shift | force_shift (M3, cutoff.hpp):
+                             #   cut — простое усечение (NIST SRSW «+LRC»-схемы);
+                             #   shift — энергетический сдвиг U−U(rc) (дефолт, golden);
+                             #   force_shift — U и F непрерывны на rc (NIST LFS;
+                             #   выбор M3 для NVE-прогонов M3.5+, см. Rationale)
+  shift: true                # УСТАРЕЛО: bool ⇒ truncation shift/cut; truncation
+                             # при одновременном задании выигрывает (warning)
   morse: { D: 0.29614, alpha: 1.11892, r0: 3.29692 }   # эВ, Å⁻¹, Å
+  # lj: { epsilon: 1.0, sigma: 1.0 }                   # для type: lj (эВ, Å;
+  #                                                    # приведённые единицы — 1.0/1.0)
   # eam:  { file: potentials/Al.eam.alloy }            # для type: eam
   # table: { file: ..., smoothing: poly5 }             # табличная форма (Гл.1.3)
 
@@ -114,6 +122,9 @@ logging:
 | `decomposition.ring.steps_per_node` | int ≥ 1 | k шагов на узел (Гл. 3.4) |
 | `decomposition.ring.n_nodes` vs $P_{op}$ | n_nodes ≤ s/s_min | предупреждение, если узлов больше полезного максимума (ур. 44–45) |
 | `neighbor.skin` | float > 0 | слой списка пар; кадрность перестройки из C1-оценки |
+| `potential.type` | enum: morse/lj | неизвестный тип ⇒ **fatal** |
+| `potential.truncation` | enum: cut/shift/force_shift | неизвестная схема ⇒ **fatal** |
+| `potential.lj.{epsilon,sigma}` | float > 0 | иначе **fatal** |
 | неизвестные ключи | — | warning с именем ключа (защита от опечаток) |
 | `verify.enabled` | bool | true требует `-DWITH_LAMMPS=ON` |
 
