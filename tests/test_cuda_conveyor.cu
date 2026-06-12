@@ -270,6 +270,88 @@ TEST(CudaConveyor, Replica36OnGpu) {
               maxd);
 }
 
+// --- production_mixed (M4/B5): FP32 pair math + int32 fixed-point transport.
+// The B5 design makes the snap sequence z-independent (one pack per zone per
+// pass at ANY node count), so production_mixed is bitwise BOTH run-to-run
+// AND 1-vs-z — an upgrade over the INV-9 matrix's original "допусково". ---
+
+namespace {
+cuda::LJDevF32 make_lj_f32(float eps, float sigma, double rcut) {
+  potentials::LJParams<float> p{eps, sigma};
+  return {p, potentials::CutoffScheme::make(
+                 potentials::Truncation::Shift, rcut,
+                 [&](double r, double& u, double& f) {
+                   float uf, ff;
+                   potentials::pair_lj(float(r), p, uf, ff);
+                   u = double(uf);
+                   f = double(ff);
+                 })};
+}
+}  // namespace
+
+TEST(CudaConveyor, MixedRunToRunAnd1vsZBitwise) {
+  core::Box box;
+  auto init = make_fcc(box, 2, 2, 6, /*pz=*/false);
+  core::thermal::maxwell_init(init, 300.0, 61);
+  const auto lj32 = make_lj_f32(0.4f, 2.55f, kRcut);
+
+  auto o = opts_fixed(60, 4, 1, 0.002);
+  o.mixed_transport = true;
+
+  auto g1a = run_gpu(init, box, o, lj32);
+  auto g1b = run_gpu(init, box, o, lj32);
+  EXPECT_TRUE(bitwise_eq(g1a, g1b));  // run-to-run (the INV-9 matrix cell)
+
+  for (int z : {2, 3}) {  // the B5 upgrade: bitwise across node counts
+    auto oz = o;
+    oz.n_nodes = z;
+    auto gz = run_gpu(init, box, oz, lj32);
+    EXPECT_TRUE(bitwise_eq(g1a, gz)) << "z=" << z;
+  }
+}
+
+TEST(CudaConveyor, MixedAccuracyVsFp64) {
+  core::Box box;
+  auto init = make_fcc(box, 2, 2, 6, /*pz=*/false);
+  core::thermal::maxwell_init(init, 300.0, 67);
+
+  auto o = opts_fixed(60, 4, 1, 0.002);
+  auto ref = run_gpu(init, box, o, make_lj(0.4, 2.55, kRcut));
+  auto om = o;
+  om.mixed_transport = true;
+  auto mix = run_gpu(init, box, om, make_lj_f32(0.4f, 2.55f, kRcut));
+
+  double maxd = 0.0;
+  for (int i = 0; i < ref.n; ++i)
+    maxd = std::max({maxd, std::fabs(ref.x[i] - mix.x[i]),
+                     std::fabs(ref.y[i] - mix.y[i]),
+                     std::fabs(ref.z[i] - mix.z[i])});
+  std::printf("Test_CUDA_Conveyor[mixed]: production_mixed vs "
+              "deterministic_fp64 max|dx| over 60 steps = %.3e A\n",
+              maxd);
+  EXPECT_LT(maxd, 1e-2);  // FP32 pair-math accuracy class, short horizon
+}
+
+TEST(CudaConveyor, MixedTransportRangeHalts) {
+  core::Box box;
+  box.lo = {0.0, 0.0, 0.0};
+  box.hi = {12.0, 12.0, 12.0};
+  box.periodic = {false, false, false};
+  core::AtomSoA<double> a;
+  a.resize(2);
+  a.x = {-200.0, 6.0};  // first atom far beyond the int32 offset range
+  a.y = {6.0, 6.0};
+  a.z = {6.0, 6.0};
+  a.type = {1, 1};
+  a.mass = {26.9815, 26.9815};
+
+  auto o = opts_fixed(3, 1, 1, 0.001);
+  o.mixed_transport = true;
+  auto r = cuda::run_conveyor_gpu(a, box, kRcut, make_lj_f32(0.4f, 2.55f, kRcut), o);
+  EXPECT_EQ(r.halt, core::Halt::Internal) << r.halt_msg;
+  EXPECT_NE(r.halt_msg.find("transport range"), std::string::npos) << r.halt_msg;
+}
+
 // --- INV-4 fires through the device reduction path ---
 
 TEST(CudaConveyor, CausalityHaltFires) {

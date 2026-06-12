@@ -171,4 +171,35 @@ struct MorseDev {
   }
 };
 
+// production_mixed pair functors (M4/B5): Real=float pair MATH at FP64
+// geometry — the M3 driver contract (mixed-precision doc §3.3: the pair set
+// and the truncation fixup stay FP64 on every path). The FP32->FP64 widening
+// before quantization is exact, so B1's order-free bitwise guarantees are
+// unchanged — only the VALUES carry FP32 accuracy.
+struct LJDevF32 {
+  potentials::LJParams<float> prm;
+  potentials::CutoffScheme cs;
+  TDMD_HOST_DEVICE void operator()(double r, double& u,
+                                   double& f_over_r) const {
+    float uf, ff;
+    potentials::pair_lj(float(r), prm, uf, ff);
+    u = double(uf);
+    f_over_r = double(ff);
+    cs.apply(r, u, f_over_r);
+  }
+};
+
+struct MorseDevF32 {
+  potentials::MorseParams<float> prm;
+  potentials::CutoffScheme cs;
+  TDMD_HOST_DEVICE void operator()(double r, double& u,
+                                   double& f_over_r) const {
+    float uf, ff;
+    potentials::pair_morse(float(r), prm, uf, ff);
+    u = double(uf);
+    f_over_r = double(ff);
+    cs.apply(r, u, f_over_r);
+  }
+};
+
 }  // namespace tdmd::cuda

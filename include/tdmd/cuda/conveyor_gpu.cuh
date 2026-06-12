@@ -103,6 +103,63 @@ static __global__ void membership_guard_kernel(const double* z, int n,
   if (excess > g) atomicOr(stale, 2);  // bit1: stale (bit0 = overflow)
 }
 
+// production_mixed transport (M4/B5 decision): coordinates/velocities/forces
+// ship as int32 fixed-point offsets with POWER-OF-TWO quanta — pack is one
+// rint per component per send (<= half-quantum loss, uniform across the box,
+// 16-200x finer than FP32 offsets at zone scale), unpack is EXACT (int->
+// double and 2^-k scaling are exact). Every zone is packed exactly once per
+// pass regardless of the node count, so the snap sequence — and therefore
+// the production_mixed trajectory — is bitwise z-INDEPENDENT (upgrade of the
+// INV-9 matrix cell; see Rationale). Out-of-range components set flag bit2 ->
+// Halt::Internal at the producer's pass end (detection latency <= 1 pass).
+
+__device__ inline int snap_i32(double v, double inv_q, int* flags) {
+  const double q = rint(v * inv_q);
+  if (!(fabs(q) <= 2147483647.0)) {
+    atomicOr(flags, 4);
+    return 0;
+  }
+  return (int)q;
+}
+
+static __global__ void pack_zone_kernel(const double* base, int cap, int n,
+                                        double inv_qp, double inv_qv,
+                                        double inv_qf, double ox, double oy,
+                                        double oz, double* pk_mass, int* pk,
+                                        int* flags) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  pk[0 * cap + i] = snap_i32(base[0 * cap + i] - ox, inv_qp, flags);
+  pk[1 * cap + i] = snap_i32(base[1 * cap + i] - oy, inv_qp, flags);
+  pk[2 * cap + i] = snap_i32(base[2 * cap + i] - oz, inv_qp, flags);
+  pk[3 * cap + i] = snap_i32(base[3 * cap + i], inv_qv, flags);
+  pk[4 * cap + i] = snap_i32(base[4 * cap + i], inv_qv, flags);
+  pk[5 * cap + i] = snap_i32(base[5 * cap + i], inv_qv, flags);
+  pk[6 * cap + i] = snap_i32(base[6 * cap + i], inv_qf, flags);
+  pk[7 * cap + i] = snap_i32(base[7 * cap + i], inv_qf, flags);
+  pk[8 * cap + i] = snap_i32(base[8 * cap + i], inv_qf, flags);
+  pk_mass[i] = base[9 * cap + i];
+}
+
+static __global__ void unpack_zone_kernel(const double* pk_mass,
+                                          const int* pk, int cap, int n,
+                                          double qp, double qv, double qf,
+                                          double ox, double oy, double oz,
+                                          double* base) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  base[0 * cap + i] = ox + double(pk[0 * cap + i]) * qp;  // exact
+  base[1 * cap + i] = oy + double(pk[1 * cap + i]) * qp;
+  base[2 * cap + i] = oz + double(pk[2 * cap + i]) * qp;
+  base[3 * cap + i] = double(pk[3 * cap + i]) * qv;
+  base[4 * cap + i] = double(pk[4 * cap + i]) * qv;
+  base[5 * cap + i] = double(pk[5 * cap + i]) * qv;
+  base[6 * cap + i] = double(pk[6 * cap + i]) * qf;
+  base[7 * cap + i] = double(pk[7 * cap + i]) * qf;
+  base[8 * cap + i] = double(pk[8 * cap + i]) * qf;
+  base[9 * cap + i] = pk_mass[i];
+}
+
 // --- StreamTransport ------------------------------------------------------
 
 struct GpuHeader {
@@ -162,6 +219,9 @@ class StreamTransport {
 struct DevSlot {
   double* base = nullptr;
   long long* raw = nullptr;  // [3*cap]: rfx rfy rfz
+  // production_mixed packed wire image: [double mass × cap][int32 × 9 × cap]
+  double* pk_mass = nullptr;
+  int* pk = nullptr;
   int cap = 0;
   double* arr(int k) const { return base + std::size_t(k) * cap; }
   long long* rfx() const { return raw; }
@@ -210,6 +270,18 @@ class GpuTimeConveyor {
     res_.stats.assign(std::size_t(o_.steps), {});
     final_.assign(std::size_t(n_), HostZone{});
 
+    if (o_.mixed_transport) {
+      // smallest power-of-two quantum covering the range in int32 (B5)
+      auto pick_q = [](double range) {
+        int e = 0;
+        std::frexp(range, &e);          // range = f·2^e, f in [0.5, 1)
+        return std::ldexp(1.0, e - 31);  // q·2^31 = 2^e >= range
+      };
+      const double L = std::max({box_.len(0), box_.len(1), box_.len(2)});
+      qp_ = pick_q(L + 64.0);   // positions: box offsets + excursion pad
+      qv_ = std::ldexp(1.0, -24);  // velocities: ±128 Å/ps
+      qf_ = std::ldexp(1.0, -20);  // forces: ±2048 eV/Å
+    }
     alloc_nodes();
     preload_node0();
     transport_ = std::make_unique<StreamTransport>(z_, S_, std::size_t(n_) + 2);
@@ -285,6 +357,12 @@ class GpuTimeConveyor {
         s.cap = cap_;
         TDMD_CU(cudaMalloc(&s.base, DevSlot::kArrays * sizeof(double) * cap_));
         TDMD_CU(cudaMalloc(&s.raw, 3 * sizeof(long long) * cap_));
+        if (o_.mixed_transport) {
+          char* pkb = nullptr;
+          TDMD_CU(cudaMalloc(&pkb, packed_bytes()));
+          s.pk_mass = reinterpret_cast<double*>(pkb);
+          s.pk = reinterpret_cast<int*>(pkb + sizeof(double) * cap_);
+        }
       }
       TDMD_CU(cudaMalloc(&nb.d_v2, 8));
       TDMD_CU(cudaMalloc(&nb.d_a2, 8));
@@ -302,6 +380,7 @@ class GpuTimeConveyor {
       for (auto& s : nb.slot) {
         cudaFree(s.base);
         cudaFree(s.raw);
+        cudaFree(s.pk_mass);  // base pointer of the packed image (or null)
       }
       for (auto* p : {nb.d_v2, nb.d_a2, nb.d_kc, nb.d_mr2}) cudaFree(p);
       cudaFree(nb.d_ke);
@@ -400,6 +479,14 @@ class GpuTimeConveyor {
           // INV-2: the payload copy is ordered before this wait by the
           // record-before-push / pop-before-wait protocol invariant.
           TDMD_CU(cudaStreamWaitEvent(nb.stream, in.arrival_[std::size_t(s.dev)], 0));
+          if (o_.mixed_transport && s.n_atoms > 0) {
+            const DevSlot& d = nb.slot[std::size_t(s.dev)];
+            const int grid = (s.n_atoms + kIntBlock - 1) / kIntBlock;
+            unpack_zone_kernel<<<grid, kIntBlock, 0, nb.stream>>>(
+                d.pk_mass, d.pk, cap_, s.n_atoms, qp_, qv_, qf_, box_.lo[0],
+                box_.lo[1], box_.lo[2], d.base);
+            TDMD_CU(cudaGetLastError());
+          }
           s.fsm.type = core::ZoneType::o;
           core::ZoneFSM::apply(s.fsm, core::ZoneEvent::RECV);  // T1
         }
@@ -547,9 +634,23 @@ class GpuTimeConveyor {
         // slot-reuse safety: the credit is pushed only after the consumer
         // recorded free_[dst], so this wait is never a no-op on a live slot
         TDMD_CU(cudaStreamWaitEvent(nb.stream, out.free_[std::size_t(dst)], 0));
-        TDMD_CU(cudaMemcpyAsync(cn.slot[std::size_t(dst)].base, src.base,
-                                DevSlot::kArrays * sizeof(double) * cap_,
-                                cudaMemcpyDeviceToDevice, nb.stream));
+        if (o_.mixed_transport) {  // B5: int32 wire image (1.8x less traffic)
+          if (s.n_atoms > 0) {
+            const int grid = (s.n_atoms + kIntBlock - 1) / kIntBlock;
+            pack_zone_kernel<<<grid, kIntBlock, 0, nb.stream>>>(
+                src.base, cap_, s.n_atoms, 1.0 / qp_, 1.0 / qv_, 1.0 / qf_,
+                box_.lo[0], box_.lo[1], box_.lo[2], src.pk_mass, src.pk,
+                nb.d_flags);
+            TDMD_CU(cudaGetLastError());
+          }
+          TDMD_CU(cudaMemcpyAsync(cn.slot[std::size_t(dst)].pk_mass,
+                                  src.pk_mass, packed_bytes(),
+                                  cudaMemcpyDeviceToDevice, nb.stream));
+        } else {
+          TDMD_CU(cudaMemcpyAsync(cn.slot[std::size_t(dst)].base, src.base,
+                                  DevSlot::kArrays * sizeof(double) * cap_,
+                                  cudaMemcpyDeviceToDevice, nb.stream));
+        }
         TDMD_CU(cudaEventRecord(out.arrival_[std::size_t(dst)], nb.stream));
         // my source slot becomes reusable once that copy has READ it:
         // record the event FIRST, then hand the credit back upstream
@@ -621,6 +722,16 @@ class GpuTimeConveyor {
     }
     if (!flush_sends()) return false;
 
+    if (o_.mixed_transport) {  // pack-overflow flags from this pass's sends
+      TDMD_CU(cudaMemcpyAsync(&nb.h_end->flags, nb.d_flags, 4,
+                              cudaMemcpyDeviceToHost, nb.stream));
+      TDMD_CU(cudaStreamSynchronize(nb.stream));
+      if (nb.h_end->flags & 4)
+        return fail(core::Halt::Internal,
+                    "production_mixed transport range overflow at step " +
+                        std::to_string(h) +
+                        " (atom beyond the int32 offset range)");
+    }
     const double pass_pe = double(nb.h_end->pe) / core::fixed::EnergyAccum::kScale;
     if (!std::isfinite(pass_pe + ke))
       return fail(core::Halt::NonFiniteEnergy,
@@ -668,8 +779,13 @@ class GpuTimeConveyor {
   const core::ConveyorOptions o_;
   const core::PairGeom geom_;
 
+  std::size_t packed_bytes() const {
+    return sizeof(double) * cap_ + 9 * sizeof(int) * std::size_t(cap_);
+  }
+
   core::ZoneDecomposition zd_;
   int n_ = 1, z_ = 1, S_ = 3, cap_ = 0;
+  double qp_ = 0.0, qv_ = 0.0, qf_ = 0.0;  // B5 quanta (mixed only)
   bool pbc_z_ = false;
   Lambda lam0_{};
   const unsigned long long inf_bits_ = 0x7FF0000000000000ULL;

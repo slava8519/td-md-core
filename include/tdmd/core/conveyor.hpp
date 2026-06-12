@@ -96,6 +96,12 @@ struct ConveyorOptions {
   double dt_initial = 0.001;     // ps; also the fixed dt when !auto_step
   buffer::TimeStepCfg ts{};
   double r_min_halt = 0.5;       // Å, overlap HALT (B10)
+  // production_mixed TRANSPORT (M4/B5, GPU ring only — this CPU conveyor is
+  // always the deterministic_fp64 reference): zone payloads ship as int32
+  // fixed-point offsets (power-of-two quantum; pack = one rint per send,
+  // unpack exact). Pair-math precision is the functor's choice (LJDevF32/
+  // MorseDevF32), independent of this flag.
+  bool   mixed_transport = false;
 };
 
 // Per-pass record. v_max/a_max/k2cap are the pass aggregates that feed the
