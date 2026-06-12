@@ -169,5 +169,16 @@ if(TDMD_BUILD_TESTS)
       $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
     add_test(NAME Test_CUDA_Cluster COMMAND test_cuda_cluster)
     set_tests_properties(Test_CUDA_Cluster PROPERTIES LABELS cuda)
+
+    add_executable(test_cuda_zones tests/test_cuda_zones.cu)      # M4: B1 on GPU
+    target_link_libraries(test_cuda_zones PRIVATE tdmd_core GTest::gtest_main)
+    # verify build (Roadmap M4): bitwise CPU<->GPU parity of the fixed-point
+    # accumulators needs FMA contraction OFF on the kernel TU (the CPU side is
+    # -ffp-contract=off project-wide). Perf kernels may re-enable FMA later —
+    # that is a bench-PR decision, annotated with the precision mode.
+    target_compile_options(test_cuda_zones PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false -Xptxas=-v>)
+    add_test(NAME Test_CUDA_Zones COMMAND test_cuda_zones)
+    set_tests_properties(Test_CUDA_Zones PROPERTIES LABELS cuda)
   endif()
 endif()

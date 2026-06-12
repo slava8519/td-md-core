@@ -7,6 +7,7 @@
 
 #include "tdmd/core/fixed_accum.hpp"
 #include "tdmd/core/soa.hpp"
+#include "tdmd/hal/hal.hpp"
 
 // M3.5 (first PR) — zone decomposition along z + the w-mechanism partial-force
 // assembly, SERIAL: the force logic of the TD conveyor (дисс. Гл. 2.1,
@@ -62,8 +63,12 @@ struct ZoneDecomposition {
 };
 
 // Shared per-pair geometry core — ONE source of the min-image/cutoff FP
-// expressions for the serial w-pass below AND the ring conveyor
-// (core/conveyor.hpp), so their per-pair math is bit-identical (INV-9).
+// expressions for the serial w-pass below, the ring conveyor
+// (core/conveyor.hpp) AND the M4 CUDA zone kernels (cuda/zone_force.cuh),
+// so their per-pair math is bit-identical (INV-9). reduce() is host+device;
+// the object is built on the host and passed to kernels by value (POD copy).
+// NB: GPU bitwise parity additionally requires the kernel TU compiled with
+// --fmad=false (r2 and `dx - L*round(dx/L)` are FMA-contraction candidates).
 struct PairGeom {
   double L[3];
   bool per[3];
@@ -74,7 +79,8 @@ struct PairGeom {
         rc2(rcut * rcut) {}
   // Min-image reduction + acceptance — exactly the pre-refactor inline
   // predicate: accept iff 1e-18 <= r2 < rc2.
-  bool reduce(double& dx, double& dy, double& dz, double& r2) const {
+  TDMD_HOST_DEVICE bool reduce(double& dx, double& dy, double& dz,
+                               double& r2) const {
     if (per[0]) dx -= L[0] * std::round(dx / L[0]);
     if (per[1]) dy -= L[1] * std::round(dy / L[1]);
     if (per[2]) dz -= L[2] * std::round(dz / L[2]);

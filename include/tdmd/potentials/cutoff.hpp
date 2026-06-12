@@ -1,4 +1,5 @@
 #pragma once
+#include "tdmd/hal/hal.hpp"
 
 // Cutoff (truncation) schemes — DRIVER policy, not pair math (pair_morse.hpp
 // note: "the cutoff test and the energy shift stay in the driver").
@@ -39,7 +40,9 @@ struct CutoffScheme {
   }
 
   // Adjusts one pair's raw (u, f_over_r) in place; r < rcut guaranteed.
-  void apply(double r, double& u, double& f_over_r) const {
+  // host+device (M4): the M4 CUDA zone kernels apply the SAME scheme object —
+  // plain data, identical FP64 expressions on both paths.
+  TDMD_HOST_DEVICE void apply(double r, double& u, double& f_over_r) const {
     switch (mode) {
       case Truncation::Cut:
         break;
