@@ -27,13 +27,19 @@
 #include "tdmd/potentials/cutoff.hpp"
 #include "tdmd/potentials/pair_lj.hpp"
 
-using namespace tdmd;
+// CUB/libcu++ exposes a global ::cuda namespace, and nvcc-generated host
+// stubs reference cuda::std unqualified — `using namespace tdmd` would make
+// `cuda` ambiguous there. Targeted aliases instead:
+namespace core = tdmd::core;
+namespace potentials = tdmd::potentials;
+namespace units = tdmd::units;
+namespace tdcu = tdmd::cuda;
 
 namespace {
 
 constexpr double kRcut = 4.0;
 
-cuda::LJDev make_lj64() {
+tdcu::LJDev make_lj64() {
   potentials::LJParams<double> p{0.4, 2.55};
   return {p, potentials::CutoffScheme::make(
                  potentials::Truncation::Shift, kRcut,
@@ -41,7 +47,7 @@ cuda::LJDev make_lj64() {
                    potentials::pair_lj(r, p, u, f);
                  })};
 }
-cuda::LJDevF32 make_lj32() {
+tdcu::LJDevF32 make_lj32() {
   potentials::LJParams<float> p{0.4f, 2.55f};
   return {p, potentials::CutoffScheme::make(
                  potentials::Truncation::Shift, kRcut,
@@ -106,28 +112,28 @@ double run_baseline(const core::AtomSoA<double>& init, const core::Box& box,
   cudaMalloc(&dv2, 8); cudaMalloc(&da2, 8); cudaMalloc(&dkc, 8);
   cudaMalloc(&dmr, 8); cudaMalloc(&dke, 8); cudaMalloc(&dpe, 8);
   cudaMalloc(&dfl, 4);
-  cuda::EndScalars* hs = nullptr;
-  cudaHostAlloc(&hs, sizeof(cuda::EndScalars), 0);
+  tdcu::EndScalars* hs = nullptr;
+  cudaHostAlloc(&hs, sizeof(tdcu::EndScalars), 0);
 
-  const int gi = (n + cuda::kIntBlock - 1) / cuda::kIntBlock;
-  const int gf = (n + cuda::kZoneBlock - 1) / cuda::kZoneBlock;
+  const int gi = (n + tdcu::kIntBlock - 1) / tdcu::kIntBlock;
+  const int gf = (n + tdcu::kZoneBlock - 1) / tdcu::kZoneBlock;
   const unsigned long long inf = 0x7FF0000000000000ULL;
 
   const double t0 = now_s();
   for (long h = 1; h <= steps; ++h) {
-    cuda::zone_drift_kernel<<<gi, cuda::kIntBlock>>>(x, y, z, vx, vy, vz, fx,
+    tdcu::zone_drift_kernel<<<gi, tdcu::kIntBlock>>>(x, y, z, vx, vy, vz, fx,
                                                      fy, fz, m, n, dt);
     cudaMemset(raw, 0, 3LL * 8 * n);
     cudaMemcpy(dmr, &inf, 8, cudaMemcpyHostToDevice);
     cudaMemset(dpe, 0, 8);
     cudaMemset(dfl, 0, 4);
-    cuda::ZoneForceArgs args{x,   y,   z,   n,   x,   y,  z,  n,
+    tdcu::ZoneForceArgs args{x,   y,   z,   n,   x,   y,  z,  n,
                              raw, raw + n, raw + 2LL * n, dpe,
                              dmr, dfl, true, true};
-    cuda::zone_pair_kernel<PairF><<<gf, cuda::kZoneBlock>>>(args, geom, pot);
-    cuda::reset_zone_scalars_kernel<<<1, 1>>>(dv2, da2, dkc);
+    tdcu::zone_pair_kernel<PairF><<<gf, tdcu::kZoneBlock>>>(args, geom, pot);
+    tdcu::reset_zone_scalars_kernel<<<1, 1>>>(dv2, da2, dkc);
     cudaMemset(dke, 0, 8);
-    cuda::zone_end_kernel<<<gi, cuda::kIntBlock>>>(
+    tdcu::zone_end_kernel<<<gi, tdcu::kIntBlock>>>(
         vx, vy, vz, fx, fy, fz, raw, raw + n, raw + 2LL * n, m, n, dt, 50.0,
         dv2, da2, dkc, dke, dfl);
     cudaMemcpyAsync(&hs->min_r2, dmr, 8, cudaMemcpyDeviceToHost);
@@ -147,7 +153,7 @@ double run_baseline(const core::AtomSoA<double>& init, const core::Box& box,
 template <typename PairF>
 double run_ring(const core::AtomSoA<double>& init, const core::Box& box,
                 const PairF& pot, long steps, double dt, int zones, int nodes,
-                bool mixed) {
+                bool mixed, bool cells, bool skip_t0) {
   core::ConveyorOptions o;
   o.steps = steps;
   o.n_zones = zones;
@@ -155,9 +161,11 @@ double run_ring(const core::AtomSoA<double>& init, const core::Box& box,
   o.auto_step = false;
   o.dt_initial = dt;
   o.mixed_transport = mixed;
+  o.cell_lists = cells;
+  o.skip_t0_forces = skip_t0;
   core::AtomSoA<double> a = init;
   const double t0 = now_s();
-  auto r = cuda::run_conveyor_gpu(a, box, kRcut, pot, o);
+  auto r = tdcu::run_conveyor_gpu(a, box, kRcut, pot, o);
   const double t = now_s() - t0;
   if (r.halt != core::Halt::None)
     std::printf("ring HALT: %s\n", r.halt_msg.c_str());
@@ -187,6 +195,9 @@ void mem_probe(int zones, int nodes, bool mixed) {
       grab(10ULL * 8 * cap);       // packed double arrays
       grab(3ULL * 8 * cap);        // raw accumulators
       if (mixed) grab(8ULL * cap + 36ULL * cap);  // int32 wire image
+      // cell lists: [cell_of cap][order cap][counts/starts/cursor NC]
+      const long ncells = (440 / 4) * (440 / 4) * 3;  // ~box(1e7)/rcut, slab z
+      grab(4ULL * (2 * cap + 3 * ncells));
     }
   std::size_t freeb = 0, totb = 0;
   cudaMemGetInfo(&freeb, &totb);
@@ -204,7 +215,8 @@ void mem_probe(int zones, int nodes, bool mixed) {
 int main(int argc, char** argv) {
   int cells = 14, zones = 8, nodes = 4;
   long steps = 30;
-  bool mixed = false, probe = false;
+  bool mixed = false, probe = false, use_cells = true, skip_t0 = false,
+       ring_only = false;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&] { return std::stol(argv[++i]); };
@@ -214,6 +226,9 @@ int main(int argc, char** argv) {
     else if (a == "--nodes") nodes = int(next());
     else if (a == "--mode") mixed = (std::string(argv[++i]) == "mixed");
     else if (a == "--mem-probe") probe = true;
+    else if (a == "--no-cells") use_cells = false;
+    else if (a == "--skip-t0") skip_t0 = true;
+    else if (a == "--ring-only") ring_only = true;  // baseline O(N²) infeasible at 1e6
   }
 
   cudaDeviceProp p{};
@@ -234,7 +249,7 @@ int main(int argc, char** argv) {
   core::thermal::maxwell_init(atoms, 300.0, 7);
   // t0 forces for the baseline path (the ring computes its own)
   core::AtomSoA<double> base_init = atoms;
-  {
+  if (!skip_t0) {
     const auto zd = core::ZoneDecomposition::build(atoms, box, 1, kRcut);
     core::zero_forces(base_init);
     const auto lj = make_lj64();
@@ -243,26 +258,32 @@ int main(int argc, char** argv) {
   const double dt = 0.002;
   const char* mode = mixed ? "production_mixed" : "deterministic_fp64";
   std::printf("system: N=%d, box %.1f^3, zones=%d (width %.2f), nodes=%d, "
-              "steps=%ld, dt=%g, mode=%s\n",
+              "steps=%ld, dt=%g, mode=%s, cells=%d, skip_t0=%d\n",
               atoms.n, box.len(0), zones, box.len(2) / zones, nodes, steps,
-              dt, mode);
+              dt, mode, int(use_cells), int(skip_t0));
 
   auto bench = [&](auto pot) {
     // warmup + difference timing: t(W+S) - t(W) cancels init/t0 cost
     const long W = 5;
-    run_baseline(base_init, box, pot, W, dt);  // warmup
-    const double tb = run_baseline(base_init, box, pot, W + steps, dt) -
-                      run_baseline(base_init, box, pot, W, dt);
+    double tb = 0.0;
+    if (!ring_only) {
+      run_baseline(base_init, box, pot, W, dt);  // warmup
+      tb = run_baseline(base_init, box, pot, W + steps, dt) -
+           run_baseline(base_init, box, pot, W, dt);
+    }
     const double tr = run_ring(atoms, box, pot, W + steps, dt, zones, nodes,
-                               mixed) -
-                      run_ring(atoms, box, pot, W, dt, zones, nodes, mixed);
-    const double as_b = double(atoms.n) * steps / tb;
+                               mixed, use_cells, skip_t0) -
+                      run_ring(atoms, box, pot, W, dt, zones, nodes, mixed,
+                               use_cells, skip_t0);
     const double as_r = double(atoms.n) * steps / tr;
-    std::printf("  baseline (single-kernel): %8.3f s  -> %.3e atom-steps/s\n",
-                tb, as_b);
+    if (!ring_only) {
+      std::printf("  baseline (single-kernel): %8.3f s  -> %.3e atom-steps/s\n",
+                  tb, double(atoms.n) * steps / tb);
+    }
     std::printf("  TD ring  (z=%d, n=%d):     %8.3f s  -> %.3e atom-steps/s\n",
                 nodes, zones, tr, as_r);
-    std::printf("  ring speedup over baseline: x%.3f  [%s]\n", tb / tr, mode);
+    if (!ring_only)
+      std::printf("  ring speedup over baseline: x%.3f  [%s]\n", tb / tr, mode);
   };
   if (mixed) bench(make_lj32());
   else bench(make_lj64());

@@ -23,14 +23,20 @@
 #include "tdmd/potentials/morse.hpp"
 #include "tdmd/potentials/pair_lj.hpp"
 
-using namespace tdmd;
+// CUB/libcu++ exposes a global ::cuda namespace, and nvcc-generated host
+// stubs reference cuda::std unqualified — `using namespace tdmd` would make
+// `cuda` ambiguous there. Targeted aliases instead:
+namespace core = tdmd::core;
+namespace potentials = tdmd::potentials;
+namespace units = tdmd::units;
+namespace tdcu = tdmd::cuda;
 
 namespace {
 
 // --- shared single-source pair functors (host + device, zone_force.cuh) ---
 
-using cuda::LJDev;
-using cuda::MorseDev;
+using tdcu::LJDev;
+using tdcu::MorseDev;
 
 LJDev make_lj(double eps, double sigma, double rcut) {
   potentials::LJParams<double> p{eps, sigma};
@@ -191,12 +197,12 @@ GpuPassResult gpu_raw_pass(const core::AtomSoA<double>& a,
 
   auto launch = [&](int za, int zo, bool same, bool energy) {
     if (zb[za].m == 0) return;
-    cuda::ZoneForceArgs args{
+    tdcu::ZoneForceArgs args{
         zb[za].x,  zb[za].y,  zb[za].z,  zb[za].m,
         zb[zo].x,  zb[zo].y,  zb[zo].z,  zb[zo].m,
         zb[za].fx, zb[za].fy, zb[za].fz, dpe, dmr, dof, same, energy};
-    const int grid = (zb[za].m + cuda::kZoneBlock - 1) / cuda::kZoneBlock;
-    cuda::zone_pair_kernel<PairF><<<grid, cuda::kZoneBlock>>>(args, geom, pot);
+    const int grid = (zb[za].m + tdcu::kZoneBlock - 1) / tdcu::kZoneBlock;
+    tdcu::zone_pair_kernel<PairF><<<grid, tdcu::kZoneBlock>>>(args, geom, pot);
     EXPECT_EQ(cudaGetLastError(), cudaSuccess);
   };
 
@@ -433,11 +439,11 @@ TEST(CudaZones, DriftEndKickAndReductionsBitwise) {
   long long* dke = upload(l0);
   int* dof = upload(i0);
 
-  const int grid = (n + cuda::kIntBlock - 1) / cuda::kIntBlock;
-  cuda::zone_drift_kernel<<<grid, cuda::kIntBlock>>>(dx, dy, dz, dvx, dvy,
+  const int grid = (n + tdcu::kIntBlock - 1) / tdcu::kIntBlock;
+  tdcu::zone_drift_kernel<<<grid, tdcu::kIntBlock>>>(dx, dy, dz, dvx, dvy,
                                                      dvz, dfx, dfy, dfz, dm,
                                                      n, dt);
-  cuda::zone_end_kernel<<<grid, cuda::kIntBlock>>>(
+  tdcu::zone_end_kernel<<<grid, tdcu::kIntBlock>>>(
       dvx, dvy, dvz, dfx, dfy, dfz, drx, dry, drz, dm, n, dt, K2, dv2, da2,
       dkc, dke, dof);
   ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
@@ -489,16 +495,16 @@ TEST(CudaZones, RegistersAndOccupancy) {
   cudaDeviceProp p;
   ASSERT_EQ(cudaGetDeviceProperties(&p, 0), cudaSuccess);
   for (auto [name, fn] :
-       {std::pair{"lj", (const void*)cuda::zone_pair_kernel<LJDev>},
-        std::pair{"morse", (const void*)cuda::zone_pair_kernel<MorseDev>}}) {
+       {std::pair{"lj", (const void*)tdcu::zone_pair_kernel<LJDev>},
+        std::pair{"morse", (const void*)tdcu::zone_pair_kernel<MorseDev>}}) {
     cudaFuncAttributes attr;
     ASSERT_EQ(cudaFuncGetAttributes(&attr, fn), cudaSuccess);
     int blocks = 0;
     ASSERT_EQ(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                  &blocks, fn, cuda::kZoneBlock, attr.sharedSizeBytes),
+                  &blocks, fn, tdcu::kZoneBlock, attr.sharedSizeBytes),
               cudaSuccess);
     const double occ =
-        100.0 * blocks * cuda::kZoneBlock / p.maxThreadsPerMultiProcessor;
+        100.0 * blocks * tdcu::kZoneBlock / p.maxThreadsPerMultiProcessor;
     std::printf("Test_CUDA_Zones[%s]: regs/thread=%d smem=%zu B blocks/SM=%d "
                 "occupancy=%.0f%% [fmad=false verify build]\n",
                 name, attr.numRegs, attr.sharedSizeBytes, blocks, occ);

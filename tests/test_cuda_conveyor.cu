@@ -27,7 +27,14 @@
 #include "tdmd/potentials/pair_lj.hpp"
 #include "tdmd/units.hpp"
 
-using namespace tdmd;
+// CUB/libcu++ exposes a global ::cuda namespace, and nvcc-generated host
+// stubs reference cuda::std unqualified — `using namespace tdmd` would make
+// `cuda` ambiguous there. Targeted aliases instead:
+namespace core = tdmd::core;
+namespace potentials = tdmd::potentials;
+namespace io = tdmd::io;
+namespace units = tdmd::units;
+namespace tdcu = tdmd::cuda;
 
 static std::string project_root() {
 #ifdef TDMD_PROJECT_ROOT
@@ -39,8 +46,8 @@ static std::string project_root() {
 
 namespace {
 
-using cuda::LJDev;
-using cuda::MorseDev;
+using tdcu::LJDev;
+using tdcu::MorseDev;
 
 LJDev make_lj(double eps, double sigma, double rcut) {
   potentials::LJParams<double> p{eps, sigma};
@@ -124,7 +131,7 @@ core::AtomSoA<double> run_gpu(const core::AtomSoA<double>& init,
                               const core::ConveyorOptions& o, const PairF& p,
                               core::ConveyorResult* out = nullptr) {
   core::AtomSoA<double> a = init;
-  auto r = cuda::run_conveyor_gpu(a, box, kRcut, p, o);
+  auto r = tdcu::run_conveyor_gpu(a, box, kRcut, p, o);
   EXPECT_EQ(r.halt, core::Halt::None) << r.halt_msg;
   EXPECT_EQ(r.steps_done, o.steps);
   if (out) *out = std::move(r);
@@ -282,7 +289,7 @@ TEST(CudaConveyor, Replica36OnGpu) {
 // AND 1-vs-z — an upgrade over the INV-9 matrix's original "допусково". ---
 
 namespace {
-cuda::LJDevF32 make_lj_f32(float eps, float sigma, double rcut) {
+tdcu::LJDevF32 make_lj_f32(float eps, float sigma, double rcut) {
   potentials::LJParams<float> p{eps, sigma};
   return {p, potentials::CutoffScheme::make(
                  potentials::Truncation::Shift, rcut,
@@ -370,7 +377,7 @@ TEST(CudaConveyor, MixedTransportRangeHalts) {
 
   auto o = opts_fixed(3, 1, 1, 0.001);
   o.mixed_transport = true;
-  auto r = cuda::run_conveyor_gpu(a, box, kRcut, make_lj_f32(0.4f, 2.55f, kRcut), o);
+  auto r = tdcu::run_conveyor_gpu(a, box, kRcut, make_lj_f32(0.4f, 2.55f, kRcut), o);
   EXPECT_EQ(r.halt, core::Halt::Internal) << r.halt_msg;
   EXPECT_NE(r.halt_msg.find("transport range"), std::string::npos) << r.halt_msg;
 }
@@ -385,7 +392,7 @@ TEST(CudaConveyor, AntiDeadlockOddEvenRings) {
   for (int z = 1; z <= 5; ++z) {
     const long steps = 2 * z + 3;
     core::AtomSoA<double> a = init;
-    auto r = cuda::run_conveyor_gpu(a, box, kRcut, lj,
+    auto r = tdcu::run_conveyor_gpu(a, box, kRcut, lj,
                                     opts_fixed(steps, 4, z, 0.002));
     EXPECT_EQ(r.halt, core::Halt::None) << "z=" << z << ": " << r.halt_msg;
     EXPECT_EQ(r.steps_done, steps) << "z=" << z;
@@ -448,6 +455,73 @@ TEST(CudaConveyor, NveInvariant50kOnGpu) {
   for (int d = 0; d < 3; ++d) EXPECT_NEAR(p[d], p0[d], 1e-8) << "axis " << d;
 }
 
+// --- cell-list culling (zone_cells.cuh): bitwise A/B vs the tile path on
+// REAL grids (>= 3 cells per dim — the small fixtures above degenerate to
+// 1-cell dims). The culled path must be bit-identical: same acceptance
+// predicate, order-free integer sums (B1). Covers the slab grid, the
+// periodic-z whole-box grid (n_zones=1 + PBC z), and the rotation closure
+// with nearest-image query folds. ---
+
+TEST(CudaConveyor, CellListsBitwiseVsTiles) {
+  core::Box box;
+  auto init = make_fcc(box, 6, 6, 6, /*pz=*/true);  // 864 atoms, 6 cells/dim
+  core::thermal::maxwell_init(init, 300.0, 83);
+
+  auto run_ab = [&](const core::Box& bx, const core::AtomSoA<double>& in,
+                    int n_zones, int z, const char* label) {
+    auto o = opts_fixed(30, n_zones, z, 0.002);
+    o.cell_lists = false;
+    core::ConveyorResult rt, rc;
+    auto tiles = run_gpu(in, bx, o, make_lj(0.4, 2.55, kRcut), &rt);
+    o.cell_lists = true;
+    auto cells = run_gpu(in, bx, o, make_lj(0.4, 2.55, kRcut), &rc);
+    EXPECT_TRUE(bitwise_eq(tiles, cells)) << label;
+    ASSERT_EQ(rt.stats.size(), rc.stats.size());
+    for (std::size_t i = 0; i < rt.stats.size(); ++i) {
+      ASSERT_EQ(rt.stats[i].pe, rc.stats[i].pe) << label << " pass " << i + 1;
+      ASSERT_EQ(rt.stats[i].v_max, rc.stats[i].v_max) << label << " pass "
+                                                      << i + 1;
+    }
+  };
+  run_ab(box, init, 4, 2, "pbc n=4");   // slab grids + rotation closure
+  run_ab(box, init, 1, 1, "pbc n=1");   // periodic-z whole-box grid (wrapz)
+  core::Box fb = box;
+  fb.periodic = {true, true, false};
+  run_ab(fb, init, 4, 3, "free n=4");   // free-z slabs, outer zones unbounded
+  run_ab(fb, init, 6, 2, "free n=6");   // width 4.05 ~ rcut: dense closure
+
+  // adversarial geometry fuzz: all-free box (clamping on every axis), 3
+  // zones, jittered lattice + outliers flung beyond the OUTER faces (the
+  // unbounded sides of edge zones — no StaleZone) — edge-cell clamping must
+  // not lose a single candidate pair vs the tile oracle
+  for (uint64_t seed : {101ull, 202ull, 303ull}) {
+    core::Box ob;
+    auto oa = make_fcc(ob, 5, 5, 6, /*pz=*/false);
+    ob.periodic = {false, false, false};
+    core::thermal::SplitMix64 rng(seed);
+    for (int i = 0; i < oa.n; ++i) {  // jitter breaks lattice symmetry
+      oa.x[i] += 0.3 * (2.0 * rng.uniform() - 1.0);
+      oa.y[i] += 0.3 * (2.0 * rng.uniform() - 1.0);
+      oa.z[i] += 0.3 * (2.0 * rng.uniform() - 1.0);
+    }
+    for (int i = 0; i < 8; ++i) {     // outliers beyond free faces
+      const int j = int(rng.uniform() * oa.n);
+      oa.x[j] += (i % 2 ? 25.0 : -25.0);
+      if (i < 4) oa.z[j] += (i % 2 ? 30.0 : -30.0);
+    }
+    run_ab(ob, oa, 3, 2, "fuzz free outliers");
+  }
+
+  // mixed transport over the culled path
+  auto om = opts_fixed(30, 4, 2, 0.002);
+  om.mixed_transport = true;
+  om.cell_lists = false;
+  auto mt = run_gpu(init, box, om, make_lj_f32(0.4f, 2.55f, kRcut));
+  om.cell_lists = true;
+  auto mc = run_gpu(init, box, om, make_lj_f32(0.4f, 2.55f, kRcut));
+  EXPECT_TRUE(bitwise_eq(mt, mc));
+}
+
 // --- INV-4 fires through the device reduction path ---
 
 TEST(CudaConveyor, CausalityHaltFires) {
@@ -468,6 +542,6 @@ TEST(CudaConveyor, CausalityHaltFires) {
 
   const auto mo = make_morse(kRcut);
   auto o = opts_fixed(10, 1, 1, 0.02);
-  auto r = cuda::run_conveyor_gpu(a, box, kRcut, mo, o);
+  auto r = tdcu::run_conveyor_gpu(a, box, kRcut, mo, o);
   EXPECT_EQ(r.halt, core::Halt::Causality) << r.halt_msg;
 }

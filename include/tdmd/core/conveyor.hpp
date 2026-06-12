@@ -102,6 +102,15 @@ struct ConveyorOptions {
   // unpack exact). Pair-math precision is the functor's choice (LJDevF32/
   // MorseDevF32), independent of this flag.
   bool   mixed_transport = false;
+  // GPU ring only: per-zone cell-list culling (zone_cells.cuh) — bitwise
+  // transparent by construction (B1: same acceptance predicate, order-free
+  // integer sums), it changes WORK, not results. Default on; the tile path
+  // remains for A/B benching.
+  bool   cell_lists = true;
+  // Bench-only (GPU ring): skip the CPU t0 force pass (O(Σm²) — hours at
+  // N=10⁶+) and start from zero forces. TIMING USE ONLY: the first kick is
+  // physically wrong, trajectories are not comparable to honest runs.
+  bool   skip_t0_forces = false;
 };
 
 // Per-pass record. v_max/a_max/k2cap are the pass aggregates that feed the

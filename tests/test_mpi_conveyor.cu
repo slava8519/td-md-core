@@ -29,7 +29,15 @@
 #include "tdmd/potentials/morse.hpp"
 #include "tdmd/potentials/pair_lj.hpp"
 
-using namespace tdmd;
+// CUB/libcu++ exposes a global ::cuda namespace, and nvcc-generated host
+// stubs reference cuda::std unqualified — `using namespace tdmd` would make
+// `cuda` ambiguous there. Targeted aliases instead:
+namespace core = tdmd::core;
+namespace potentials = tdmd::potentials;
+namespace io = tdmd::io;
+namespace units = tdmd::units;
+namespace tdcu = tdmd::cuda;
+namespace mpi = tdmd::mpi;
 
 namespace {
 
@@ -46,7 +54,7 @@ int g_rank = 0;
     }                                                                     \
   } while (0)
 
-cuda::LJDev make_lj64() {
+tdcu::LJDev make_lj64() {
   potentials::LJParams<double> p{0.4, 2.55};
   return {p, potentials::CutoffScheme::make(
                  potentials::Truncation::Shift, kRcut,
@@ -54,7 +62,7 @@ cuda::LJDev make_lj64() {
                    potentials::pair_lj(r, p, u, f);
                  })};
 }
-cuda::MorseDev make_morse() {
+tdcu::MorseDev make_morse() {
   potentials::MorseParams<double> p{0.29614, 1.11892, 3.29692};
   return {p, potentials::CutoffScheme::make(
                  potentials::Truncation::Shift, kRcut,
@@ -62,7 +70,7 @@ cuda::MorseDev make_morse() {
                    potentials::pair_morse(r, p, u, f);
                  })};
 }
-cuda::LJDevF32 make_lj32() {
+tdcu::LJDevF32 make_lj32() {
   potentials::LJParams<float> p{0.4f, 2.55f};
   return {p, potentials::CutoffScheme::make(
                  potentials::Truncation::Shift, kRcut,
@@ -120,7 +128,7 @@ void run_case(const char* name, const core::AtomSoA<double>& init,
   // reference (every rank, locally — deterministic and identical)
   o.n_nodes = Z;
   core::AtomSoA<double> ref = init;
-  auto rref = cuda::run_conveyor_gpu(ref, box, kRcut, pot, o);
+  auto rref = tdcu::run_conveyor_gpu(ref, box, kRcut, pot, o);
   MPI_CHECK(rref.halt == core::Halt::None, "reference halted");
 
   // the wire image size must agree on both sides of every boundary: it is a
@@ -136,7 +144,7 @@ void run_case(const char* name, const core::AtomSoA<double>& init,
 
   mpi::MpiRingEdge edge(MPI_COMM_WORLD, rank, nranks, wire,
                         o.n_zones + 2);
-  cuda::RingPart part;
+  tdcu::RingPart part;
   part.z_global = Z;
   part.node0 = rank * k;
   part.z_local = k;
@@ -145,7 +153,7 @@ void run_case(const char* name, const core::AtomSoA<double>& init,
   auto om = o;
   om.n_nodes = k;
   core::AtomSoA<double> mine = init;
-  auto rmpi = cuda::run_conveyor_gpu(mine, box, kRcut, pot, om, part);
+  auto rmpi = tdcu::run_conveyor_gpu(mine, box, kRcut, pot, om, part);
   MPI_CHECK(rmpi.halt == core::Halt::None, "mpi ring halted");
 
   const int final_owner = int(((o.steps - 1) % Z) / k);
@@ -188,14 +196,14 @@ void run_bench(const core::AtomSoA<double>& init, const core::Box& box,
   // ~10-15% one-time setup bias — t0 force pass + slot-pool allocation)
   auto timed_mpi = [&](long steps) {
     mpi::MpiRingEdge edge(MPI_COMM_WORLD, rank, nranks, wire, o.n_zones + 2);
-    cuda::RingPart part{Z, rank * k, k, &edge, &edge};
+    tdcu::RingPart part{Z, rank * k, k, &edge, &edge};
     auto om = o;
     om.n_nodes = k;
     om.steps = steps;
     core::AtomSoA<double> mine = init;
     MPI_Barrier(MPI_COMM_WORLD);
     const double t0 = MPI_Wtime();
-    auto r = cuda::run_conveyor_gpu(mine, box, kRcut, pot, om, part);
+    auto r = tdcu::run_conveyor_gpu(mine, box, kRcut, pot, om, part);
     MPI_Barrier(MPI_COMM_WORLD);
     MPI_CHECK(r.halt == core::Halt::None, "bench mpi ring halted");
     return MPI_Wtime() - t0;
@@ -211,7 +219,7 @@ void run_bench(const core::AtomSoA<double>& init, const core::Box& box,
       os.steps = steps;
       core::AtomSoA<double> sp = init;
       const double s0 = MPI_Wtime();
-      auto rs = cuda::run_conveyor_gpu(sp, box, kRcut, pot, os);
+      auto rs = tdcu::run_conveyor_gpu(sp, box, kRcut, pot, os);
       MPI_CHECK(rs.halt == core::Halt::None, "bench single halted");
       return MPI_Wtime() - s0;
     };
@@ -302,9 +310,9 @@ int main(int argc, char** argv) {
     oh.dt_initial = 0.02;
     const std::size_t wire = 10 * sizeof(double) * 2;  // cap = 2 atoms
     mpi::MpiRingEdge edge(MPI_COMM_WORLD, rank, nranks, wire, 3);
-    cuda::RingPart part{nranks, rank, 1, &edge, &edge};
+    tdcu::RingPart part{nranks, rank, 1, &edge, &edge};
     oh.n_nodes = 1;
-    auto r = cuda::run_conveyor_gpu(ha, hb, kRcut, make_morse(), oh, part);
+    auto r = tdcu::run_conveyor_gpu(ha, hb, kRcut, make_morse(), oh, part);
     MPI_CHECK(r.halt != core::Halt::None, "halt did not reach this rank");
     int causality = (r.halt == core::Halt::Causality) ? 1 : 0, any = 0;
     MPI_Allreduce(&causality, &any, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
@@ -316,10 +324,10 @@ int main(int argc, char** argv) {
     // z_local=2: the poisoned rank must also unwind its INTRA node threads
     // (review M5a: this variant deadlocked before the propagation fix)
     mpi::MpiRingEdge edge2(MPI_COMM_WORLD, rank, nranks, wire, 3);
-    cuda::RingPart part2{2 * nranks, 2 * rank, 2, &edge2, &edge2};
+    tdcu::RingPart part2{2 * nranks, 2 * rank, 2, &edge2, &edge2};
     oh.n_nodes = 2;
     core::AtomSoA<double> hb2 = ha;
-    auto r2 = cuda::run_conveyor_gpu(hb2, hb, kRcut, make_morse(), oh, part2);
+    auto r2 = tdcu::run_conveyor_gpu(hb2, hb, kRcut, make_morse(), oh, part2);
     MPI_CHECK(r2.halt != core::Halt::None, "k=2 halt did not reach this rank");
     MPI_Barrier(MPI_COMM_WORLD);
     if (rank == 0)

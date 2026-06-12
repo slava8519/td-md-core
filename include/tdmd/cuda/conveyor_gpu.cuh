@@ -53,6 +53,7 @@
 #include "tdmd/core/fsm.hpp"
 #include "tdmd/core/transport.hpp"
 #include "tdmd/core/zones.hpp"
+#include "tdmd/cuda/zone_cells.cuh"
 #include "tdmd/cuda/zone_force.cuh"
 #include "tdmd/cuda/zone_integrate.cuh"
 
@@ -255,7 +256,15 @@ struct DevSlot {
   // production_mixed packed wire image: [double mass × cap][int32 × 9 × cap]
   double* pk_mass = nullptr;
   int* pk = nullptr;
+  // cell-list culling (zone_cells.cuh): [cell_of cap][order cap]
+  // [counts NC][starts NC][cursor NC] — one allocation
+  int* cells = nullptr;
   int cap = 0;
+  int* cell_of() const { return cells; }
+  int* order() const { return cells + cap; }
+  int* counts(int nc) const { (void)nc; return cells + 2 * std::size_t(cap); }
+  int* starts(int nc) const { return cells + 2 * std::size_t(cap) + nc; }
+  int* cursor(int nc) const { return cells + 2 * std::size_t(cap) + 2 * std::size_t(nc); }
   double* arr(int k) const { return base + std::size_t(k) * cap; }
   long long* rfx() const { return raw; }
   long long* rfy() const { return raw + cap; }
@@ -303,7 +312,9 @@ class GpuTimeConveyor {
 
     // t0 forces + Λ pre-history — identical to the CPU conveyor.
     core::zero_forces(atoms_);
-    const double pe0 = core::zone_force_pass(atoms_, box_, zd_, rcut_, pot_);
+    const double pe0 = o_.skip_t0_forces
+                           ? 0.0  // bench-only: zero first kick (documented)
+                           : core::zone_force_pass(atoms_, box_, zd_, rcut_, pot_);
     res_.e0 = pe0 + core::kinetic_energy(atoms_);
     lam0_ = {core::buffer::max_speed(atoms_), core::buffer::max_accel(atoms_),
              core::buffer::temperature_limited_dt(atoms_, o_.ts.K2)};
@@ -321,6 +332,11 @@ class GpuTimeConveyor {
       qp_ = pick_q(L + 64.0);   // positions: box offsets + excursion pad
       qv_ = std::ldexp(1.0, -24);  // velocities: ±128 Å/ps
       qf_ = std::ldexp(1.0, -20);  // forces: ±2048 eV/Å
+    }
+    if (o_.cell_lists) {
+      const double len[3] = {box_.len(0), box_.len(1), box_.len(2)};
+      const bool per[3] = {box_.periodic[0], box_.periodic[1], box_.periodic[2]};
+      ncells_ = make_zone_grid(box_.lo.data(), len, per, rcut_, n_, 0).ncells();
     }
     alloc_nodes();
     if (node0_ == 0) preload_node0();  // §7.3: only the rank owning P1
@@ -391,6 +407,8 @@ class GpuTimeConveyor {
     long long *d_ke{}, *d_pe{};
     int* d_flags{};
     EndScalars* h_end{};  // pinned
+    void* d_cubtmp = nullptr;  // cell-list scan temp
+    std::size_t cubtmp_bytes = 0;
   };
 
   // Host-side per-pass slot bookkeeping (the CPU conveyor Slot minus payload).
@@ -419,6 +437,16 @@ class GpuTimeConveyor {
           s.pk_mass = reinterpret_cast<double*>(pkb);
           s.pk = reinterpret_cast<int*>(pkb + sizeof(double) * cap_);
         }
+        if (o_.cell_lists)
+          TDMD_CU(cudaMalloc(&s.cells,
+                             sizeof(int) * (2 * std::size_t(cap_) +
+                                            3 * std::size_t(ncells_))));
+      }
+      if (o_.cell_lists) {
+        nb.cubtmp_bytes = 0;  // CUB temp for the per-zone exclusive scan
+        cub::DeviceScan::ExclusiveSum(nullptr, nb.cubtmp_bytes, (int*)nullptr,
+                                      (int*)nullptr, ncells_);
+        TDMD_CU(cudaMalloc(&nb.d_cubtmp, nb.cubtmp_bytes));
       }
       TDMD_CU(cudaMalloc(&nb.d_v2, 8));
       TDMD_CU(cudaMalloc(&nb.d_a2, 8));
@@ -437,7 +465,9 @@ class GpuTimeConveyor {
         cudaFree(s.base);
         cudaFree(s.raw);
         cudaFree(s.pk_mass);  // base pointer of the packed image (or null)
+        cudaFree(s.cells);
       }
+      cudaFree(nb.d_cubtmp);
       for (auto* p : {nb.d_v2, nb.d_a2, nb.d_kc, nb.d_mr2}) cudaFree(p);
       cudaFree(nb.d_ke);
       cudaFree(nb.d_pe);
@@ -617,6 +647,30 @@ class GpuTimeConveyor {
       }
       TDMD_CU(cudaMemsetAsync(d.raw, 0, 3 * sizeof(long long) * cap_,
                               nb.stream));
+      if (o_.cell_lists) {  // rebuild this zone's cell list at x_h
+        TDMD_CU(cudaMemsetAsync(d.counts(ncells_), 0, sizeof(int) * ncells_,
+                                nb.stream));
+        if (s.n_atoms > 0) {
+          const CellGrid g = zone_grid(s.fsm.id);
+          const int grid = (s.n_atoms + kIntBlock - 1) / kIntBlock;
+          cell_count_kernel<<<grid, kIntBlock, 0, nb.stream>>>(
+              d.arr(0), d.arr(1), d.arr(2), s.n_atoms, g, d.cell_of(),
+              d.counts(ncells_));
+          TDMD_CU(cudaGetLastError());
+        }
+        std::size_t tb = nb.cubtmp_bytes;
+        cub::DeviceScan::ExclusiveSum(nb.d_cubtmp, tb, d.counts(ncells_),
+                                      d.starts(ncells_), ncells_, nb.stream);
+        TDMD_CU(cudaMemcpyAsync(d.cursor(ncells_), d.starts(ncells_),
+                                sizeof(int) * ncells_,
+                                cudaMemcpyDeviceToDevice, nb.stream));
+        if (s.n_atoms > 0) {
+          const int grid = (s.n_atoms + kIntBlock - 1) / kIntBlock;
+          cell_scatter_kernel<<<grid, kIntBlock, 0, nb.stream>>>(
+              d.cell_of(), s.n_atoms, d.cursor(ncells_), d.order());
+          TDMD_CU(cudaGetLastError());
+        }
+      }
       s.drifted = true;
     };
 
@@ -629,8 +683,15 @@ class GpuTimeConveyor {
                          da.rfx(),  da.rfy(),  da.rfz(),  nb.d_pe,
                          nb.d_mr2,  nb.d_flags, same,     energy};
       const int grid = (A.n_atoms + kZoneBlock - 1) / kZoneBlock;
-      zone_pair_kernel<PairF><<<grid, kZoneBlock, 0, nb.stream>>>(args, geom_,
-                                                                  pot_);
+      if (o_.cell_lists) {  // culled path — bitwise ≡ tiles (B1)
+        const CellGrid bgrid = zone_grid(B.fsm.id);
+        zone_pair_cells_kernel<PairF><<<grid, kZoneBlock, 0, nb.stream>>>(
+            args, geom_, pot_, bgrid, db.starts(ncells_), db.counts(ncells_),
+            db.order());
+      } else {
+        zone_pair_kernel<PairF><<<grid, kZoneBlock, 0, nb.stream>>>(args, geom_,
+                                                                    pot_);
+      }
       TDMD_CU(cudaGetLastError());
     };
 
@@ -940,6 +1001,11 @@ class GpuTimeConveyor {
   std::size_t packed_bytes() const {
     return sizeof(double) * cap_ + 9 * sizeof(int) * std::size_t(cap_);
   }
+  CellGrid zone_grid(int zone_id) const {
+    const double len[3] = {box_.len(0), box_.len(1), box_.len(2)};
+    const bool per[3] = {box_.periodic[0], box_.periodic[1], box_.periodic[2]};
+    return make_zone_grid(box_.lo.data(), len, per, rcut_, n_, zone_id);
+  }
   std::size_t wire_bytes() const {  // the boundary payload image
     return o_.mixed_transport ? packed_bytes()
                               : DevSlot::kArrays * sizeof(double) * cap_;
@@ -947,6 +1013,7 @@ class GpuTimeConveyor {
 
   core::ZoneDecomposition zd_;
   int n_ = 1, z_ = 1, Z_ = 1, S_ = 3, cap_ = 0;
+  int ncells_ = 1;
   int node0_ = 0;
   std::deque<int> bfree_;          // local slot pool of a boundary-fed node 0
   double* in_stage_ = nullptr;     // pinned boundary staging (M5a)
