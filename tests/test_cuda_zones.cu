@@ -18,6 +18,7 @@
 #include "tdmd/core/thermal.hpp"
 #include "tdmd/core/zones.hpp"
 #include "tdmd/cuda/zone_force.cuh"
+#include "tdmd/cuda/zone_integrate.cuh"
 #include "tdmd/potentials/cutoff.hpp"
 #include "tdmd/potentials/morse.hpp"
 #include "tdmd/potentials/pair_lj.hpp"
@@ -362,6 +363,123 @@ TEST(CudaZones, OverflowFlagAndMinR2) {
   core::zero_forces(b);
   EXPECT_THROW(core::zone_force_pass(b, box, zd, kRcut, lj),
                std::overflow_error);
+}
+
+// --- integration + zone-local reductions (zone_integrate.cuh): drift, the
+// END kick with raw->FP64 conversion, v_max²/a_max²/k2cap — all bitwise vs
+// the CPU conveyor expressions; KE — fixed-point vs the CPU FP64 sum within
+// the quantization scale. ---
+
+TEST(CudaZones, DriftEndKickAndReductionsBitwise) {
+  core::Box box;
+  auto a = make_fcc(box, 3, 3, 6);  // 648 atoms = one "zone"
+  core::thermal::maxwell_init(a, 300.0, 41);
+  const int n = a.n;
+  const double dt = 0.002, K2 = 50.0;
+  const auto zd = core::ZoneDecomposition::build(a, box, 1, kRcut);
+  const auto lj = make_lj(0.4, 2.55, kRcut);
+
+  // f(t0) doubles + raw force accumulators standing in for the next pass
+  const auto raw = cpu_raw_pass(a, box, zd, kRcut, lj);
+  std::vector<double> f0x(n), f0y(n), f0z(n);
+  for (int i = 0; i < n; ++i) {
+    f0x[i] = double(raw.fx[0][i]) / core::fixed::ForceAccum::kScale;
+    f0y[i] = double(raw.fy[0][i]) / core::fixed::ForceAccum::kScale;
+    f0z[i] = double(raw.fz[0][i]) / core::fixed::ForceAccum::kScale;
+  }
+
+  // CPU reference — verbatim conveyor expressions (ensure_drift / end_zone)
+  core::AtomSoA<double> c = a;
+  double v2m = 0.0, a2m = 0.0, kcap = std::numeric_limits<double>::infinity();
+  double ke = 0.0;
+  for (int i = 0; i < n; ++i) {
+    const double inv_m = units::ftm2v / c.mass[i];
+    c.vx[i] += 0.5 * dt * inv_m * f0x[i];
+    c.vy[i] += 0.5 * dt * inv_m * f0y[i];
+    c.vz[i] += 0.5 * dt * inv_m * f0z[i];
+    c.x[i] += dt * c.vx[i];
+    c.y[i] += dt * c.vy[i];
+    c.z[i] += dt * c.vz[i];
+  }
+  for (int i = 0; i < n; ++i) {
+    c.fx[i] = double(raw.fx[0][i]) / core::fixed::ForceAccum::kScale;
+    c.fy[i] = double(raw.fy[0][i]) / core::fixed::ForceAccum::kScale;
+    c.fz[i] = double(raw.fz[0][i]) / core::fixed::ForceAccum::kScale;
+    const double inv_m = units::ftm2v / c.mass[i];
+    c.vx[i] += 0.5 * dt * inv_m * c.fx[i];
+    c.vy[i] += 0.5 * dt * inv_m * c.fy[i];
+    c.vz[i] += 0.5 * dt * inv_m * c.fz[i];
+    const double vi2 = core::buffer::speed2(c.vx[i], c.vy[i], c.vz[i]);
+    v2m = std::max(v2m, vi2);
+    a2m = std::max(a2m, core::buffer::accel2(c.fx[i], c.fy[i], c.fz[i],
+                                             c.mass[i]));
+    kcap = std::min(kcap, core::buffer::k2_limited_dt_atom(
+                              c.fx[i], c.fy[i], c.fz[i], c.vx[i], c.vy[i],
+                              c.vz[i], c.mass[i], K2));
+    ke += 0.5 * units::mvv2e * c.mass[i] * vi2;
+  }
+
+  // GPU
+  double *dx = upload(a.x), *dy = upload(a.y), *dz = upload(a.z);
+  double *dvx = upload(a.vx), *dvy = upload(a.vy), *dvz = upload(a.vz);
+  double *dfx = upload(f0x), *dfy = upload(f0y), *dfz = upload(f0z);
+  double* dm = upload(a.mass);
+  long long *drx = upload(raw.fx[0]), *dry = upload(raw.fy[0]),
+            *drz = upload(raw.fz[0]);
+  std::vector<unsigned long long> z0{0}, zinf{0x7FF0000000000000ULL};
+  std::vector<long long> l0{0};
+  std::vector<int> i0{0};
+  unsigned long long *dv2 = upload(z0), *da2 = upload(z0), *dkc = upload(zinf);
+  long long* dke = upload(l0);
+  int* dof = upload(i0);
+
+  const int grid = (n + cuda::kIntBlock - 1) / cuda::kIntBlock;
+  cuda::zone_drift_kernel<<<grid, cuda::kIntBlock>>>(dx, dy, dz, dvx, dvy,
+                                                     dvz, dfx, dfy, dfz, dm,
+                                                     n, dt);
+  cuda::zone_end_kernel<<<grid, cuda::kIntBlock>>>(
+      dvx, dvy, dvz, dfx, dfy, dfz, drx, dry, drz, dm, n, dt, K2, dv2, da2,
+      dkc, dke, dof);
+  ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  std::vector<double> gx(n), gvx(n), gfx(n), gz(n), gvz(n), gfz(n);
+  ASSERT_EQ(cudaMemcpy(gx.data(), dx, n * 8, cudaMemcpyDeviceToHost), cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(gz.data(), dz, n * 8, cudaMemcpyDeviceToHost), cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(gvx.data(), dvx, n * 8, cudaMemcpyDeviceToHost), cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(gvz.data(), dvz, n * 8, cudaMemcpyDeviceToHost), cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(gfx.data(), dfx, n * 8, cudaMemcpyDeviceToHost), cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(gfz.data(), dfz, n * 8, cudaMemcpyDeviceToHost), cudaSuccess);
+  unsigned long long hv2 = 0, ha2 = 0, hkc = 0;
+  long long hke = 0;
+  int hof = 0;
+  ASSERT_EQ(cudaMemcpy(&hv2, dv2, 8, cudaMemcpyDeviceToHost), cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(&ha2, da2, 8, cudaMemcpyDeviceToHost), cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(&hkc, dkc, 8, cudaMemcpyDeviceToHost), cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(&hke, dke, 8, cudaMemcpyDeviceToHost), cudaSuccess);
+  ASSERT_EQ(cudaMemcpy(&hof, dof, 4, cudaMemcpyDeviceToHost), cudaSuccess);
+  for (auto* p : {dx, dy, dz, dvx, dvy, dvz, dfx, dfy, dfz, dm}) cudaFree(p);
+  for (auto* p : {drx, dry, drz, dke}) cudaFree(p);
+  for (auto* p : {dv2, da2, dkc}) cudaFree(p);
+  cudaFree(dof);
+
+  EXPECT_EQ(hof, 0);
+  for (int i = 0; i < n; ++i) {
+    ASSERT_EQ(gx[i], c.x[i]) << i;     // drift bitwise
+    ASSERT_EQ(gz[i], c.z[i]) << i;
+    ASSERT_EQ(gvx[i], c.vx[i]) << i;   // both kicks bitwise
+    ASSERT_EQ(gvz[i], c.vz[i]) << i;
+    ASSERT_EQ(gfx[i], c.fx[i]) << i;   // raw->FP64 conversion bitwise
+    ASSERT_EQ(gfz[i], c.fz[i]) << i;
+  }
+  double gv2, ga2, gkc;
+  std::memcpy(&gv2, &hv2, 8);
+  std::memcpy(&ga2, &ha2, 8);
+  std::memcpy(&gkc, &hkc, 8);
+  EXPECT_EQ(gv2, v2m);   // INV-4 / Λ-chain inputs: bitwise
+  EXPECT_EQ(ga2, a2m);
+  EXPECT_EQ(gkc, kcap);
+  const double gke = double(hke) / core::fixed::EnergyAccum::kScale;
+  EXPECT_NEAR(gke, ke, n * 1.0 / core::fixed::EnergyAccum::kScale);
 }
 
 // --- Tier-2 bookkeeping for the new kernel (regs / theoretical occupancy);

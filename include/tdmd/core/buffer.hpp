@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <limits>
 #include "tdmd/core/soa.hpp"
+#include "tdmd/hal/hal.hpp"
 #include "tdmd/units.hpp"
 
 // Causality buffer and automatic time-step (M2).
@@ -38,15 +39,17 @@ inline bool causality_ok(double v_max, double dt, double R_buf) {
   return v_max * dt <= R_buf;
 }
 
-// --- per-atom kernels (M3.5): shared by the whole-SoA reductions below and
-// the conveyor's per-zone locals, so both paths use bit-identical FP
-// expressions (INV-9). Bodies are verbatim the pre-refactor inline code. ---
+// --- per-atom kernels (M3.5/M4): shared by the whole-SoA reductions below,
+// the conveyor's per-zone locals AND the M4 CUDA reduction kernels (host+
+// device), so every path uses bit-identical FP expressions (INV-9). All ops
+// are correctly rounded (+,*,/,sqrt) => CPU<->GPU bitwise under fmad=false.
+// Bodies are verbatim the pre-refactor inline code. ---
 
-inline double speed2(double vx, double vy, double vz) {
+TDMD_HOST_DEVICE inline double speed2(double vx, double vy, double vz) {
   return vx * vx + vy * vy + vz * vz;
 }
 
-inline double accel2(double fx, double fy, double fz, double mass) {
+TDMD_HOST_DEVICE inline double accel2(double fx, double fy, double fz, double mass) {
   const double s = units::ftm2v / mass;
   const double ax = s * fx, ay = s * fy, az = s * fz;
   return ax * ax + ay * ay + az * az;
@@ -55,7 +58,7 @@ inline double accel2(double fx, double fy, double fz, double mass) {
 // Largest dt keeping THIS atom's per-step temperature rise <= K2 (see
 // temperature_limited_dt below for the derivation); +inf when unconstrained
 // (K2 disabled or zero acceleration).
-inline double k2_limited_dt_atom(double fx, double fy, double fz, double vx,
+TDMD_HOST_DEVICE inline double k2_limited_dt_atom(double fx, double fy, double fz, double vx,
                                  double vy, double vz, double mass, double K2) {
   if (K2 <= 0.0) return std::numeric_limits<double>::infinity();
   const double ax = units::ftm2v * fx / mass;
