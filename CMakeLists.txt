@@ -78,6 +78,11 @@ if(TDMD_WITH_CUDA)
   add_executable(devprobe tools/devprobe.cu)
 endif()
 
+# --- M3 timing evidence: direct vs clustered (manual tool, not a CI gate) ---
+add_executable(bench_pair tools/bench_pair.cpp)
+target_include_directories(bench_pair PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(bench_pair PRIVATE -Wall -Wextra -O3)
+
 # --- tests (do NOT depend on yaml-cpp; golden-data driven, no LAMMPS) ---
 if(TDMD_BUILD_TESTS)
   enable_testing()
@@ -123,6 +128,10 @@ if(TDMD_BUILD_TESTS)
   add_executable(test_determinism tests/test_determinism.cpp)  # M3: bitwise net
   target_link_libraries(test_determinism PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_Determinism COMMAND test_determinism)
+
+  add_executable(test_cluster tests/test_cluster.cpp)      # M3: clustering core
+  target_link_libraries(test_cluster PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_Cluster COMMAND test_cluster)
 
   if(TDMD_WITH_CUDA)                                       # M2.7: toolchain smoke
     add_executable(test_cuda_smoke tests/test_cuda_smoke.cu)

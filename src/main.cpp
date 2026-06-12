@@ -10,6 +10,7 @@
 #include "tdmd/core/simulation.hpp"
 #include "tdmd/core/thermal.hpp"
 #include "tdmd/potentials/morse.hpp"
+#include "tdmd/potentials/clustered_morse.hpp"
 #include "tdmd/units.hpp"
 
 using namespace tdmd;
@@ -75,9 +76,6 @@ int main(int argc, char** argv) {
                 T0, p[0], p[1], p[2]);
   }
 
-  potentials::MorsePotential<double> morse{cfg.D, cfg.alpha, cfg.r0, cfg.rcut,
-                                           cfg.shift};
-
   core::SimOptions opt;
   opt.steps       = cfg.steps;
   opt.dt          = cfg.dt;
@@ -90,10 +88,28 @@ int main(int argc, char** argv) {
                 opt.ts.C1, opt.ts.K2, opt.ts.C3, opt.ts.C_buf,
                 opt.ts.cell_size, opt.ts.dt_max);
 
+  std::printf("neighbor     : %s%s\n", cfg.neighbor_mode.c_str(),
+              cfg.neighbor_mode == "cluster"
+                  ? ("  skin=" + std::to_string(cfg.skin) + " Å").c_str()
+                  : "  (O(N²) reference)");
+
   io::TrajectoryWriter writer(cfg.traj_file);
-  auto res = core::run_simulation(
-      atoms, box, morse, opt,
-      [&](long step) { writer.write_frame(step, atoms, box); });
+  auto frame = [&](long step) { writer.write_frame(step, atoms, box); };
+
+  core::SimResult res;
+  if (cfg.neighbor_mode == "cluster") {  // M3: Z-order + 32-atom clusters
+    potentials::ClusteredMorse<double> pot;
+    pot.D = cfg.D; pot.alpha = cfg.alpha; pot.r0 = cfg.r0;
+    pot.rcut = cfg.rcut; pot.shift = cfg.shift;
+    pot.skin = cfg.skin; pot.cell = cfg.cell_size;
+    res = core::run_simulation(atoms, box, pot, opt, frame);
+    std::printf("pair-list    : %ld rebuild(s) over %ld steps\n",
+                pot.rebuild_count, res.steps_done);
+  } else {
+    potentials::MorsePotential<double> morse{cfg.D, cfg.alpha, cfg.r0, cfg.rcut,
+                                             cfg.shift};
+    res = core::run_simulation(atoms, box, morse, opt, frame);
+  }
 
   if (res.halt != core::Halt::None) {
     std::fprintf(stderr, "[HALT] %s\n", res.halt_msg.c_str());

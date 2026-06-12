@@ -101,6 +101,7 @@ bool parse(std::ifstream& f, const std::string& path,
   atoms.resize(natoms);
   for (int k = 0; k < natoms; ++k) {
     const int s = order[k];
+    atoms.id[k] = ids[s];
     atoms.x[k] = pos[s][0];
     atoms.y[k] = pos[s][1];
     atoms.z[k] = pos[s][2];

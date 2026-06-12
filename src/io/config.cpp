@@ -173,6 +173,14 @@ Config load_config(const std::string& path) {
   }
   v.check(c.cell_size > 0.0, "decomposition.cell_size must be > 0");
 
+  if (auto nb = root["neighbor"]) {
+    warn_unknown_keys(nb, "neighbor", {"mode", "skin"});
+    if (nb["mode"]) c.neighbor_mode = nb["mode"].as<std::string>();
+    if (nb["skin"]) c.skin          = nb["skin"].as<double>();
+  }
+  v.check_enum(c.neighbor_mode, "neighbor.mode", {"direct", "cluster"});
+  v.check(c.skin > 0.0, "neighbor.skin must be > 0");
+
   if (auto io = root["io"]) {
     warn_unknown_keys(io, "io", {"trajectory", "rescue"});
     if (auto tr = io["trajectory"]) {

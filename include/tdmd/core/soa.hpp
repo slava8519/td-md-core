@@ -22,6 +22,7 @@ struct AtomSoA {
   std::vector<double> fx, fy, fz;  // forces (eV/Å), FP64 accumulation
   std::vector<int>    type;        // atom type id
   std::vector<double> mass;        // per-atom mass (amu)
+  std::vector<int>    id;          // original atom id — survives Z-order sort (M3)
   int n = 0;
 
   void resize(int N) {
@@ -30,6 +31,8 @@ struct AtomSoA {
     vx.assign(N, Real(0)); vy.assign(N, Real(0)); vz.assign(N, Real(0));
     fx.assign(N, 0.0); fy.assign(N, 0.0); fz.assign(N, 0.0);
     type.assign(N, 0); mass.assign(N, 0.0);
+    id.resize(N);
+    for (int i = 0; i < N; ++i) id[i] = i + 1;
   }
 };
 

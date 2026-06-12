@@ -28,6 +28,9 @@ struct Config {
   double dt_max = 0.02;          // ps
   double C1 = 0.1, K2 = 50.0, C3 = 0.5, C_buf = 1.5;  // auto-step coeffs (M2)
   double cell_size = 2.33;       // Å, spatial cell (decomposition.cell_size)
+  // neighbor (M3)
+  std::string neighbor_mode = "direct";  // direct (O(N²) reference) | cluster
+  double skin = 1.0;                     // Å, pair-list skin (neighbor.skin)
   // io
   std::string traj_file  = "traj.lammpstrj";
   long        traj_every = 50;

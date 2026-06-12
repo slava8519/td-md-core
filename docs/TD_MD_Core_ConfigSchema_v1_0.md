@@ -53,8 +53,11 @@ decomposition:
     transport: auto          # auto | memcpy | p2p | mpi
 
 neighbor:
+  mode: direct               # direct (эталонный O(N²)) | cluster (M3: Z-order +
+                             # 32-атомные кластеры + список пар; сортирует атомы in-place,
+                             # идентичность — в id)
   skin: 1.0                  # Å; слой валидности списка пар кластеров (аналог таблиц
-                             # Варлета, R_k−R_max); перестройка по накопленному смещению (M3)
+                             # Варлета, R_k−R_max); перестройка при смещении > skin/2 (M3)
 
 potential:
   type: morse                # morse | eam | fs | meam | ml
