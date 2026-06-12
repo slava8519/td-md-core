@@ -133,6 +133,10 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_cluster PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_Cluster COMMAND test_cluster)
 
+  add_executable(test_lj_nist tests/test_lj_nist.cpp)      # M3: LJ vs NIST SRSW
+  target_link_libraries(test_lj_nist PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_LJ_NIST COMMAND test_lj_nist)
+
   if(TDMD_WITH_CUDA)                                       # M2.7: toolchain smoke
     add_executable(test_cuda_smoke tests/test_cuda_smoke.cu)
     target_link_libraries(test_cuda_smoke PRIVATE GTest::gtest_main)

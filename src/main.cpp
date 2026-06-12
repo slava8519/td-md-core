@@ -11,6 +11,7 @@
 #include "tdmd/core/thermal.hpp"
 #include "tdmd/potentials/morse.hpp"
 #include "tdmd/potentials/clustered_morse.hpp"
+#include "tdmd/potentials/lj.hpp"
 #include "tdmd/units.hpp"
 
 using namespace tdmd;
@@ -37,9 +38,12 @@ int main(int argc, char** argv) {
   std::printf("precision    : %s\n", cfg.precision_mode.c_str());
   std::printf("ensemble     : %s   steps=%ld   dt=%g ps (%s)\n",
               cfg.ensemble.c_str(), cfg.steps, cfg.dt, cfg.ts_mode.c_str());
-  std::printf("potential    : %s  r_cut=%g  shift=%s  D=%g alpha=%g r0=%g\n",
-              cfg.pot_type.c_str(), cfg.rcut, cfg.shift ? "yes" : "no",
-              cfg.D, cfg.alpha, cfg.r0);
+  if (cfg.pot_type == "lj")
+    std::printf("potential    : lj  r_cut=%g  truncation=%s  epsilon=%g sigma=%g\n",
+                cfg.rcut, cfg.truncation.c_str(), cfg.lj_epsilon, cfg.lj_sigma);
+  else
+    std::printf("potential    : morse  r_cut=%g  truncation=%s  D=%g alpha=%g r0=%g\n",
+                cfg.rcut, cfg.truncation.c_str(), cfg.D, cfg.alpha, cfg.r0);
 
   core::AtomSoA<double> atoms;
   core::Box box;
@@ -96,19 +100,47 @@ int main(int argc, char** argv) {
   io::TrajectoryWriter writer(cfg.traj_file);
   auto frame = [&](long step) { writer.write_frame(step, atoms, box); };
 
+  const potentials::Truncation trunc =
+      cfg.truncation == "cut"         ? potentials::Truncation::Cut
+      : cfg.truncation == "force_shift" ? potentials::Truncation::ForceShift
+                                        : potentials::Truncation::Shift;
+  const bool cluster = (cfg.neighbor_mode == "cluster");  // M3: Z-order clusters
+
   core::SimResult res;
-  if (cfg.neighbor_mode == "cluster") {  // M3: Z-order + 32-atom clusters
-    potentials::ClusteredMorse<double> pot;
-    pot.D = cfg.D; pot.alpha = cfg.alpha; pot.r0 = cfg.r0;
-    pot.rcut = cfg.rcut; pot.shift = cfg.shift;
-    pot.skin = cfg.skin; pot.cell = cfg.cell_size;
+  auto run_direct = [&](auto pot) {
+    res = core::run_simulation(atoms, box, pot, opt, frame);
+  };
+  auto run_cluster = [&](auto pot) {
+    pot.skin = cfg.skin;
+    pot.cell = cfg.cell_size;
     res = core::run_simulation(atoms, box, pot, opt, frame);
     std::printf("pair-list    : %ld rebuild(s) over %ld steps\n",
                 pot.rebuild_count, res.steps_done);
+  };
+  if (cfg.pot_type == "lj") {
+    if (cluster) {
+      potentials::ClusteredLJ<double> pot;
+      pot.epsilon = cfg.lj_epsilon; pot.sigma = cfg.lj_sigma;
+      pot.rcut = cfg.rcut; pot.truncation = trunc;
+      run_cluster(std::move(pot));
+    } else {
+      potentials::LJPotential<double> pot;
+      pot.epsilon = cfg.lj_epsilon; pot.sigma = cfg.lj_sigma;
+      pot.rcut = cfg.rcut; pot.truncation = trunc;
+      run_direct(std::move(pot));
+    }
   } else {
-    potentials::MorsePotential<double> morse{cfg.D, cfg.alpha, cfg.r0, cfg.rcut,
-                                             cfg.shift};
-    res = core::run_simulation(atoms, box, morse, opt, frame);
+    if (cluster) {
+      potentials::ClusteredMorse<double> pot;
+      pot.D = cfg.D; pot.alpha = cfg.alpha; pot.r0 = cfg.r0;
+      pot.rcut = cfg.rcut; pot.truncation = trunc;
+      run_cluster(std::move(pot));
+    } else {
+      potentials::MorsePotential<double> pot;
+      pot.D = cfg.D; pot.alpha = cfg.alpha; pot.r0 = cfg.r0;
+      pot.rcut = cfg.rcut; pot.truncation = trunc;
+      run_direct(std::move(pot));
+    }
   }
 
   if (res.halt != core::Halt::None) {

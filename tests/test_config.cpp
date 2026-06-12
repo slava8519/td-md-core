@@ -177,3 +177,95 @@ TEST(Config, AllErrorsAreCollected) {  // one pass reports every problem
     EXPECT_NE(w.find("C_buf"), std::string::npos) << w;
   }
 }
+
+// --- M3: potential.type=lj, truncation schemes (cutoff.hpp) ---
+
+TEST(Config, LJPotentialParses) {
+  TempConfig cfg(R"(
+run: { steps: 1 }
+geometry: { file: reference_data/al_fcc_72.data }
+potential: { type: lj, r_cut: 3.0, truncation: force_shift, lj: { epsilon: 1.0, sigma: 1.0 } }
+)");
+  io::Config c = io::load_config(cfg.path());
+  EXPECT_EQ(c.pot_type, "lj");
+  EXPECT_EQ(c.truncation, "force_shift");
+  EXPECT_DOUBLE_EQ(c.lj_epsilon, 1.0);
+  EXPECT_DOUBLE_EQ(c.lj_sigma, 1.0);
+}
+
+TEST(Config, BadPotentialTypeIsFatal) {
+  std::string y(kValid);
+  y.replace(y.find("type: morse"), 11, "type: reaxx");
+  expect_throws_with(y, "potential.type");
+}
+
+TEST(Config, BadTruncationIsFatal) {
+  TempConfig cfg(R"(
+run: { steps: 1 }
+geometry: { file: reference_data/al_fcc_72.data }
+potential: { type: lj, r_cut: 3.0, truncation: smooth }
+)");
+  EXPECT_THROW(io::load_config(cfg.path()), std::runtime_error);
+}
+
+TEST(Config, LegacyShiftMapsToTruncation) {
+  std::string y(kValid);  // shift: true
+  {
+    TempConfig cfg(y);
+    EXPECT_EQ(io::load_config(cfg.path()).truncation, "shift");
+  }
+  y.replace(y.find("shift: true"), 11, "shift: false");
+  {
+    TempConfig cfg(y);
+    EXPECT_EQ(io::load_config(cfg.path()).truncation, "cut");
+  }
+}
+
+TEST(Config, TruncationWinsOverLegacyShiftWithWarning) {
+  std::string y(kValid);
+  y.replace(y.find("shift: true"), 11, "shift: false, truncation: shift");
+  TempConfig cfg(y);
+  testing::internal::CaptureStderr();
+  io::Config c = io::load_config(cfg.path());
+  const std::string err = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(c.truncation, "shift");
+  EXPECT_NE(err.find("potential.shift is ignored"), std::string::npos) << err;
+}
+
+TEST(Config, NonPositiveLJParamsAreFatal) {
+  TempConfig cfg(R"(
+run: { steps: 1 }
+geometry: { file: reference_data/al_fcc_72.data }
+potential: { type: lj, r_cut: 3.0, lj: { epsilon: -1.0, sigma: 1.0 } }
+)");
+  EXPECT_THROW(io::load_config(cfg.path()), std::runtime_error);
+}
+
+// Review M3: parameter ranges are scoped to the ACTIVE potential — a stale
+// block of the inactive type must not be fatal.
+TEST(Config, InactivePotentialBlockIsNotValidated) {
+  TempConfig lj_with_bad_morse(R"(
+run: { steps: 1 }
+geometry: { file: reference_data/al_fcc_72.data }
+potential: { type: lj, r_cut: 3.0, lj: { epsilon: 1.0, sigma: 1.0 }, morse: { D: 0 } }
+)");
+  EXPECT_NO_THROW(io::load_config(lj_with_bad_morse.path()));
+  TempConfig morse_with_bad_lj(R"(
+run: { steps: 1 }
+geometry: { file: reference_data/al_fcc_72.data }
+potential: { type: morse, r_cut: 4.0, lj: { epsilon: -1.0 } }
+)");
+  EXPECT_NO_THROW(io::load_config(morse_with_bad_lj.path()));
+}
+
+// Review M3: a scheme name in the legacy bool key is the likely migration
+// typo — it must land in the collected B10 report with a hint, not surface
+// as a raw yaml-cpp bad-conversion.
+TEST(Config, SchemeNameInLegacyShiftKeyIsFatalWithHint) {
+  expect_throws_with(R"(
+run: { steps: 1 }
+geometry: { file: reference_data/al_fcc_72.data }
+potential: { type: morse, r_cut: 4.0, shift: force_shift }
+)",
+                     "potential.truncation");
+}

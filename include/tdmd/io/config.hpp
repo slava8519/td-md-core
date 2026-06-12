@@ -17,11 +17,15 @@ struct Config {
   std::string geom_file;
   std::string geom_format = "lammps_data";
   std::array<bool, 3> periodic{true, true, true};
-  // potential (morse)
+  // potential (morse | lj)
   std::string pot_type = "morse";
   double rcut = 4.0;
-  bool   shift = true;
+  // cutoff scheme: cut | shift | force_shift (cutoff.hpp). Resolved here:
+  // legacy `potential.shift: bool` maps to shift/cut, `potential.truncation`
+  // wins when both are given.
+  std::string truncation = "shift";
   double D = 0.29614, alpha = 1.11892, r0 = 3.29692;
+  double lj_epsilon = 1.0, lj_sigma = 1.0;  // reduced-unit defaults
   // timestep
   std::string ts_mode = "fixed";  // fixed | auto
   double dt = 0.005;              // ps (dt_initial)

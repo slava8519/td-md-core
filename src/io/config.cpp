@@ -126,21 +126,53 @@ Config load_config(const std::string& path) {
 
   if (auto p = root["potential"]) {
     warn_unknown_keys(p, "potential",
-                      {"type", "r_cut", "shift", "morse", "eam", "table"});
+                      {"type", "r_cut", "shift", "truncation", "morse", "lj",
+                       "eam", "table"});
     if (p["type"])  c.pot_type = p["type"].as<std::string>();
     if (p["r_cut"]) c.rcut     = p["r_cut"].as<double>();
-    if (p["shift"]) c.shift    = p["shift"].as<bool>();
+    // cutoff scheme: `truncation` (cut|shift|force_shift) is the M3 key;
+    // legacy bool `shift` maps to shift/cut and loses when both are given.
+    // A scheme name in the legacy key is the likely migration typo — catch it
+    // here so it lands in the collected B10 report, not a raw yaml-cpp error.
+    if (p["shift"]) {
+      try {
+        c.truncation = p["shift"].as<bool>() ? "shift" : "cut";
+      } catch (const YAML::Exception&) {
+        v.fail("potential.shift must be bool (true|false); use "
+               "potential.truncation for cut|shift|force_shift");
+      }
+    }
+    if (p["truncation"]) {
+      if (p["shift"])
+        std::fprintf(stderr,
+                     "[config] warning: potential.shift is ignored — "
+                     "potential.truncation takes precedence\n");
+      c.truncation = p["truncation"].as<std::string>();
+    }
     if (auto m = p["morse"]) {
       warn_unknown_keys(m, "potential.morse", {"D", "alpha", "r0"});
       if (m["D"])     c.D     = m["D"].as<double>();
       if (m["alpha"]) c.alpha = m["alpha"].as<double>();
       if (m["r0"])    c.r0    = m["r0"].as<double>();
     }
+    if (auto l = p["lj"]) {
+      warn_unknown_keys(l, "potential.lj", {"epsilon", "sigma"});
+      if (l["epsilon"]) c.lj_epsilon = l["epsilon"].as<double>();
+      if (l["sigma"])   c.lj_sigma   = l["sigma"].as<double>();
+    }
   }
-  v.check_enum(c.pot_type, "potential.type", {"morse"});  // lj — M3 core
+  v.check_enum(c.pot_type, "potential.type", {"morse", "lj"});
+  v.check_enum(c.truncation, "potential.truncation",
+               {"cut", "shift", "force_shift"});
   v.check(c.rcut > 0.0, "potential.r_cut must be > 0");
-  v.check(c.D > 0.0 && c.alpha > 0.0 && c.r0 > 0.0,
-          "potential.morse: D, alpha, r0 must all be > 0");
+  // parameter ranges are scoped to the ACTIVE potential — a stale block of
+  // the other type must not be fatal (review M3)
+  if (c.pot_type == "morse")
+    v.check(c.D > 0.0 && c.alpha > 0.0 && c.r0 > 0.0,
+            "potential.morse: D, alpha, r0 must all be > 0");
+  if (c.pot_type == "lj")
+    v.check(c.lj_epsilon > 0.0 && c.lj_sigma > 0.0,
+            "potential.lj: epsilon and sigma must be > 0");
 
   if (auto t = root["timestep"]) {
     warn_unknown_keys(t, "timestep",
