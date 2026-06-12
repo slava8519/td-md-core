@@ -226,7 +226,7 @@ Config load_config(const std::string& path) {
                {"streams", "multi_gpu"});
   v.check(c.ring_nodes >= 1, "decomposition.ring.n_nodes must be >= 1");
   v.check(c.steps_per_node == 1,
-          "decomposition.ring.steps_per_node: k>1 lands at M5a (Гл. 3.4)");
+          "decomposition.ring.steps_per_node: k>1 реализовано в MPI-кольце (M5a, тестовый путь); CLI-путь пока k=1");
 
   if (auto nb = root["neighbor"]) {
     warn_unknown_keys(nb, "neighbor", {"mode", "skin"});

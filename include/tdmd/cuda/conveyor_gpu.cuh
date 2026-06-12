@@ -213,6 +213,39 @@ class StreamTransport {
   std::vector<std::unique_ptr<StreamEdge>> edges_;
 };
 
+// --- M5a: process-boundary edge (the ring partitioned across MPI ranks) ---
+//
+// The ITransport contract fixes the memory space: payloads cross a process
+// boundary as HOST buffers (the system OpenMPI 4.1.6 is not CUDA-aware —
+// device pointers do not travel; host-staging D2H -> MPI -> H2D is the base
+// path). The conveyor does the staging; the edge moves bytes. Wire format =
+// exactly the intra-rank image (packed doubles, or the int32 image in
+// production_mixed — the B5 traffic win applies to MPI hops too), so the
+// transport is bit-exact and rank partitioning cannot change trajectories.
+struct IBoundaryEdge {
+  // Blocking; the payload buffer may be reused after return.
+  virtual void send(const GpuHeader& h, const void* payload,
+                    std::size_t bytes) = 0;
+  // Blocking; false == ring shutdown (halt poison from another rank).
+  virtual bool recv(GpuHeader& h, void* payload, std::size_t bytes) = 0;
+  // Propagate a HALT across the boundary (poison message with a hop TTL).
+  virtual void poison() = 0;
+  virtual ~IBoundaryEdge() = default;
+};
+
+// This process's share of the global logical ring. Logical node count is
+// z_ranks x k (M5a "k шагов на узел", Гл. 3.4/ур. 51: a zone makes k cheap
+// intra-rank hops per one MPI hop — traffic drops k-fold, memory grows with
+// the in-flight window, the trajectory is bitwise UNCHANGED because the
+// protocol never depends on the node count).
+struct RingPart {
+  int z_global = 0;            // 0 => single-process (z_global = o.n_nodes)
+  int node0 = 0;               // global index of this process's first node
+  int z_local = 0;             // logical nodes hosted by this process
+  IBoundaryEdge* in = nullptr;   // feeds local node 0
+  IBoundaryEdge* out = nullptr;  // drains local node z_local-1
+};
+
 // --- per-node device storage ----------------------------------------------
 
 // Packed zone slot: base[k*cap + i], k = 0..9 -> x y z vx vy vz fx fy fz mass.
@@ -243,19 +276,26 @@ template <typename PairF>
 class GpuTimeConveyor {
  public:
   GpuTimeConveyor(core::AtomSoA<double>& atoms, const core::Box& box,
-                  double rcut, PairF pot, const core::ConveyorOptions& o)
-      : atoms_(atoms), box_(box), rcut_(rcut), pot_(pot), o_(o),
+                  double rcut, PairF pot, const core::ConveyorOptions& o,
+                  RingPart part = {})
+      : atoms_(atoms), box_(box), rcut_(rcut), pot_(pot), o_(o), part_(part),
         geom_(box, rcut) {
     if (o_.steps < 1) throw std::invalid_argument("gpu conveyor: steps >= 1");
     if (o_.n_nodes < 1) throw std::invalid_argument("gpu conveyor: n_nodes >= 1");
     if (!(o_.dt_initial > 0.0))
       throw std::invalid_argument("gpu conveyor: dt_initial must be > 0");
+    if (part_.z_global > 0 &&
+        (part_.z_local < 1 || part_.node0 < 0 ||
+         part_.node0 + part_.z_local > part_.z_global || !part_.in || !part_.out))
+      throw std::invalid_argument("gpu conveyor: malformed RingPart");
   }
 
   core::ConveyorResult run() {
     zd_ = core::ZoneDecomposition::build(atoms_, box_, o_.n_zones, rcut_);
     n_ = zd_.n_zones;
-    z_ = o_.n_nodes;
+    z_ = (part_.z_global > 0) ? part_.z_local : o_.n_nodes;
+    Z_ = (part_.z_global > 0) ? part_.z_global : z_;
+    node0_ = part_.node0;
     S_ = n_ + 2;  // slots per node
     pbc_z_ = box_.periodic[2];
     for (const auto& m : zd_.members) cap_ = std::max(cap_, int(m.size()));
@@ -283,12 +323,20 @@ class GpuTimeConveyor {
       qf_ = std::ldexp(1.0, -20);  // forces: ±2048 eV/Å
     }
     alloc_nodes();
-    preload_node0();
+    if (node0_ == 0) preload_node0();  // §7.3: only the rank owning P1
     transport_ = std::make_unique<StreamTransport>(z_, S_, std::size_t(n_) + 2);
-    for (int k = 0; k < z_; ++k) {  // edge k feeds node (k+1)%z
+    for (int k = 0; k < z_; ++k) {  // intra edge k feeds local node (k+1)%z
+      if (part_.in && k == z_ - 1) continue;  // wrap edge replaced by boundary
       const int kn = (k + 1) % z_;
-      for (int s2 = (kn == 0 ? n_ : 0); s2 < S_; ++s2)
+      for (int s2 = (kn == 0 && !part_.in && node0_ == 0 ? n_ : 0); s2 < S_; ++s2)
         transport_->edge(k).credits_.send(int(s2));
+    }
+    if (part_.in) {  // local node 0 manages its own slot pool + host staging
+      for (int s2 = (node0_ == 0 ? n_ : 0); s2 < S_; ++s2)
+        bfree_.push_back(s2);
+      TDMD_CU(cudaHostAlloc(&in_stage_, wire_bytes(), 0));
+      TDMD_CU(cudaHostAlloc(&out_stage_, wire_bytes(), 0));
+      TDMD_CU(cudaEventCreateWithFlags(&in_evt_, cudaEventDisableTiming));
     }
 
     {
@@ -313,7 +361,15 @@ class GpuTimeConveyor {
       res_.stats.resize(std::size_t(done));
     } else {
       res_.steps_done = o_.steps;
-      scatter_final();
+      if (final_seen_.load()) {  // multi-rank: one rank owns the final pass
+        scatter_final();
+        res_.has_final = true;
+      }
+    }
+    if (part_.in) {
+      cudaFreeHost(in_stage_);
+      cudaFreeHost(out_stage_);
+      cudaEventDestroy(in_evt_);
     }
     free_nodes();
     return res_;
@@ -419,7 +475,7 @@ class GpuTimeConveyor {
 
   void node_main(int k) {
     try {
-      for (long h = k + 1; h <= o_.steps; h += z_) {
+      for (long h = node0_ + k + 1; h <= o_.steps; h += Z_) {
         if (halt_on_.load(std::memory_order_acquire)) return;
         if (!run_pass(k, h)) return;
       }
@@ -433,7 +489,9 @@ class GpuTimeConveyor {
     NodeBuf& nb = node_[std::size_t(k)];
     StreamEdge& in = transport_->edge((k - 1 + z_) % z_);
     StreamEdge& out = transport_->edge(k);
-    const auto io = core::node_io_order(k + 1);       // §7.4 parity
+    const bool b_in = (part_.in && k == 0);            // boundary in-edge
+    const bool b_out = (part_.out && k == z_ - 1);     // boundary out-edge
+    const auto io = core::node_io_order(int(node0_ + k) + 1);  // §7.4 parity
     const int r = pbc_z_ ? int((h - 1) % n_) : 0;     // rotation
     const bool defer_head = pbc_z_ && n_ > 1;
     const bool preload = (h == 1);
@@ -466,6 +524,41 @@ class GpuTimeConveyor {
           s.lam_in = lam0_;
           if (arrived == 0) dt = o_.dt_initial;
           s.fsm.type = core::initial_zone_type(1);
+        } else if (b_in) {
+          // M5a boundary: header+payload arrive as host bytes; this node owns
+          // its slot pool locally (no cross-rank credits). Staging reuse is
+          // gated by the previous H2D's event (never-recorded => no-op).
+          TDMD_CU(cudaEventSynchronize(in_evt_));
+          GpuHeader gh;
+          if (!part_.in->recv(gh, in_stage_, wire_bytes())) return false;
+          if (gh.hdr.zone_id != want_id || gh.hdr.step_h != h - 1 ||
+              gh.hdr.sent_pos != arrived)
+            throw std::logic_error("gpu conveyor: boundary arrival out of order");
+          if (bfree_.empty())
+            throw std::logic_error("gpu conveyor: boundary slot pool exhausted");
+          s.dev = bfree_.front();
+          bfree_.pop_front();
+          s.n_atoms = gh.n_atoms;
+          s.lam_in = {gh.hdr.v_full, gh.hdr.a_full, gh.hdr.k2cap_full};
+          if (arrived == 0) dt = gh.hdr.dt_next;
+          const DevSlot& d = nb.slot[std::size_t(s.dev)];
+          if (o_.mixed_transport) {
+            TDMD_CU(cudaMemcpyAsync(d.pk_mass, in_stage_, wire_bytes(),
+                                    cudaMemcpyHostToDevice, nb.stream));
+            if (s.n_atoms > 0) {
+              const int grid = (s.n_atoms + kIntBlock - 1) / kIntBlock;
+              unpack_zone_kernel<<<grid, kIntBlock, 0, nb.stream>>>(
+                  d.pk_mass, d.pk, cap_, s.n_atoms, qp_, qv_, qf_, box_.lo[0],
+                  box_.lo[1], box_.lo[2], d.base);
+              TDMD_CU(cudaGetLastError());
+            }
+          } else {
+            TDMD_CU(cudaMemcpyAsync(d.base, in_stage_, wire_bytes(),
+                                    cudaMemcpyHostToDevice, nb.stream));
+          }
+          TDMD_CU(cudaEventRecord(in_evt_, nb.stream));
+          s.fsm.type = core::ZoneType::o;
+          core::ZoneFSM::apply(s.fsm, core::ZoneEvent::RECV);  // T1
         } else {
           GpuHeader gh;
           if (!in.chan_.recv(gh)) return false;  // shutdown
@@ -625,10 +718,61 @@ class GpuTimeConveyor {
                                   DevSlot::kArrays * sizeof(double) * cap_,
                                   cudaMemcpyDeviceToHost, nb.stream));
           TDMD_CU(cudaStreamSynchronize(nb.stream));
+          final_seen_.store(true, std::memory_order_release);
           continue;
         }
         const int kn = (k + 1) % z_;
         NodeBuf& cn = node_[std::size_t(kn)];
+        if (b_out) {
+          // M5a boundary: stage the wire image to pinned host memory and hand
+          // it to the edge (D2H -> MPI -> H2D on the peer). One staging
+          // buffer suffices: send() returns only when it may be reused.
+          GpuHeader gh;
+          gh.hdr.zone_id = s.fsm.id;
+          gh.hdr.step_h = h;
+          gh.hdr.sent_pos = sent;
+          const Lambda lamb =
+              (sent + 1 < n_) ? slot[std::size_t(sent + 1)].lam_in : agg;
+          if (sent == 0)
+            dt_next = o_.auto_step
+                          ? core::buffer::auto_dt(lamb.v, dt, o_.ts, lamb.k2cap)
+                          : o_.dt_initial;
+          gh.hdr.dt_next = (sent == 0) ? dt_next : 0.0;
+          gh.hdr.v_full = lamb.v;
+          gh.hdr.a_full = lamb.a;
+          gh.hdr.k2cap_full = lamb.k2cap;
+          gh.n_atoms = s.n_atoms;
+          gh.dst_slot = -1;  // the receiver picks its own slot
+          if (o_.mixed_transport) {
+            if (s.n_atoms > 0) {
+              const int grid = (s.n_atoms + kIntBlock - 1) / kIntBlock;
+              pack_zone_kernel<<<grid, kIntBlock, 0, nb.stream>>>(
+                  src.base, cap_, s.n_atoms, 1.0 / qp_, 1.0 / qv_, 1.0 / qf_,
+                  box_.lo[0], box_.lo[1], box_.lo[2], src.pk_mass, src.pk,
+                  nb.d_flags);
+              TDMD_CU(cudaGetLastError());
+            }
+            TDMD_CU(cudaMemcpyAsync(out_stage_, src.pk_mass, wire_bytes(),
+                                    cudaMemcpyDeviceToHost, nb.stream));
+          } else {
+            TDMD_CU(cudaMemcpyAsync(out_stage_, src.base, wire_bytes(),
+                                    cudaMemcpyDeviceToHost, nb.stream));
+          }
+          TDMD_CU(cudaStreamSynchronize(nb.stream));
+          core::ZoneFSM::apply(s.fsm, core::ZoneEvent::SEND);  // T5
+          part_.out->send(gh, out_stage_, wire_bytes());
+          // free MY source slot: if this node's in-edge is the boundary, the
+          // pool is local (stream order serializes the read-out above vs any
+          // later H2D into the slot); otherwise the usual event+credit.
+          if (b_in) {
+            bfree_.push_back(s.dev);
+          } else {
+            TDMD_CU(cudaEventRecord(in.free_[std::size_t(s.dev)], nb.stream));
+            in.credits_.send(int(s.dev));
+          }
+          ++sent;
+          continue;
+        }
         int dst = -1;
         if (!out.credits_.recv(dst)) return false;  // free-slot credit
         // slot-reuse safety: the credit is pushed only after the consumer
@@ -652,10 +796,16 @@ class GpuTimeConveyor {
                                   cudaMemcpyDeviceToDevice, nb.stream));
         }
         TDMD_CU(cudaEventRecord(out.arrival_[std::size_t(dst)], nb.stream));
-        // my source slot becomes reusable once that copy has READ it:
-        // record the event FIRST, then hand the credit back upstream
-        TDMD_CU(cudaEventRecord(in.free_[std::size_t(s.dev)], nb.stream));
-        in.credits_.send(int(s.dev));
+        // my source slot becomes reusable once that copy has READ it: if the
+        // in-edge is the process boundary the pool is local and stream order
+        // suffices; otherwise record the event FIRST, then hand the credit
+        // back upstream
+        if (b_in) {
+          bfree_.push_back(s.dev);
+        } else {
+          TDMD_CU(cudaEventRecord(in.free_[std::size_t(s.dev)], nb.stream));
+          in.credits_.send(int(s.dev));
+        }
 
         GpuHeader gh;
         gh.hdr.zone_id = s.fsm.id;
@@ -769,6 +919,7 @@ class GpuTimeConveyor {
       halt_kind_ = kind;
       halt_msg_ = std::move(msg);
       transport_->shutdown();
+      if (part_.out) part_.out->poison();  // M5a: stop the other ranks too
     }
   }
 
@@ -777,14 +928,25 @@ class GpuTimeConveyor {
   const double rcut_;
   PairF pot_;
   const core::ConveyorOptions o_;
+  RingPart part_;
   const core::PairGeom geom_;
 
   std::size_t packed_bytes() const {
     return sizeof(double) * cap_ + 9 * sizeof(int) * std::size_t(cap_);
   }
+  std::size_t wire_bytes() const {  // the boundary payload image
+    return o_.mixed_transport ? packed_bytes()
+                              : DevSlot::kArrays * sizeof(double) * cap_;
+  }
 
   core::ZoneDecomposition zd_;
-  int n_ = 1, z_ = 1, S_ = 3, cap_ = 0;
+  int n_ = 1, z_ = 1, Z_ = 1, S_ = 3, cap_ = 0;
+  int node0_ = 0;
+  std::deque<int> bfree_;          // local slot pool of a boundary-fed node 0
+  double* in_stage_ = nullptr;     // pinned boundary staging (M5a)
+  double* out_stage_ = nullptr;
+  cudaEvent_t in_evt_{};
+  std::atomic<bool> final_seen_{false};
   double qp_ = 0.0, qv_ = 0.0, qf_ = 0.0;  // B5 quanta (mixed only)
   bool pbc_z_ = false;
   Lambda lam0_{};
@@ -804,8 +966,9 @@ template <typename PairF>
 core::ConveyorResult run_conveyor_gpu(core::AtomSoA<double>& atoms,
                                       const core::Box& box, double rcut,
                                       PairF pot,
-                                      const core::ConveyorOptions& o) {
-  GpuTimeConveyor<PairF> tc(atoms, box, rcut, std::move(pot), o);
+                                      const core::ConveyorOptions& o,
+                                      RingPart part = {}) {
+  GpuTimeConveyor<PairF> tc(atoms, box, rcut, std::move(pot), o, part);
   return tc.run();
 }
 

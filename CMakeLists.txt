@@ -18,6 +18,8 @@ option(TDMD_BUILD_TESTS "Build unit tests (Test_0_Step, NVE drift)" ON)
 # and cloud CI must not require a CUDA toolkit. GPU tests carry the `cuda` ctest
 # label and are gated locally via scripts/gpu_gate.sh (compute-sanitizer).
 option(TDMD_WITH_CUDA "Build CUDA components (tools/devprobe, Test_CUDA_Smoke)" OFF)
+# M5a: the MPI ring test (mpirun, ranks share one GPU). Needs TDMD_WITH_CUDA.
+option(TDMD_WITH_MPI "Build the M5a MPI ring test (needs CUDA + MPI)" OFF)
 
 if(TDMD_WITH_CUDA)
   # 120-real: SASS for the RTX 5080 dev box, no PTX (bare "120" would embed PTX
@@ -191,6 +193,22 @@ if(TDMD_BUILD_TESTS)
       $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false -Xptxas=-v>)
     add_test(NAME Test_CUDA_Zones COMMAND test_cuda_zones)
     set_tests_properties(Test_CUDA_Zones PROPERTIES LABELS cuda)
+
+    if(TDMD_WITH_MPI)                                            # M5a: MPI ring
+      find_package(MPI REQUIRED COMPONENTS CXX)
+      add_executable(test_mpi_conveyor tests/test_mpi_conveyor.cu)
+      target_link_libraries(test_mpi_conveyor PRIVATE tdmd_core Threads::Threads
+                            MPI::MPI_CXX)
+      target_compile_options(test_mpi_conveyor PRIVATE
+        $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+      foreach(NP 2 4)
+        add_test(NAME Test_MPI_Conveyor_np${NP}
+                 COMMAND ${MPIEXEC_EXECUTABLE} ${MPIEXEC_NUMPROC_FLAG} ${NP}
+                         $<TARGET_FILE:test_mpi_conveyor>)
+        set_tests_properties(Test_MPI_Conveyor_np${NP}
+                             PROPERTIES LABELS "cuda;mpi" TIMEOUT 300)
+      endforeach()
+    endif()
 
     add_executable(test_cuda_conveyor tests/test_cuda_conveyor.cu)  # M4: GPU ring
     target_link_libraries(test_cuda_conveyor PRIVATE tdmd_core GTest::gtest_main

@@ -85,3 +85,25 @@ cmake -S . -B build-cuda -G Ninja -DTDMD_WITH_CUDA=ON && cmake --build build-cud
 ncu --metrics sm__warps_active.avg.pct_of_peak_sustained_active,launch__grid_size \
     --kernel-name regex:zone_pair_kernel --launch-count 4 ./build-cuda/bench_conveyor ...
 ```
+
+## M5a: издержки host-staging MPI-кольца (2026-06-12)
+
+`mpirun -np 2 ./build-cuda/test_mpi_conveyor --bench <k>` — то же ядро работ,
+один GPU (Default compute mode), LJ fp64, N=10 976, 8 зон, 60 шагов; MPI-путь:
+D2H → `MPI_Isend` (OpenMPI 4.1.6, не CUDA-aware) → H2D, пул 4 буферов.
+
+| Конфигурация | atom-steps/s | vs одно-процессного D2D (Z тот же) |
+|---|---|---|
+| np=2, k=1 (Z=2) | 3.22e5 | **×1.95 медленнее** (каждый хоп — staging) |
+| np=2, k=4 (Z=8) | 5.35e5 | **×1.32 медленнее** |
+
+**k шагов на узел работает как заявлено (ур. 51):** зона пересекает границу
+рангов раз в k проходов ⇒ штраф staging падает с ×1.95 до ×1.32 при k=4, при
+этом k стримов на ранг дают конкурентность. nsys (k=1 vs k=4, на ранг):
+суммарное время ядер неизменно (~3.5 с — работа та же), wall кольца
+2.04 → 1.23 с ⇒ конкурентность ядер выросла ×1.66 — насыщение от k>1
+зафиксировано (репорты `/tmp/tdmd_k{0,1}_{1,4}.nsys-rep`, методика
+`-t cuda` + `cuda_gpu_kern_sum`). Детерминизм: MPI-кольцо побитово ≡
+одно-процессному (fixed/auto/mixed; np∈{2,3,4}; k∈{1,2,3}), включая
+**реплику §3.6 на np=2×k=2 = Z=4 — конфигурация четырёх процессоров
+диссертации, нулевое отклонение**.

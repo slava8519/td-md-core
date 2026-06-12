@@ -124,6 +124,10 @@ struct ConveyorResult {
   std::string halt_msg;
   double e0 = 0.0;               // pe0 + ke0 at t0
   std::vector<PassStats> stats;  // [h-1] for h = 1..steps_done
+  // M5a: with the ring partitioned across MPI ranks, the final-pass zones
+  // land on ONE rank — atoms/stats are authoritative only where this is set
+  // (single-process runs always set it on success).
+  bool   has_final = false;
 };
 
 namespace conveyor_detail {
@@ -209,6 +213,7 @@ class TimeConveyor {
     } else {
       res_.steps_done = o_.steps;
       scatter_final();
+      res_.has_final = true;
     }
     return res_;
   }
