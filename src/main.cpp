@@ -129,6 +129,15 @@ int main(int argc, char** argv) {
                 "               (io.trajectory/neighbor.mode не действуют на "
                 "кольцевом пути — M4)\n",
                 n_zones, cfg.ring_nodes);
+    if (cfg.precision_mode != "deterministic_fp64")
+      std::printf("               ВНИМАНИЕ: CLI-кольцо всегда deterministic_fp64;"
+                  " precision.mode=%s не действует (GPU/MPI-кольцо — тестовый"
+                  " путь до упаковки M5b/M7)\n",
+                  cfg.precision_mode.c_str());
+    if (cfg.ring_backend != "streams")
+      std::printf("               ВНИМАНИЕ: ring.backend=%s не действует на"
+                  " CLI-пути\n",
+                  cfg.ring_backend.c_str());
     core::ConveyorOptions co;
     co.steps = cfg.steps;
     co.n_zones = n_zones;

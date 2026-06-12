@@ -100,6 +100,9 @@ core::AtomSoA<double> make_fcc(core::Box& box, int cx, int cy, int cz,
   bad += cmp(a.vx, b.vx, "vx ");
   bad += cmp(a.vy, b.vy, "vy ");
   bad += cmp(a.vz, b.vz, "vz ");
+  bad += cmp(a.fx, b.fx, "fx ");
+  bad += cmp(a.fy, b.fy, "fy ");
+  bad += cmp(a.fz, b.fz, "fz ");
   if (bad.empty()) return ::testing::AssertionSuccess();
   return ::testing::AssertionFailure() << "bitwise mismatch in: " << bad;
 }
@@ -215,10 +218,12 @@ TEST(CudaConveyor, PbcClosureBitwiseVsCpu) {
   auto gpu = run_gpu(init, box, o, lj);
   EXPECT_TRUE(bitwise_eq(cpu, gpu));
 
-  auto oz = o;
-  oz.n_nodes = 3;
-  auto gpu3 = run_gpu(init, box, oz, lj);
-  EXPECT_TRUE(bitwise_eq(gpu, gpu3));
+  for (int z : {2, 3, 4}) {  // even AND odd stream counts under rotation
+    auto oz = o;
+    oz.n_nodes = z;
+    auto gpuz = run_gpu(init, box, oz, lj);
+    EXPECT_TRUE(bitwise_eq(gpu, gpuz)) << "z=" << z;
+  }
 }
 
 // --- §3.6 replica on the GPU: Al-72, free boundaries, auto-step (C1=10
@@ -309,6 +314,23 @@ TEST(CudaConveyor, MixedRunToRunAnd1vsZBitwise) {
     auto gz = run_gpu(init, box, oz, lj32);
     EXPECT_TRUE(bitwise_eq(g1a, gz)) << "z=" << z;
   }
+
+  // auto dt through the mixed transport: the Λ-chain decides dt from END
+  // reductions over UNPACKED int32 state — the regime where the
+  // snap-once-per-pass z-independence argument has teeth (review M5a)
+  auto oa = o;
+  oa.steps = 80;
+  oa.auto_step = true;
+  oa.dt_initial = 0.001;
+  oa.ts.C1 = 0.01;
+  oa.ts.C3 = 1.0;
+  core::ConveyorResult ra1, ra3;
+  auto ga1 = run_gpu(init, box, oa, lj32, &ra1);
+  oa.n_nodes = 3;
+  auto ga3 = run_gpu(init, box, oa, lj32, &ra3);
+  EXPECT_TRUE(bitwise_eq(ga1, ga3));
+  for (std::size_t i = 0; i < ra1.stats.size(); ++i)
+    ASSERT_EQ(ra1.stats[i].dt, ra3.stats[i].dt) << "mixed auto dt, pass " << i + 1;
 }
 
 TEST(CudaConveyor, MixedAccuracyVsFp64) {
@@ -399,16 +421,19 @@ TEST(CudaConveyor, NveInvariant50kOnGpu) {
 
   // secular trend (LSQ over E(t)), kT/(ns·dof)
   const std::size_t n = r1.stats.size();
-  double tm = 0.0, em = 0.0;
+  std::vector<double> tax(n);  // cumulative time axis — survives auto-dt
+  double tcum = 0.0, tm = 0.0, em = 0.0;
   for (std::size_t i = 0; i < n; ++i) {
-    tm += double(i + 1) * 0.001;
+    tcum += r1.stats[i].dt;
+    tax[i] = tcum;
+    tm += tax[i];
     em += r1.stats[i].pe + r1.stats[i].ke;
   }
   tm /= double(n);
   em /= double(n);
   double num = 0.0, den = 0.0;
   for (std::size_t i = 0; i < n; ++i) {
-    const double dt_i = double(i + 1) * 0.001 - tm;
+    const double dt_i = tax[i] - tm;
     num += dt_i * (r1.stats[i].pe + r1.stats[i].ke - em);
     den += dt_i * dt_i;
   }

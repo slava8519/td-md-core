@@ -262,7 +262,7 @@ int main(int argc, char** argv) {
                 tb, as_b);
     std::printf("  TD ring  (z=%d, n=%d):     %8.3f s  -> %.3e atom-steps/s\n",
                 nodes, zones, tr, as_r);
-    std::printf("  ring/baseline overhead ratio: %.3f  [%s]\n", tb / tr, mode);
+    std::printf("  ring speedup over baseline: x%.3f  [%s]\n", tb / tr, mode);
   };
   if (mixed) bench(make_lj32());
   else bench(make_lj64());

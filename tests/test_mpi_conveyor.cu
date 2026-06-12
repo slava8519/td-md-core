@@ -102,7 +102,8 @@ bool bitwise_eq(const core::AtomSoA<double>& a, const core::AtomSoA<double>& b) 
     return std::memcmp(u.data(), v.data(), u.size() * sizeof(double)) == 0;
   };
   return a.n == b.n && eq(a.x, b.x) && eq(a.y, b.y) && eq(a.z, b.z) &&
-         eq(a.vx, b.vx) && eq(a.vy, b.vy) && eq(a.vz, b.vz);
+         eq(a.vx, b.vx) && eq(a.vy, b.vy) && eq(a.vz, b.vz) &&
+         eq(a.fx, b.fx) && eq(a.fy, b.fy) && eq(a.fz, b.fz);
 }
 
 // One scenario: single-process reference vs the rank-partitioned ring.
@@ -133,7 +134,8 @@ void run_case(const char* name, const core::AtomSoA<double>& init,
           ? sizeof(double) * cap + 9 * sizeof(int) * std::size_t(cap)
           : 10 * sizeof(double) * std::size_t(cap);
 
-  mpi::MpiRingEdge edge(MPI_COMM_WORLD, rank, nranks, wire);
+  mpi::MpiRingEdge edge(MPI_COMM_WORLD, rank, nranks, wire,
+                        o.n_zones + 2);
   cuda::RingPart part;
   part.z_global = Z;
   part.node0 = rank * k;
@@ -182,30 +184,43 @@ void run_bench(const core::AtomSoA<double>& init, const core::Box& box,
   for (const auto& m : zd.members) cap = std::max(cap, int(m.size()));
   const std::size_t wire = 10 * sizeof(double) * std::size_t(cap);
 
-  mpi::MpiRingEdge edge(MPI_COMM_WORLD, rank, nranks, wire);
-  cuda::RingPart part{Z, rank * k, k, &edge, &edge};
-  auto om = o;
-  om.n_nodes = k;
-  core::AtomSoA<double> mine = init;
-  MPI_Barrier(MPI_COMM_WORLD);
-  const double t0 = MPI_Wtime();
-  auto r = cuda::run_conveyor_gpu(mine, box, kRcut, pot, om, part);
-  MPI_Barrier(MPI_COMM_WORLD);
-  const double t_mpi = MPI_Wtime() - t0;
-  MPI_CHECK(r.halt == core::Halt::None, "bench mpi ring halted");
+  // difference timing t(W+S) - t(W) (review M5a: single-shot carried a
+  // ~10-15% one-time setup bias — t0 force pass + slot-pool allocation)
+  auto timed_mpi = [&](long steps) {
+    mpi::MpiRingEdge edge(MPI_COMM_WORLD, rank, nranks, wire, o.n_zones + 2);
+    cuda::RingPart part{Z, rank * k, k, &edge, &edge};
+    auto om = o;
+    om.n_nodes = k;
+    om.steps = steps;
+    core::AtomSoA<double> mine = init;
+    MPI_Barrier(MPI_COMM_WORLD);
+    const double t0 = MPI_Wtime();
+    auto r = cuda::run_conveyor_gpu(mine, box, kRcut, pot, om, part);
+    MPI_Barrier(MPI_COMM_WORLD);
+    MPI_CHECK(r.halt == core::Halt::None, "bench mpi ring halted");
+    return MPI_Wtime() - t0;
+  };
+  const long W = 5;
+  const double t_mpi = timed_mpi(W + o.steps) - timed_mpi(W);
 
+  double t_sp = 0.0;
   if (rank == 0) {  // single-process D2D ring, same Z, GPU otherwise idle
-    auto os = o;
-    os.n_nodes = Z;
-    core::AtomSoA<double> sp = init;
-    const double s0 = MPI_Wtime();
-    auto rs = cuda::run_conveyor_gpu(sp, box, kRcut, pot, os);
-    const double t_sp = MPI_Wtime() - s0;
-    MPI_CHECK(rs.halt == core::Halt::None, "bench single halted");
+    auto timed_sp = [&](long steps) {
+      auto os = o;
+      os.n_nodes = Z;
+      os.steps = steps;
+      core::AtomSoA<double> sp = init;
+      const double s0 = MPI_Wtime();
+      auto rs = cuda::run_conveyor_gpu(sp, box, kRcut, pot, os);
+      MPI_CHECK(rs.halt == core::Halt::None, "bench single halted");
+      return MPI_Wtime() - s0;
+    };
+    t_sp = timed_sp(W + o.steps) - timed_sp(W);
     std::printf("[mpi bench] N=%d steps=%ld zones=%d np=%d k=%d (Z=%d)\n"
                 "  mpi ring (host-staging): %7.3f s -> %.3e atom-steps/s\n"
                 "  single-process (D2D)   : %7.3f s -> %.3e atom-steps/s\n"
-                "  host-staging overhead  : x%.3f\n",
+                "  mpi/single time ratio  : x%.3f  (UPPER bound of staging\n"
+                "  cost: np contexts time-slice ONE GPU — see Bench doc)\n",
                 init.n, o.steps, o.n_zones, nranks, k, Z, t_mpi,
                 double(init.n) * o.steps / t_mpi, t_sp,
                 double(init.n) * o.steps / t_sp, t_mpi / t_sp);
@@ -262,6 +277,9 @@ int main(int argc, char** argv) {
   run_case("lj fixed fp64", init, box, o, make_lj64(), rank, nranks, 2);
   run_case("lj auto fp64", init, box, oa, make_lj64(), rank, nranks, 3);
   run_case("lj fixed mixed", init, box, om, make_lj32(), rank, nranks, 2);
+  auto oma = oa;
+  oma.mixed_transport = true;
+  run_case("lj auto mixed", init, box, oma, make_lj32(), rank, nranks, 2);
 
   // HALT propagation across ranks: a causality halt on the owning rank must
   // poison the ring; every rank reports a halt (origin keeps its kind).
@@ -283,7 +301,7 @@ int main(int argc, char** argv) {
     oh.n_zones = 1;
     oh.dt_initial = 0.02;
     const std::size_t wire = 10 * sizeof(double) * 2;  // cap = 2 atoms
-    mpi::MpiRingEdge edge(MPI_COMM_WORLD, rank, nranks, wire);
+    mpi::MpiRingEdge edge(MPI_COMM_WORLD, rank, nranks, wire, 3);
     cuda::RingPart part{nranks, rank, 1, &edge, &edge};
     oh.n_nodes = 1;
     auto r = cuda::run_conveyor_gpu(ha, hb, kRcut, make_morse(), oh, part);
@@ -294,6 +312,18 @@ int main(int argc, char** argv) {
     MPI_Barrier(MPI_COMM_WORLD);
     if (rank == 0)
       std::printf("[mpi ring] %-22s np=%d k=1 : ok\n", "halt propagation",
+                  nranks);
+    // z_local=2: the poisoned rank must also unwind its INTRA node threads
+    // (review M5a: this variant deadlocked before the propagation fix)
+    mpi::MpiRingEdge edge2(MPI_COMM_WORLD, rank, nranks, wire, 3);
+    cuda::RingPart part2{2 * nranks, 2 * rank, 2, &edge2, &edge2};
+    oh.n_nodes = 2;
+    core::AtomSoA<double> hb2 = ha;
+    auto r2 = cuda::run_conveyor_gpu(hb2, hb, kRcut, make_morse(), oh, part2);
+    MPI_CHECK(r2.halt != core::Halt::None, "k=2 halt did not reach this rank");
+    MPI_Barrier(MPI_COMM_WORLD);
+    if (rank == 0)
+      std::printf("[mpi ring] %-22s np=%d k=2 : ok\n", "halt propagation",
                   nranks);
   }
 
