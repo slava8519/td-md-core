@@ -79,6 +79,13 @@ target_compile_options(occupancy_probe PRIVATE -Wall -Wextra)
 # --- M2.7 GPU bring-up: device probe (Tier-2 of the occupancy model) ---
 if(TDMD_WITH_CUDA)
   add_executable(devprobe tools/devprobe.cu)
+
+  # M4: conveyor-vs-baseline bench + 1e7 memory probe (manual tool, not CI)
+  find_package(Threads REQUIRED)
+  add_executable(bench_conveyor tools/bench_conveyor.cu)
+  target_link_libraries(bench_conveyor PRIVATE tdmd_core Threads::Threads)
+  target_compile_options(bench_conveyor PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 endif()
 
 # --- M3 timing evidence: direct vs clustered (manual tool, not a CI gate) ---
