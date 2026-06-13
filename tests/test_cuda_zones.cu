@@ -13,6 +13,7 @@
 #include <climits>
 #include <cmath>
 #include <cstring>
+#include <set>
 #include <vector>
 
 #include "tdmd/core/soa.hpp"
@@ -415,7 +416,117 @@ GpuPassResult gpu_verlet_pass(const core::AtomSoA<double>& a,
   return ::testing::AssertionSuccess();
 }
 
+// GATE-01 helper: materialise the single-zone SELF Verlet list (radius
+// rcut+skin) at `a`'s positions and return it to the host as per-atom partner
+// index lists.
+std::vector<std::vector<int>> materialize_self_list(const core::AtomSoA<double>& a,
+                                                    const core::Box& box,
+                                                    double rcut, double skin) {
+  const int n = a.n;
+  const core::PairGeom geom_list(box, rcut + skin);
+  const double len[3] = {box.len(0), box.len(1), box.len(2)};
+  const bool per[3] = {box.periodic[0], box.periodic[1], box.periodic[2]};
+  const tdcu::CellGrid grid =
+      tdcu::make_zone_grid(box.lo.data(), len, per, rcut + skin, 1, 0);
+  const int nc = grid.ncells();
+  auto scan = [](const int* in, int* out, int num) {
+    void* tmp = nullptr; std::size_t b = 0;
+    cub::DeviceScan::ExclusiveSum(nullptr, b, in, out, num);
+    cudaMalloc(&tmp, b); cub::DeviceScan::ExclusiveSum(tmp, b, in, out, num);
+    cudaFree(tmp);
+  };
+  double *dx = upload(a.x), *dy = upload(a.y), *dz = upload(a.z);
+  int *cell_of, *order, *counts, *starts, *cursor;
+  cudaMalloc(&cell_of, n * 4); cudaMalloc(&order, n * 4);
+  cudaMalloc(&counts, nc * 4); cudaMalloc(&starts, nc * 4); cudaMalloc(&cursor, nc * 4);
+  cudaMemset(counts, 0, nc * 4);
+  const int g = (n + tdcu::kVerletBlock - 1) / tdcu::kVerletBlock;
+  tdcu::cell_count_kernel<<<g, tdcu::kVerletBlock>>>(dx, dy, dz, n, grid, cell_of, counts);
+  scan(counts, starts, nc);
+  cudaMemcpy(cursor, starts, nc * 4, cudaMemcpyDeviceToDevice);
+  tdcu::cell_scatter_kernel<<<g, tdcu::kVerletBlock>>>(cell_of, n, cursor, order);
+  int *vc, *voff;
+  cudaMalloc(&vc, (n + 1) * 4); cudaMalloc(&voff, (n + 1) * 4); cudaMemset(vc, 0, (n + 1) * 4);
+  tdcu::verlet_count_kernel<<<g, tdcu::kVerletBlock>>>(
+      dx, dy, dz, n, dx, dy, dz, geom_list, grid, starts, counts, order,
+      /*same=*/true, INT_MAX, nullptr, vc);
+  scan(vc, voff, n + 1);
+  int total = 0; cudaMemcpy(&total, voff + n, 4, cudaMemcpyDeviceToHost);
+  int* vidx = nullptr; if (total > 0) cudaMalloc(&vidx, total * 4);
+  tdcu::verlet_fill_kernel<<<g, tdcu::kVerletBlock>>>(
+      dx, dy, dz, n, dx, dy, dz, geom_list, grid, starts, counts, order,
+      /*same=*/true, INT_MAX, voff, vidx);
+  cudaDeviceSynchronize();
+  std::vector<int> hoff(n + 1), hidx(std::max(total, 1));
+  cudaMemcpy(hoff.data(), voff, (n + 1) * 4, cudaMemcpyDeviceToHost);
+  if (total > 0) cudaMemcpy(hidx.data(), vidx, total * 4, cudaMemcpyDeviceToHost);
+  for (auto* p : {dx, dy, dz}) cudaFree(p);
+  for (auto* p : {cell_of, order, counts, starts, cursor, vc, voff}) cudaFree(p);
+  if (vidx) cudaFree(vidx);
+  std::vector<std::vector<int>> out(n);
+  for (int i = 0; i < n; ++i)
+    for (int t = hoff[i]; t < hoff[i + 1]; ++t) out[i].push_back(hidx[t]);
+  return out;
+}
+
 }  // namespace
+
+// --- GATE-01: standalone GEOMETRIC oracle for the Verlet list (NL-INV-1),
+// independent of the cell-path reference. (1) The materialised list is EXACTLY
+// the set of within-(rcut+skin) partners (the 27-cell sweep misses none).
+// (2) After any per-atom displacement < skin/2, every within-rcut pair is
+// still in the build-time list — the superset guarantee the skin budget rests
+// on. ---
+
+TEST(CudaZones, VerletListGeometricOracle) {
+  core::Box box;
+  auto a = make_fcc(box, 3, 3, 6);  // 216 atoms, single zone, PBC
+  core::thermal::maxwell_init(a, 300.0, 19);
+  const double skin = 1.0;
+  const auto list = materialize_self_list(a, box, kRcut, skin);
+  ASSERT_EQ(int(list.size()), a.n);
+
+  // (1) exact coverage at build positions
+  core::PairGeom gl(box, kRcut + skin);
+  for (int i = 0; i < a.n; ++i) {
+    std::set<int> listed(list[i].begin(), list[i].end());
+    for (int j = 0; j < a.n; ++j) {
+      if (j == i) continue;
+      double dx = a.x[i] - a.x[j], dy = a.y[i] - a.y[j], dz = a.z[i] - a.z[j], r2;
+      const bool in_skin = gl.reduce(dx, dy, dz, r2);
+      ASSERT_EQ(in_skin, listed.count(j) > 0) << "coverage i=" << i << " j=" << j;
+    }
+  }
+
+  // (2) superset survives a bounded displacement (|d_i| < skin/2)
+  core::AtomSoA<double> moved = a;
+  unsigned s = 12345;
+  auto rnd = [&] { s = s * 1664525u + 1013904223u; return (s >> 8) * (1.0 / 16777216.0); };
+  const double dmax = (skin / 2.0) * 0.99 / std::sqrt(3.0);  // => |d| < skin/2
+  for (int i = 0; i < a.n; ++i) {
+    moved.x[i] += (2 * rnd() - 1) * dmax;
+    moved.y[i] += (2 * rnd() - 1) * dmax;
+    moved.z[i] += (2 * rnd() - 1) * dmax;
+  }
+  core::PairGeom gc(box, kRcut);
+  long checked = 0;
+  for (int i = 0; i < a.n; ++i) {
+    std::set<int> listed(list[i].begin(), list[i].end());
+    for (int j = 0; j < a.n; ++j) {
+      if (j == i) continue;
+      double dx = moved.x[i] - moved.x[j], dy = moved.y[i] - moved.y[j],
+             dz = moved.z[i] - moved.z[j], r2;
+      if (gc.reduce(dx, dy, dz, r2)) {
+        ASSERT_TRUE(listed.count(j) > 0)
+            << "missed within-rcut pair after drift: i=" << i << " j=" << j;
+        ++checked;
+      }
+    }
+  }
+  EXPECT_GT(checked, 0);  // the test actually exercised within-rcut pairs
+  std::printf("Test_CUDA_Zones[oracle]: %ld within-rcut pairs all covered "
+              "after |d|<skin/2 drift\n", checked);
+}
 
 // --- the headline: LJ raw accumulators, CPU == GPU bit-for-bit ---
 
