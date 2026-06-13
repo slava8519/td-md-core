@@ -177,6 +177,41 @@ TEST(CudaConveyor, LjFixedBitwiseVsCpuAnd1vsNStreams) {
   }
 }
 
+// --- PR-1b-i: Verlet-list reuse path == cell path bitwise at K=1 ---
+// verlet_reuse on, no criterion yet => the list is materialised EVERY pass
+// (K=1), so the trajectory must equal the cell path bit-for-bit. Exercises the
+// ring integration (per-launch materialise/force, the rcut+skin grid, the
+// closure/rotation roles, co-residency) and 1-vs-z for the Verlet path. The
+// K>1 reuse + criterion + Physical Oracle land in PR-1b-ii.
+
+TEST(CudaConveyor, VerletReuseK1BitwiseVsCells) {
+  const auto lj = make_lj(0.4, 2.55, kRcut);
+  auto check = [&](bool pbc, bool autodt) {
+    core::Box box;
+    auto init = make_fcc(box, 2, 2, 6, pbc);  // w=6.075 Å > rcut+skin=5 Å
+    core::thermal::maxwell_init(init, 300.0, 51);
+    core::ConveyorOptions oc;
+    oc.steps = 40; oc.n_zones = 4; oc.n_nodes = 1;
+    oc.dt_initial = 0.001;
+    if (autodt) {  // conservative auto-step (as LjAutoDtMatchesCpuConveyor) —
+      oc.auto_step = true; oc.ts.C1 = 0.01; oc.ts.C3 = 1.0;  // else INV-4 trips
+    }
+    const auto cells = run_gpu(init, box, oc, lj);  // cell path, z=1
+    for (int z : {1, 2, 3}) {  // verlet path == cells AND z-independent
+      auto ov = oc;
+      ov.n_nodes = z;
+      ov.verlet_reuse = true;
+      ov.verlet_skin = 1.0;
+      const auto verlet = run_gpu(init, box, ov, lj);
+      EXPECT_TRUE(bitwise_eq(cells, verlet))
+          << "pbc=" << pbc << " auto=" << autodt << " z=" << z;
+    }
+  };
+  check(false, false);
+  check(true, false);
+  check(true, true);
+}
+
 // --- auto dt: the Λ-chain fed by DEVICE reductions matches the CPU ---
 
 TEST(CudaConveyor, LjAutoDtMatchesCpuConveyor) {

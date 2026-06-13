@@ -79,13 +79,18 @@ __device__ inline void verlet_for_each_candidate(
 // The B positions here are read through the partner zone's grid `bg`; ax/bx are
 // the A/B position arrays of the co-resident slots.
 
-// Step 1: per A-atom, count within-(rcut+skin) partners.
+// Step 1: per A-atom, count within-(rcut+skin) partners. The count is CAPPED
+// at max_per_atom so the conveyor's pre-allocated CSR (capacity = cap*stride)
+// can never be overrun; a truncated atom trips `overflow` (-> Halt::Internal),
+// never a silent missing pair. Pass max_per_atom = INT_MAX (and overflow may be
+// null) for an exact, uncapped build (the isolation test sizes idx exactly).
 __global__ void verlet_count_kernel(const double* ax, const double* ay,
                                     const double* az, int na, const double* bx,
                                     const double* by, const double* bz,
                                     core::PairGeom geom_list, CellGrid bg,
                                     const int* b_starts, const int* b_counts,
                                     const int* b_order, bool same_zone,
+                                    int max_per_atom, int* overflow,
                                     int* counts) {
   const int i = blockIdx.x * kVerletBlock + threadIdx.x;
   if (i >= na) return;
@@ -95,7 +100,9 @@ __global__ void verlet_count_kernel(const double* ax, const double* ay,
       xi, yi, zi, i, same_zone, geom_list, bg, b_starts, b_counts, b_order,
       [&](int j) {
         double ddx = xi - bx[j], ddy = yi - by[j], ddz = zi - bz[j], r2;
-        if (geom_list.reduce(ddx, ddy, ddz, r2)) ++c;
+        if (!geom_list.reduce(ddx, ddy, ddz, r2)) return;
+        if (c < max_per_atom) ++c;
+        else if (overflow) atomicOr(overflow, 1);
       });
   counts[i] = c;
 }
@@ -104,22 +111,27 @@ __global__ void verlet_count_kernel(const double* ax, const double* ay,
 // One owner thread per A-atom writes its CSR run in iteration order — no
 // atomics, so the stored order is deterministic (irrelevant to the force sum,
 // but keeps build bitwise-stable for tests/debug).
+// Same iteration and same cap as verlet_count_kernel, so it writes exactly
+// counts[i] = min(actual, max_per_atom) entries (the first ones in iteration
+// order) — offsets and the filled run stay consistent under the cap.
 __global__ void verlet_fill_kernel(const double* ax, const double* ay,
                                    const double* az, int na, const double* bx,
                                    const double* by, const double* bz,
                                    core::PairGeom geom_list, CellGrid bg,
                                    const int* b_starts, const int* b_counts,
                                    const int* b_order, bool same_zone,
-                                   const int* offsets, int* idx) {
+                                   int max_per_atom, const int* offsets,
+                                   int* idx) {
   const int i = blockIdx.x * kVerletBlock + threadIdx.x;
   if (i >= na) return;
   const double xi = ax[i], yi = ay[i], zi = az[i];
-  int w = offsets[i];
+  int w = offsets[i], k = 0;
   verlet_for_each_candidate(
       xi, yi, zi, i, same_zone, geom_list, bg, b_starts, b_counts, b_order,
       [&](int j) {
         double ddx = xi - bx[j], ddy = yi - by[j], ddz = zi - bz[j], r2;
-        if (geom_list.reduce(ddx, ddy, ddz, r2)) idx[w++] = j;
+        if (!geom_list.reduce(ddx, ddy, ddz, r2)) return;
+        if (k < max_per_atom) { idx[w++] = j; ++k; }
       });
 }
 

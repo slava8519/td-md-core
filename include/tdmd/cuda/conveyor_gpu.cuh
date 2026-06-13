@@ -68,6 +68,7 @@
 #include "tdmd/cuda/zone_cells.cuh"
 #include "tdmd/cuda/zone_force.cuh"
 #include "tdmd/cuda/zone_integrate.cuh"
+#include "tdmd/cuda/zone_verlet.cuh"
 
 namespace tdmd::cuda {
 
@@ -308,7 +309,8 @@ class GpuTimeConveyor {
                   double rcut, PairF pot, const core::ConveyorOptions& o,
                   RingPart part = {})
       : atoms_(atoms), box_(box), rcut_(rcut), pot_(pot), o_(o), part_(part),
-        geom_(box, rcut) {
+        geom_(box, rcut), geom_list_(box, rcut + o.verlet_skin),
+        grid_rcut_(o.verlet_reuse ? rcut + o.verlet_skin : rcut) {
     if (o_.steps < 1) throw std::invalid_argument("gpu conveyor: steps >= 1");
     if (o_.n_nodes < 1) throw std::invalid_argument("gpu conveyor: n_nodes >= 1");
     if (!(o_.dt_initial > 0.0))
@@ -372,10 +374,30 @@ class GpuTimeConveyor {
       qv_ = std::ldexp(1.0, -24);  // velocities: ±128 Å/ps
       qf_ = std::ldexp(1.0, -20);  // forces: ±2048 eV/Å
     }
-    if (o_.cell_lists) {
+    if (o_.verlet_reuse) {
+      // The list halo must hold rcut+skin and the StaleZone slack g=(w-rcut-
+      // skin)/2 must stay >= 0, so a multi-zone slab must be wider than
+      // rcut+skin (SPEC §5.5). A persistent neighbour can drift up to skin/2
+      // into the adjacent zone and still be binned.
+      if (n_ > 1 && zd_.width <= rcut_ + o_.verlet_skin)
+        throw std::invalid_argument(
+            "verlet_reuse: zone width must exceed rcut + skin (SPEC §5.5)");
+      // CSR stride bound: ~atoms within a (rcut+skin) sphere at the mean
+      // density, x2 headroom + floor. A truncated atom trips the overflow flag
+      // (Halt::Internal), never a silent miss. NB [ENG]: this flat per-atom
+      // stride is generous for correctness at test scale; the 1e7 memory
+      // tightening (sparse cross-role CSR) is a follow-up (PR-1b-ii).
+      const double vol = box_.len(0) * box_.len(1) * box_.len(2);
+      const double dens = vol > 0 ? double(atoms_.n) / vol : 0.0;
+      const double rl = rcut_ + o_.verlet_skin;
+      max_neigh_ = std::max(
+          64, int(2.0 * (4.0 / 3.0) * 3.14159265358979323846 * rl * rl * rl *
+                   dens) + 16);
+    }
+    if (o_.cell_lists || o_.verlet_reuse) {
       const double len[3] = {box_.len(0), box_.len(1), box_.len(2)};
       const bool per[3] = {box_.periodic[0], box_.periodic[1], box_.periodic[2]};
-      ncells_ = make_zone_grid(box_.lo.data(), len, per, rcut_, n_, 0).ncells();
+      ncells_ = make_zone_grid(box_.lo.data(), len, per, grid_rcut_, n_, 0).ncells();
     }
     alloc_nodes();
     // Pool partition: ids [0, S-W) circulate as producer credits / the
@@ -454,8 +476,12 @@ class GpuTimeConveyor {
     int* d_flags{};
     EndScalars* h_end{};  // pinned, n_zones entries — per-position END
                           // snapshots for the ONCE-PER-PASS batched sync
-    void* d_cubtmp = nullptr;  // cell-list scan temp
+    void* d_cubtmp = nullptr;  // cell-list / verlet scan temp
     std::size_t cubtmp_bytes = 0;
+    // PR-1 Verlet reuse scratch (ephemeral per launch at K=1, one stream so
+    // reuse across launches is stream-ordered-safe): CSR build for the current
+    // (A,B). v_idx capacity = cap*max_neigh_.
+    int *v_counts = nullptr, *v_offsets = nullptr, *v_idx = nullptr;
   };
 
   // Host-side per-pass slot bookkeeping (the CPU conveyor Slot minus payload).
@@ -484,17 +510,28 @@ class GpuTimeConveyor {
           s.pk_mass = reinterpret_cast<double*>(pkb);
           s.pk = reinterpret_cast<int*>(pkb + sizeof(double) * cap_);
         }
-        if (o_.cell_lists)
+        if (o_.cell_lists || o_.verlet_reuse)
           TDMD_CU(cudaMalloc(&s.cells,
                              sizeof(int) * (2 * std::size_t(cap_) +
                                             3 * std::size_t(ncells_))));
       }
-      if (o_.cell_lists) {
-        nb.cubtmp_bytes = 0;  // CUB temp for the per-zone exclusive scan
-        TDMD_CU(cub::DeviceScan::ExclusiveSum(nullptr, nb.cubtmp_bytes,
-                                              (int*)nullptr, (int*)nullptr,
-                                              ncells_));
+      if (o_.cell_lists || o_.verlet_reuse) {
+        // CUB temp for the per-zone exclusive scan: cells scan over ncells_,
+        // the verlet CSR scan over cap_+1 — size for the larger.
+        nb.cubtmp_bytes = 0;
+        std::size_t b1 = 0, b2 = 0;
+        TDMD_CU(cub::DeviceScan::ExclusiveSum(nullptr, b1, (int*)nullptr,
+                                              (int*)nullptr, ncells_));
+        TDMD_CU(cub::DeviceScan::ExclusiveSum(nullptr, b2, (int*)nullptr,
+                                              (int*)nullptr, cap_ + 1));
+        nb.cubtmp_bytes = std::max(b1, b2);
         TDMD_CU(cudaMalloc(&nb.d_cubtmp, nb.cubtmp_bytes));
+      }
+      if (o_.verlet_reuse) {
+        TDMD_CU(cudaMalloc(&nb.v_counts, sizeof(int) * (cap_ + 1)));
+        TDMD_CU(cudaMalloc(&nb.v_offsets, sizeof(int) * (cap_ + 1)));
+        TDMD_CU(cudaMalloc(&nb.v_idx,
+                           sizeof(int) * std::size_t(cap_) * max_neigh_));
       }
       TDMD_CU(cudaMalloc(&nb.d_v2, 8));
       TDMD_CU(cudaMalloc(&nb.d_a2, 8));
@@ -516,6 +553,9 @@ class GpuTimeConveyor {
         cudaFree(s.cells);
       }
       cudaFree(nb.d_cubtmp);
+      cudaFree(nb.v_counts);
+      cudaFree(nb.v_offsets);
+      cudaFree(nb.v_idx);
       for (auto* p : {nb.d_v2, nb.d_a2, nb.d_kc, nb.d_mr2}) cudaFree(p);
       cudaFree(nb.d_ke);
       cudaFree(nb.d_pe);
@@ -706,7 +746,8 @@ class GpuTimeConveyor {
       }
       TDMD_CU(cudaMemsetAsync(d.raw, 0, 3 * sizeof(long long) * cap_,
                               nb.stream));
-      if (o_.cell_lists) {  // rebuild this zone's cell list at x_h
+      if (o_.cell_lists || o_.verlet_reuse) {  // rebuild cell list at x_h
+                                               // (verlet materialisation needs it)
         TDMD_CU(cudaMemsetAsync(d.counts(ncells_), 0, sizeof(int) * ncells_,
                                 nb.stream));
         if (s.n_atoms > 0) {
@@ -744,7 +785,33 @@ class GpuTimeConveyor {
                          da.rfx(),  da.rfy(),  da.rfz(),  nb.d_pe,
                          nb.d_mr2,  nb.d_flags, same,     energy};
       const int grid = (A.n_atoms + kZoneBlock - 1) / kZoneBlock;
-      if (o_.cell_lists) {  // culled path — bitwise ≡ tiles (B1)
+      if (o_.verlet_reuse) {
+        // PR-1b-i: materialise the (A,B) list from B's cells at rcut+skin, then
+        // force from it. At K=1 the list is ephemeral — built and consumed on
+        // this stream within the pass — so it lives in per-node scratch and
+        // needs no persistent (zone,role) keying (that is PR-1b-ii, K>1). The
+        // verlet force kernel re-tests at geom_ (rcut): bitwise ≡ the cell path.
+        const CellGrid bgrid = zone_grid(B.fsm.id);
+        const int gc = (A.n_atoms + kVerletBlock - 1) / kVerletBlock;
+        TDMD_CU(cudaMemsetAsync(nb.v_counts, 0, sizeof(int) * (A.n_atoms + 1),
+                                nb.stream));
+        verlet_count_kernel<<<gc, kVerletBlock, 0, nb.stream>>>(
+            da.arr(0), da.arr(1), da.arr(2), A.n_atoms, db.arr(0), db.arr(1),
+            db.arr(2), geom_list_, bgrid, db.starts(ncells_),
+            db.counts(ncells_), db.order(), same, max_neigh_, nb.d_flags,
+            nb.v_counts);
+        std::size_t tb = nb.cubtmp_bytes;
+        TDMD_CU(cub::DeviceScan::ExclusiveSum(nb.d_cubtmp, tb, nb.v_counts,
+                                              nb.v_offsets, A.n_atoms + 1,
+                                              nb.stream));
+        verlet_fill_kernel<<<gc, kVerletBlock, 0, nb.stream>>>(
+            da.arr(0), da.arr(1), da.arr(2), A.n_atoms, db.arr(0), db.arr(1),
+            db.arr(2), geom_list_, bgrid, db.starts(ncells_),
+            db.counts(ncells_), db.order(), same, max_neigh_, nb.v_offsets,
+            nb.v_idx);
+        zone_pair_verlet_kernel<PairF><<<gc, kVerletBlock, 0, nb.stream>>>(
+            args, geom_, pot_, nb.v_offsets, nb.v_idx);
+      } else if (o_.cell_lists) {  // culled path — bitwise ≡ tiles (B1)
         const CellGrid bgrid = zone_grid(B.fsm.id);
         zone_pair_cells_kernel<PairF><<<grid, kZoneBlock, 0, nb.stream>>>(
             args, geom_, pot_, bgrid, db.starts(ncells_), db.counts(ncells_),
@@ -1116,6 +1183,11 @@ class GpuTimeConveyor {
   const core::ConveyorOptions o_;
   RingPart part_;
   const core::PairGeom geom_;
+  // PR-1 Verlet reuse: list-build geometry at rcut+skin (the force kernel still
+  // re-tests at rcut via geom_). grid_rcut_ sizes the cell grid halo so the
+  // 27-cell sweep covers rcut+skin; equals rcut_ when the feature is off.
+  const core::PairGeom geom_list_;
+  double grid_rcut_;
 
   std::size_t packed_bytes() const {
     return sizeof(double) * cap_ + 9 * sizeof(int) * std::size_t(cap_);
@@ -1123,7 +1195,7 @@ class GpuTimeConveyor {
   CellGrid zone_grid(int zone_id) const {
     const double len[3] = {box_.len(0), box_.len(1), box_.len(2)};
     const bool per[3] = {box_.periodic[0], box_.periodic[1], box_.periodic[2]};
-    return make_zone_grid(box_.lo.data(), len, per, rcut_, n_, zone_id);
+    return make_zone_grid(box_.lo.data(), len, per, grid_rcut_, n_, zone_id);
   }
   std::size_t wire_bytes() const {  // the boundary payload image
     return o_.mixed_transport ? packed_bytes()
@@ -1133,6 +1205,7 @@ class GpuTimeConveyor {
   core::ZoneDecomposition zd_;
   int n_ = 1, z_ = 1, Z_ = 1, S_ = 3, cap_ = 0;
   int ncells_ = 1;
+  int max_neigh_ = 1;  // PR-1: per-atom Verlet stride (CSR capacity = cap*this)
   int node0_ = 0;
   std::deque<int> bfree_;          // local slot pool of a boundary-fed node 0
   std::deque<int> p1free_;         // pass-1 upload reserve / self-loop pool

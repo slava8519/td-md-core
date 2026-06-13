@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 #include <cuda_runtime.h>
 
+#include <climits>
 #include <cmath>
 #include <cstring>
 #include <vector>
@@ -340,7 +341,7 @@ GpuPassResult gpu_verlet_pass(const core::AtomSoA<double>& a,
     tdcu::verlet_count_kernel<<<g, tdcu::kVerletBlock>>>(
         zb[za].x, zb[za].y, zb[za].z, na, zb[zo].x, zb[zo].y, zb[zo].z,
         geom_list, zb[zo].grid, zb[zo].starts, zb[zo].counts, zb[zo].order,
-        same, dcounts);
+        same, INT_MAX, nullptr, dcounts);
     excl_scan(dcounts, doffsets, na + 1);
     int total = 0;
     cudaMemcpy(&total, doffsets + na, sizeof(int), cudaMemcpyDeviceToHost);
@@ -349,7 +350,7 @@ GpuPassResult gpu_verlet_pass(const core::AtomSoA<double>& a,
     tdcu::verlet_fill_kernel<<<g, tdcu::kVerletBlock>>>(
         zb[za].x, zb[za].y, zb[za].z, na, zb[zo].x, zb[zo].y, zb[zo].z,
         geom_list, zb[zo].grid, zb[zo].starts, zb[zo].counts, zb[zo].order,
-        same, doffsets, didx);
+        same, INT_MAX, doffsets, didx);
     tdcu::ZoneForceArgs args{zb[za].x,  zb[za].y,  zb[za].z,  na,
                              zb[zo].x,  zb[zo].y,  zb[zo].z,  zb[zo].m,
                              zb[za].fx, zb[za].fy, zb[za].fz, dpe, dmr, dof,
