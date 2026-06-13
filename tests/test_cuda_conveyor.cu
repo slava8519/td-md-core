@@ -291,6 +291,48 @@ TEST(CudaConveyor, VerletHybridBitwiseAndLargerK) {
   EXPECT_EQ(rc_hyb.verlet_rebuilds, rc_hyb2.verlet_rebuilds);
 }
 
+// --- PR-4 L2a: homogeneous drift correction (Theorem 1) ---
+// Under a bulk drift (rigid translation: pair distances unchanged), the
+// lab-frame displacement is large but the DRIFT-CORRECTED residual is just the
+// thermal part. Subtracting the mean drift D0 (same for every atom => cancels
+// in pair differences => safe for ANY D0) keeps the criterion from rebuilding
+// for motion that does not change any pair. Bitwise == cells in both cases.
+
+TEST(CudaConveyor, VerletDriftReducesRebuilds) {
+  const auto lj = make_lj(0.4, 2.55, kRcut);
+  core::Box box;
+  auto init = make_fcc(box, 2, 2, 8, /*pz=*/false);  // n=2 => lag=1
+  core::thermal::maxwell_init(init, 300.0, 51);
+  for (int i = 0; i < init.n; ++i) {  // bulk drift in the periodic x/y plane
+    init.vx[i] += 50.0;
+    init.vy[i] += 30.0;
+  }
+  core::ConveyorOptions oc;
+  oc.steps = 60; oc.n_zones = 2; oc.n_nodes = 1; oc.dt_initial = 0.001;
+  const auto cells = run_gpu(init, box, oc, lj);
+
+  auto run_v = [&](bool drift, core::ConveyorResult* r) {
+    core::ConveyorOptions o = oc;
+    o.verlet_reuse = true; o.verlet_default = true; o.verlet_skin = 0.5;
+    o.verlet_hybrid = true; o.verlet_drift = drift;
+    return run_gpu(init, box, o, lj, r);
+  };
+  core::ConveyorResult rh, rd;
+  const auto hyb = run_v(false, &rh);
+  const auto dft = run_v(true, &rd);
+  EXPECT_TRUE(bitwise_eq(cells, hyb)) << "hybrid";
+  EXPECT_TRUE(bitwise_eq(cells, dft)) << "hybrid+drift";
+  // L2a never rebuilds MORE (safe; correctness is the point). The reduction is
+  // marginal here because the conservative 2*R_buf branch is itself
+  // drift-inflated (R_buf uses lab-frame v_max) and dominates the min() — the
+  // FULL drift benefit needs the drift-corrected tail (L2b: relative velocity
+  // in INV-4), deferred per the SPEC. Documented, not silently oversold.
+  EXPECT_LE(rd.verlet_rebuilds, rh.verlet_rebuilds);
+  std::printf("bulk drift (60 steps, n=2): hybrid %ld rebuilds, hybrid+drift "
+              "%ld (L2a marginal w/o L2b)\n", rh.verlet_rebuilds,
+              rd.verlet_rebuilds);
+}
+
 // --- auto dt: the Λ-chain fed by DEVICE reductions matches the CPU ---
 
 TEST(CudaConveyor, LjAutoDtMatchesCpuConveyor) {

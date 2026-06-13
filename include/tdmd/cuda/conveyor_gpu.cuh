@@ -315,6 +315,10 @@ class GpuTimeConveyor {
     if (o_.n_nodes < 1) throw std::invalid_argument("gpu conveyor: n_nodes >= 1");
     if (!(o_.dt_initial > 0.0))
       throw std::invalid_argument("gpu conveyor: dt_initial must be > 0");
+    if (o_.verlet_hybrid && !o_.verlet_reuse)
+      throw std::invalid_argument("gpu conveyor: verlet_hybrid needs verlet_reuse");
+    if (o_.verlet_drift && !o_.verlet_hybrid)
+      throw std::invalid_argument("gpu conveyor: verlet_drift needs verlet_hybrid");
     if (part_.z_global > 0 &&
         (part_.z_local < 1 || part_.node0 < 0 ||
          part_.node0 + part_.z_local > part_.z_global || !part_.in || !part_.out))
@@ -959,13 +963,25 @@ class GpuTimeConveyor {
               pbc_z_, s.fsm.id == 0, s.fsm.id == n_ - 1,
               nb.d_flags);  // bit1
         }
-        if (o_.verlet_hybrid) {  // PR-3: max ||x_h - x_ref|| into the pass d_d2
+        if (o_.verlet_hybrid) {  // PR-3: max ||x_h - x_ref - D0|| into pass d_d2
           double* xr = vl_xref_[std::size_t(s.fsm.id)];
           const int gd = (s.n_atoms + kVerletBlock - 1) / kVerletBlock;
+          // PR-4 (Theorem 1): subtract the lagged mean drift D0 (same value for
+          // EVERY atom of the pass — the head's lagged aggregate — so it cancels
+          // in pair differences; ANY D0 is safe). 0 when verlet_drift is off.
+          double d0x = 0, d0y = 0, d0z = 0;
+          if (o_.verlet_drift) {
+            const Lambda& L0 = slot[0].lam_in;
+            d0x = L0.drift[0]; d0y = L0.drift[1]; d0z = L0.drift[2];
+          }
           zone_dmax_kernel<<<gd, kVerletBlock, 0, nb.stream>>>(
               d.arr(0), d.arr(1), d.arr(2), xr, xr + cap_, xr + 2 * cap_,
-              s.n_atoms, 0.0, 0.0, 0.0, nb.d_d2);  // D0=0 (PR-4 routes drift)
+              s.n_atoms, d0x, d0y, d0z, nb.d_d2);
           TDMD_CU(cudaGetLastError());
+          if (o_.verlet_drift)  // this pass's drift D0 = (Σ displacement)/N
+            zone_drift_sum_kernel<<<gd, kVerletBlock, 0, nb.stream>>>(
+                d.arr(0), d.arr(1), d.arr(2), xr, xr + cap_, xr + 2 * cap_,
+                s.n_atoms, nb.d_sx, nb.d_sy, nb.d_sz, nb.d_flags);
         }
       }
       EndScalars* hs = &nb.h_end[std::size_t(j)];
