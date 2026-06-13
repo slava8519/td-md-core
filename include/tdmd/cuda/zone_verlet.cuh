@@ -191,4 +191,68 @@ __global__ void zone_pair_verlet_kernel(ZoneForceArgs a, core::PairGeom geom,
               (unsigned long long)sred[0]);
 }
 
+// --- PR-3/PR-4: measured-displacement criterion support ---------------------
+// x_ref = positions at the last rebuild epoch (per-zone persistent). Snapshot
+// on a rebuild pass; the max ||x - x_ref|| (optionally minus the mean drift D0,
+// PR-4 Theorem 1) feeds the hybrid criterion. Displacement uses UNWRAPPED
+// coords (drift never folds x; within a rebuild window it stays << box).
+
+static __global__ void xref_copy_kernel(const double* x, const double* y,
+                                        const double* z, double* xr, double* yr,
+                                        double* zr, int n) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  xr[i] = x[i]; yr[i] = y[i]; zr[i] = z[i];
+}
+
+// max squared (drift-corrected) displacement -> atomicMax on ordered bits
+// (d2 >= 0 so bit patterns compare like values). d0 = mean drift (0 for PR-3).
+static __global__ void zone_dmax_kernel(const double* x, const double* y,
+                                        const double* z, const double* xr,
+                                        const double* yr, const double* zr,
+                                        int n, double d0x, double d0y,
+                                        double d0z, unsigned long long* d2max) {
+  const int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  const double dx = (x[i] - xr[i]) - d0x;
+  const double dy = (y[i] - yr[i]) - d0y;
+  const double dz = (z[i] - zr[i]) - d0z;
+  const double d2 = dx * dx + dy * dy + dz * dz;
+  atomicMax(d2max, (unsigned long long)pos_double_bits(d2));
+}
+
+// PR-4 (Theorem 1): per-zone Q24.40 fixed-point sum of the displacement vector,
+// so the global mean drift D0 = sum/N is order-independent => z-independent
+// (a plain FP sum is not). One block; ll partials -> atomicAdd. Reuses the B1
+// Q24.40 scale (the displacement is small; exact quantization).
+static __global__ void zone_drift_sum_kernel(const double* x, const double* y,
+                                             const double* z, const double* xr,
+                                             const double* yr, const double* zr,
+                                             int n, long long* sx, long long* sy,
+                                             long long* sz, int* overflow) {
+  __shared__ long long rx[kVerletBlock], ry[kVerletBlock], rz[kVerletBlock];
+  const int i = blockIdx.x * kVerletBlock + threadIdx.x;
+  long long qx = 0, qy = 0, qz = 0;
+  if (i < n) {
+    qx = quantize(x[i] - xr[i], core::fixed::ForceAccum::kScale, overflow);
+    qy = quantize(y[i] - yr[i], core::fixed::ForceAccum::kScale, overflow);
+    qz = quantize(z[i] - zr[i], core::fixed::ForceAccum::kScale, overflow);
+  }
+  rx[threadIdx.x] = qx; ry[threadIdx.x] = qy; rz[threadIdx.x] = qz;
+  __syncthreads();
+  for (int s = kVerletBlock / 2; s > 0; s >>= 1) {
+    if (threadIdx.x < s) {
+      rx[threadIdx.x] += rx[threadIdx.x + s];
+      ry[threadIdx.x] += ry[threadIdx.x + s];
+      rz[threadIdx.x] += rz[threadIdx.x + s];
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) {
+    atomicAdd(reinterpret_cast<unsigned long long*>(sx), (unsigned long long)rx[0]);
+    atomicAdd(reinterpret_cast<unsigned long long*>(sy), (unsigned long long)ry[0]);
+    atomicAdd(reinterpret_cast<unsigned long long*>(sz), (unsigned long long)rz[0]);
+  }
+}
+
 }  // namespace tdmd::cuda

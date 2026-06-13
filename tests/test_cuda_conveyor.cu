@@ -248,6 +248,49 @@ TEST(CudaConveyor, VerletFallbackBitwiseVsCells) {
   }
 }
 
+// --- PR-3: hybrid criterion (2*d_max + 2*L*R_buf) — safe superset + larger K ---
+// The measured-displacement bound min()'d with the conservative 2*R_buf is the
+// tightest SAFE bound, so the trajectory stays bitwise == cells while rebuilds
+// drop. Shown at n=2 (lag=1) where the hybrid is not swamped by the L-step tail.
+
+TEST(CudaConveyor, VerletHybridBitwiseAndLargerK) {
+  const auto lj = make_lj(0.4, 2.55, kRcut);
+  core::Box box;
+  auto init = make_fcc(box, 2, 2, 8, /*pz=*/false);  // n=2 free-z => lag=1
+  core::thermal::maxwell_init(init, 300.0, 51);
+  const double skin = 0.5;
+
+  core::ConveyorOptions oc;
+  oc.steps = 60; oc.n_zones = 2; oc.n_nodes = 1; oc.dt_initial = 0.001;
+  const auto cells = run_gpu(init, box, oc, lj);  // cell-path reference
+
+  auto run_v = [&](bool hybrid, int z, core::ConveyorResult* r) {
+    core::ConveyorOptions o = oc;
+    o.n_nodes = z;
+    o.verlet_reuse = true;
+    o.verlet_default = true;
+    o.verlet_skin = skin;
+    o.verlet_hybrid = hybrid;
+    return run_gpu(init, box, o, lj, r);
+  };
+
+  core::ConveyorResult rc_cons, rc_hyb, rc_hyb2;
+  const auto cons = run_v(false, 1, &rc_cons);
+  const auto hyb = run_v(true, 1, &rc_hyb);
+  // (1) both are safe supersets => bitwise == the cell path
+  EXPECT_TRUE(bitwise_eq(cells, cons)) << "conservative";
+  EXPECT_TRUE(bitwise_eq(cells, hyb)) << "hybrid";
+  // (2) the tighter hybrid bound rebuilds no more often than conservative
+  EXPECT_LE(rc_hyb.verlet_rebuilds, rc_cons.verlet_rebuilds);
+  std::printf("Verlet hybrid (skin=%.2f, 60 steps, n=2): conservative %ld "
+              "rebuilds, hybrid %ld\n", skin, rc_cons.verlet_rebuilds,
+              rc_hyb.verlet_rebuilds);
+  // (3) hybrid is z-independent
+  const auto hyb2 = run_v(true, 2, &rc_hyb2);
+  EXPECT_TRUE(bitwise_eq(hyb, hyb2)) << "hybrid 1-vs-z";
+  EXPECT_EQ(rc_hyb.verlet_rebuilds, rc_hyb2.verlet_rebuilds);
+}
+
 // --- auto dt: the Λ-chain fed by DEVICE reductions matches the CPU ---
 
 TEST(CudaConveyor, LjAutoDtMatchesCpuConveyor) {

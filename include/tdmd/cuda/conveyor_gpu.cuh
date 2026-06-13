@@ -491,6 +491,10 @@ class GpuTimeConveyor {
     // reuse across launches is stream-ordered-safe): CSR build for the current
     // (A,B). v_idx capacity = cap*max_neigh_.
     int *v_counts = nullptr, *v_offsets = nullptr, *v_idx = nullptr;
+    // PR-3/PR-4 hybrid criterion: per-pass max sq displacement + (PR-4) Q24.40
+    // drift sums (reset per pass, accumulated across zones, read after sync).
+    unsigned long long* d_d2 = nullptr;
+    long long *d_sx = nullptr, *d_sy = nullptr, *d_sz = nullptr;
   };
 
   // Host-side per-pass slot bookkeeping (the CPU conveyor Slot minus payload).
@@ -550,6 +554,12 @@ class GpuTimeConveyor {
       TDMD_CU(cudaMalloc(&nb.d_pe, 8));
       TDMD_CU(cudaMalloc(&nb.d_flags, 4));
       TDMD_CU(cudaHostAlloc(&nb.h_end, sizeof(EndScalars) * std::size_t(n_), 0));
+      if (o_.verlet_hybrid) {  // PR-3/PR-4 per-pass displacement aggregates
+        TDMD_CU(cudaMalloc(&nb.d_d2, 8));
+        TDMD_CU(cudaMalloc(&nb.d_sx, 8));
+        TDMD_CU(cudaMalloc(&nb.d_sy, 8));
+        TDMD_CU(cudaMalloc(&nb.d_sz, 8));
+      }
     }
     if (o_.verlet_reuse) {  // shared per-(zone,role) persistent lists
       vl_off_.assign(std::size_t(n_) * kRoles, nullptr);
@@ -561,14 +571,21 @@ class GpuTimeConveyor {
         TDMD_CU(cudaMalloc(&vl_idx_[s],
                            sizeof(int) * std::size_t(cap_) * stride));
       }
+      if (o_.verlet_hybrid) {  // PR-3 rebuild-epoch positions x_ref per zone
+        vl_xref_.assign(std::size_t(n_), nullptr);
+        for (auto& p : vl_xref_)
+          TDMD_CU(cudaMalloc(&p, sizeof(double) * 3 * std::size_t(cap_)));
+      }
     }
   }
 
   void free_nodes() {
     for (auto* p : vl_off_) cudaFree(p);
     for (auto* p : vl_idx_) cudaFree(p);
+    for (auto* p : vl_xref_) cudaFree(p);
     vl_off_.clear();
     vl_idx_.clear();
+    vl_xref_.clear();
     for (auto& nb : node_) {
       for (auto& s : nb.slot) {
         cudaFree(s.base);
@@ -580,6 +597,10 @@ class GpuTimeConveyor {
       cudaFree(nb.v_counts);
       cudaFree(nb.v_offsets);
       cudaFree(nb.v_idx);
+      cudaFree(nb.d_d2);
+      cudaFree(nb.d_sx);
+      cudaFree(nb.d_sy);
+      cudaFree(nb.d_sz);
       for (auto* p : {nb.d_v2, nb.d_a2, nb.d_kc, nb.d_mr2}) cudaFree(p);
       cudaFree(nb.d_ke);
       cudaFree(nb.d_pe);
@@ -663,6 +684,12 @@ class GpuTimeConveyor {
                             nb.stream));
     TDMD_CU(cudaMemsetAsync(nb.d_pe, 0, 8, nb.stream));
     TDMD_CU(cudaMemsetAsync(nb.d_flags, 0, 4, nb.stream));
+    if (o_.verlet_hybrid) {  // PR-3/PR-4 per-pass displacement aggregates -> 0
+      TDMD_CU(cudaMemsetAsync(nb.d_d2, 0, 8, nb.stream));
+      TDMD_CU(cudaMemsetAsync(nb.d_sx, 0, 8, nb.stream));
+      TDMD_CU(cudaMemsetAsync(nb.d_sy, 0, 8, nb.stream));
+      TDMD_CU(cudaMemsetAsync(nb.d_sz, 0, 8, nb.stream));
+    }
 
     auto fail = [&](core::Halt kind, const std::string& msg) {
       set_halt(kind, msg);
@@ -709,7 +736,10 @@ class GpuTimeConveyor {
           s.dev = bfree_.front();
           bfree_.pop_front();
           s.n_atoms = gh.n_atoms;
-          s.lam_in = {gh.hdr.v_full, gh.hdr.a_full, gh.hdr.k2cap_full};
+          s.lam_in = {gh.hdr.v_full, gh.hdr.a_full, gh.hdr.k2cap_full,
+                      gh.hdr.d_full,
+                      {gh.hdr.drift_full[0], gh.hdr.drift_full[1],
+                       gh.hdr.drift_full[2]}};
           if (arrived == 0) {
             dt = gh.hdr.dt_next;
             skin_in = gh.hdr.skin_consumed;            // carried budget
@@ -742,7 +772,10 @@ class GpuTimeConveyor {
             throw std::logic_error("gpu conveyor: ring arrival out of order");
           s.dev = gh.dst_slot;
           s.n_atoms = gh.n_atoms;
-          s.lam_in = {gh.hdr.v_full, gh.hdr.a_full, gh.hdr.k2cap_full};
+          s.lam_in = {gh.hdr.v_full, gh.hdr.a_full, gh.hdr.k2cap_full,
+                      gh.hdr.d_full,
+                      {gh.hdr.drift_full[0], gh.hdr.drift_full[1],
+                       gh.hdr.drift_full[2]}};
           if (arrived == 0) {
             dt = gh.hdr.dt_next;
             skin_in = gh.hdr.skin_consumed;            // carried budget
@@ -789,6 +822,15 @@ class GpuTimeConveyor {
             d.arr(0), d.arr(1), d.arr(2), d.arr(3), d.arr(4), d.arr(5),
             d.arr(6), d.arr(7), d.arr(8), d.arr(9), s.n_atoms, dt);
         TDMD_CU(cudaGetLastError());
+        // PR-3: on a rebuild pass snapshot the new epoch x_ref = x_h (post-
+        // drift), so this pass measures d=0 and reuse passes measure growth.
+        if (o_.verlet_hybrid && rebuild_now_pass) {
+          double* xr = vl_xref_[std::size_t(s.fsm.id)];
+          xref_copy_kernel<<<grid, kIntBlock, 0, nb.stream>>>(
+              d.arr(0), d.arr(1), d.arr(2), xr, xr + cap_, xr + 2 * cap_,
+              s.n_atoms);
+          TDMD_CU(cudaGetLastError());
+        }
       }
       TDMD_CU(cudaMemsetAsync(d.raw, 0, 3 * sizeof(long long) * cap_,
                               nb.stream));
@@ -917,6 +959,14 @@ class GpuTimeConveyor {
               pbc_z_, s.fsm.id == 0, s.fsm.id == n_ - 1,
               nb.d_flags);  // bit1
         }
+        if (o_.verlet_hybrid) {  // PR-3: max ||x_h - x_ref|| into the pass d_d2
+          double* xr = vl_xref_[std::size_t(s.fsm.id)];
+          const int gd = (s.n_atoms + kVerletBlock - 1) / kVerletBlock;
+          zone_dmax_kernel<<<gd, kVerletBlock, 0, nb.stream>>>(
+              d.arr(0), d.arr(1), d.arr(2), xr, xr + cap_, xr + 2 * cap_,
+              s.n_atoms, 0.0, 0.0, 0.0, nb.d_d2);  // D0=0 (PR-4 routes drift)
+          TDMD_CU(cudaGetLastError());
+        }
       }
       EndScalars* hs = &nb.h_end[std::size_t(j)];
       TDMD_CU(cudaMemcpyAsync(&hs->v2, nb.d_v2, 8, cudaMemcpyDeviceToHost, nb.stream));
@@ -981,6 +1031,24 @@ class GpuTimeConveyor {
           return fail(core::Halt::Causality, buf);
         }
       }
+      if (o_.verlet_hybrid) {  // pass-global max displacement (PR-3) + drift (PR-4)
+        unsigned long long d2bits = 0;
+        TDMD_CU(cudaMemcpy(&d2bits, nb.d_d2, 8, cudaMemcpyDeviceToHost));
+        double d2;
+        std::memcpy(&d2, &d2bits, 8);
+        agg.d = std::sqrt(d2);
+        if (o_.verlet_drift) {  // PR-4: D0 = (Σ displacement)/N, z-independent
+          long long sx = 0, sy = 0, sz = 0;
+          TDMD_CU(cudaMemcpy(&sx, nb.d_sx, 8, cudaMemcpyDeviceToHost));
+          TDMD_CU(cudaMemcpy(&sy, nb.d_sy, 8, cudaMemcpyDeviceToHost));
+          TDMD_CU(cudaMemcpy(&sz, nb.d_sz, 8, cudaMemcpyDeviceToHost));
+          const double invN = 1.0 / double(atoms_.n);
+          const double sc = core::fixed::ForceAccum::kScale;
+          agg.drift[0] = (double(sx) / sc) * invN;
+          agg.drift[1] = (double(sy) / sc) * invN;
+          agg.drift[2] = (double(sz) / sc) * invN;
+        }
+      }
       return true;
     };
 
@@ -1036,13 +1104,18 @@ class GpuTimeConveyor {
             dt_next = o_.auto_step
                           ? core::buffer::auto_dt(lamb.v, dt, o_.ts, lamb.k2cap)
                           : o_.dt_initial;
-            decide_pass(skin_in, R_buf, verlet_active_pass, skin_out,
-                        rebuild_next, va_next);
+            decide_pass(skin_in, R_buf, verlet_active_pass, lamb.d,
+                        (n_ == 1) ? 1.0 : double(n_ - 1), skin_out, rebuild_next,
+                        va_next);
           }
           gh.hdr.dt_next = (sent == 0) ? dt_next : 0.0;
           gh.hdr.v_full = lamb.v;
           gh.hdr.a_full = lamb.a;
           gh.hdr.k2cap_full = lamb.k2cap;
+          gh.hdr.d_full = lamb.d;            // PR-3 lagged max displacement
+          gh.hdr.drift_full[0] = lamb.drift[0];
+          gh.hdr.drift_full[1] = lamb.drift[1];
+          gh.hdr.drift_full[2] = lamb.drift[2];
           gh.hdr.skin_consumed = skin_out;  // broadcast to EVERY header
           gh.hdr.rebuild_now = rebuild_next ? 1 : 0;
           gh.hdr.verlet_active = va_next;
@@ -1114,13 +1187,18 @@ class GpuTimeConveyor {
           dt_next = o_.auto_step
                         ? core::buffer::auto_dt(lam.v, dt, o_.ts, lam.k2cap)
                         : o_.dt_initial;
-          decide_pass(skin_in, R_buf, verlet_active_pass, skin_out,
-                      rebuild_next, va_next);
+          decide_pass(skin_in, R_buf, verlet_active_pass, lam.d,
+                      (n_ == 1) ? 1.0 : double(n_ - 1), skin_out, rebuild_next,
+                      va_next);
         }
         gh.hdr.dt_next = (sent == 0) ? dt_next : 0.0;
         gh.hdr.v_full = lam.v;
         gh.hdr.a_full = lam.a;
         gh.hdr.k2cap_full = lam.k2cap;
+        gh.hdr.d_full = lam.d;            // PR-3 lagged max displacement
+        gh.hdr.drift_full[0] = lam.drift[0];
+        gh.hdr.drift_full[1] = lam.drift[1];
+        gh.hdr.drift_full[2] = lam.drift[2];
         gh.hdr.skin_consumed = skin_out;  // broadcast to EVERY header
         gh.hdr.rebuild_now = rebuild_next ? 1 : 0;
         gh.hdr.verlet_active = va_next;
@@ -1279,8 +1357,9 @@ class GpuTimeConveyor {
   //     hysteresis (K_on > K_off) flips verlet_active without chatter; below
   //     break-even we fall back to the cell-raster path (worst case == current
   //     engine, not "+tax"). A 0->1 turn-on forces a rebuild (no list yet).
-  void decide_pass(double skin_in, double R_buf, uint8_t va_prev,
-                   double& skin_out, bool& rebuild, uint8_t& va_next) const {
+  void decide_pass(double skin_in, double R_buf, uint8_t va_prev, double d_lagged,
+                   double lag, double& skin_out, bool& rebuild,
+                   uint8_t& va_next) const {
     const double charge = 2.0 * R_buf;
     const double K_pred = charge > 1e-300
                               ? o_.verlet_skin / charge
@@ -1293,8 +1372,19 @@ class GpuTimeConveyor {
     } else if (va_prev == 0) {      // turned ON: no list yet -> force rebuild
       rebuild = true; skin_out = 0.0;
     } else {
-      skin_out = skin_in + charge;
-      rebuild = (skin_out >= o_.verlet_skin);
+      skin_out = skin_in + charge;       // conservative accumulator (carried)
+      double skin_used = skin_out;
+      if (o_.verlet_hybrid) {
+        // PR-3 hybrid: 2*d_lagged + 2*L*R_buf is also a valid upper bound on
+        // the current pair-approach (d_lagged = max displacement as of t-L,
+        // + L steps of R_buf). min() of two upper bounds is the tightest SAFE
+        // bound => rebuilds no sooner than conservative (larger K). The
+        // post-rebuild stale d_lagged is harmless: skin_out is then tiny, so
+        // min() picks it — no rebuild storm (no epoch tracking needed).
+        const double hyb = 2.0 * d_lagged + 2.0 * lag * R_buf;
+        skin_used = hyb < skin_used ? hyb : skin_used;
+      }
+      rebuild = (skin_used >= o_.verlet_skin);
       if (rebuild) skin_out = 0.0;
     }
   }
@@ -1323,6 +1413,7 @@ class GpuTimeConveyor {
   static constexpr int kRoles = 3;  // 0=SELF, 1=NEXT, 2=PREV
   std::vector<int*> vl_off_;   // [zone*kRoles + role], cap+1 ints
   std::vector<int*> vl_idx_;   // [zone*kRoles + role], cap*max_neigh_ ints
+  std::vector<double*> vl_xref_;  // PR-3 [zone], 3*cap doubles (rebuild-epoch x)
   int node0_ = 0;
   std::deque<int> bfree_;          // local slot pool of a boundary-fed node 0
   std::deque<int> p1free_;         // pass-1 upload reserve / self-loop pool

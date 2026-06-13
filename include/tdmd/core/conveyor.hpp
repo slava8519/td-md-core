@@ -121,6 +121,9 @@ struct ConveyorOptions {
   double verlet_K_on = 3.0;        // fallback: enable reuse at K_pred >= K_on (I1, PR-2)
   double verlet_K_off = 1.5;       // ...fall back to cell-raster below K_off
   bool   verlet_default = false;   // initial verlet_active at cold start
+  // PR-3/PR-4 (opt-in refinements over the conservative 2*R_buf criterion):
+  bool   verlet_hybrid = false;    // measured-displacement criterion (2*d_max + 2*L*R_buf)
+  bool   verlet_drift = false;     // subtract mean displacement D0 first (Theorem 1; needs hybrid)
 };
 
 // Per-pass record. v_max/a_max/k2cap are the pass aggregates that feed the
@@ -155,6 +158,8 @@ namespace conveyor_detail {
 
 struct Lambda {
   double v = 0.0, a = 0.0, k2cap = 0.0;
+  double d = 0.0;                 // PR-3: lagged max displacement (verlet_hybrid)
+  double drift[3] = {0, 0, 0};    // PR-4: lagged mean displacement D0 (verlet_drift)
 };
 
 struct Slot {

@@ -47,6 +47,12 @@ struct ZoneHeader {
   double skin_consumed = 0.0;  // accumulated 2*R_buf budget since last rebuild
   uint8_t rebuild_now = 1;     // 1 => materialize the list this pass
   uint8_t verlet_active = 0;   // 1 => Verlet reuse path; 0 => cell-raster (Базис A)
+  // PR-3 hybrid criterion (opt-in, verlet_hybrid): the lagged max atom
+  // displacement from the last rebuild epoch — rides the Λ-chain like v_full.
+  // PR-4 drift (opt-in, verlet_drift): the lagged mean displacement (drift D0)
+  // subtracted before the max (Theorem 1). Both inert unless their flag is set.
+  double d_full = 0.0;             // max ||x - x_ref|| (or residual under drift)
+  double drift_full[3] = {0, 0, 0};  // mean displacement D0 (PR-4)
 };
 
 // Zone payload. deterministic_fp64 mode ships plain FP64 global coordinates
