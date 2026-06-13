@@ -450,6 +450,7 @@ class GpuTimeConveyor {
         res_.has_final = true;
       }
     }
+    res_.verlet_rebuilds = verlet_rebuilds_.load();
     if (part_.in) {
       cudaFreeHost(in_stage_);
       cudaFreeHost(out_stage_);
@@ -542,9 +543,22 @@ class GpuTimeConveyor {
       TDMD_CU(cudaMalloc(&nb.d_flags, 4));
       TDMD_CU(cudaHostAlloc(&nb.h_end, sizeof(EndScalars) * std::size_t(n_), 0));
     }
+    if (o_.verlet_reuse) {  // shared per-(zone,role) persistent lists
+      vl_off_.assign(std::size_t(n_) * kRoles, nullptr);
+      vl_idx_.assign(std::size_t(n_) * kRoles, nullptr);
+      for (std::size_t s = 0; s < vl_off_.size(); ++s) {
+        TDMD_CU(cudaMalloc(&vl_off_[s], sizeof(int) * (cap_ + 1)));
+        TDMD_CU(cudaMalloc(&vl_idx_[s],
+                           sizeof(int) * std::size_t(cap_) * max_neigh_));
+      }
+    }
   }
 
   void free_nodes() {
+    for (auto* p : vl_off_) cudaFree(p);
+    for (auto* p : vl_idx_) cudaFree(p);
+    vl_off_.clear();
+    vl_idx_.clear();
     for (auto& nb : node_) {
       for (auto& s : nb.slot) {
         cudaFree(s.base);
@@ -624,6 +638,12 @@ class GpuTimeConveyor {
     bool synced = false;
     int sent = 0, arrived = 0;
     double dt = 0.0, R_buf = 0.0, dt_next = 0.0;
+    // PR-1b-ii Verlet skin budget (per-pass, carried in the header like dt):
+    // skin_in arrives at pos 0; the head decides the NEXT pass's rebuild and
+    // broadcasts skin_out/rebuild_next into EVERY header. rebuild_now_pass is
+    // THIS pass's broadcast decision (uniform across zones).
+    double skin_in = 0.0, skin_out = 0.0;
+    bool rebuild_now_pass = true, rebuild_next = false;
     Lambda agg{0.0, 0.0, std::numeric_limits<double>::infinity()};
     double ke = 0.0;
 
@@ -650,7 +670,11 @@ class GpuTimeConveyor {
           upload_zone(s.dev, want_id);  // streamed §7.3 (INV-7 pool)
           s.n_atoms = int(zd_.members[std::size_t(want_id)].size());
           s.lam_in = lam0_;
-          if (arrived == 0) dt = o_.dt_initial;
+          if (arrived == 0) {
+            dt = o_.dt_initial;
+            skin_in = 0.0;          // cold start: build all lists on pass 1
+            rebuild_now_pass = true;
+          }
           s.fsm.type = core::initial_zone_type(1);
         } else if (b_in) {
           // M5a boundary: header+payload arrive as host bytes; this node owns
@@ -674,7 +698,11 @@ class GpuTimeConveyor {
           bfree_.pop_front();
           s.n_atoms = gh.n_atoms;
           s.lam_in = {gh.hdr.v_full, gh.hdr.a_full, gh.hdr.k2cap_full};
-          if (arrived == 0) dt = gh.hdr.dt_next;
+          if (arrived == 0) {
+            dt = gh.hdr.dt_next;
+            skin_in = gh.hdr.skin_consumed;        // carried budget
+            rebuild_now_pass = gh.hdr.rebuild_now;  // broadcast decision
+          }
           const DevSlot& d = nb.slot[std::size_t(s.dev)];
           if (o_.mixed_transport) {
             TDMD_CU(cudaMemcpyAsync(d.pk_mass, in_stage_, wire_bytes(),
@@ -702,7 +730,11 @@ class GpuTimeConveyor {
           s.dev = gh.dst_slot;
           s.n_atoms = gh.n_atoms;
           s.lam_in = {gh.hdr.v_full, gh.hdr.a_full, gh.hdr.k2cap_full};
-          if (arrived == 0) dt = gh.hdr.dt_next;
+          if (arrived == 0) {
+            dt = gh.hdr.dt_next;
+            skin_in = gh.hdr.skin_consumed;        // carried budget
+            rebuild_now_pass = gh.hdr.rebuild_now;  // broadcast decision
+          }
           // INV-2: the payload copy is ordered before this wait by the
           // record-before-push / pop-before-wait protocol invariant.
           TDMD_CU(cudaStreamWaitEvent(nb.stream, in.arrival_[std::size_t(s.dev)], 0));
@@ -746,8 +778,12 @@ class GpuTimeConveyor {
       }
       TDMD_CU(cudaMemsetAsync(d.raw, 0, 3 * sizeof(long long) * cap_,
                               nb.stream));
-      if (o_.cell_lists || o_.verlet_reuse) {  // rebuild cell list at x_h
-                                               // (verlet materialisation needs it)
+      // verlet_reuse: build cells only on a rebuild pass (the materialisation
+      // needs them); on a reuse pass skip the build entirely — that is the
+      // amortisation win. Plain cell path: always.
+      const bool build_cells =
+          o_.verlet_reuse ? rebuild_now_pass : o_.cell_lists;
+      if (build_cells) {  // rebuild cell list at x_h
         TDMD_CU(cudaMemsetAsync(d.counts(ncells_), 0, sizeof(int) * ncells_,
                                 nb.stream));
         if (s.n_atoms > 0) {
@@ -776,7 +812,8 @@ class GpuTimeConveyor {
       s.drifted = true;
     };
 
-    auto launch_pairs = [&](PassSlot& A, PassSlot& B, bool same, bool energy) {
+    auto launch_pairs = [&](PassSlot& A, PassSlot& B, bool same, bool energy,
+                            int role) {
       if (A.n_atoms == 0) return;
       const DevSlot& da = nb.slot[std::size_t(A.dev)];
       const DevSlot& db = nb.slot[std::size_t(B.dev)];
@@ -786,31 +823,36 @@ class GpuTimeConveyor {
                          nb.d_mr2,  nb.d_flags, same,     energy};
       const int grid = (A.n_atoms + kZoneBlock - 1) / kZoneBlock;
       if (o_.verlet_reuse) {
-        // PR-1b-i: materialise the (A,B) list from B's cells at rcut+skin, then
-        // force from it. At K=1 the list is ephemeral — built and consumed on
-        // this stream within the pass — so it lives in per-node scratch and
-        // needs no persistent (zone,role) keying (that is PR-1b-ii, K>1). The
-        // verlet force kernel re-tests at geom_ (rcut): bitwise ≡ the cell path.
-        const CellGrid bgrid = zone_grid(B.fsm.id);
+        // PR-1b-ii: persistent (zone,role) list. On a rebuild pass materialise
+        // from B's cells at rcut+skin into the shared buffer; on a reuse pass
+        // skip the build and force from the stored list. The verlet force
+        // kernel re-tests at geom_ (rcut): bitwise ≡ the cell path while the
+        // list is a superset (guaranteed by the 2*R_buf skin budget). The
+        // shared write/read is ordered by the existing arrival-event chain;
+        // the stored LOCAL indices are slot-independent (static membership).
+        const std::size_t vk = std::size_t(A.fsm.id) * kRoles + role;
+        int* off = vl_off_[vk];
+        int* idx = vl_idx_[vk];
         const int gc = (A.n_atoms + kVerletBlock - 1) / kVerletBlock;
-        TDMD_CU(cudaMemsetAsync(nb.v_counts, 0, sizeof(int) * (A.n_atoms + 1),
-                                nb.stream));
-        verlet_count_kernel<<<gc, kVerletBlock, 0, nb.stream>>>(
-            da.arr(0), da.arr(1), da.arr(2), A.n_atoms, db.arr(0), db.arr(1),
-            db.arr(2), geom_list_, bgrid, db.starts(ncells_),
-            db.counts(ncells_), db.order(), same, max_neigh_, nb.d_flags,
-            nb.v_counts);
-        std::size_t tb = nb.cubtmp_bytes;
-        TDMD_CU(cub::DeviceScan::ExclusiveSum(nb.d_cubtmp, tb, nb.v_counts,
-                                              nb.v_offsets, A.n_atoms + 1,
-                                              nb.stream));
-        verlet_fill_kernel<<<gc, kVerletBlock, 0, nb.stream>>>(
-            da.arr(0), da.arr(1), da.arr(2), A.n_atoms, db.arr(0), db.arr(1),
-            db.arr(2), geom_list_, bgrid, db.starts(ncells_),
-            db.counts(ncells_), db.order(), same, max_neigh_, nb.v_offsets,
-            nb.v_idx);
+        if (rebuild_now_pass) {
+          const CellGrid bgrid = zone_grid(B.fsm.id);
+          TDMD_CU(cudaMemsetAsync(nb.v_counts, 0, sizeof(int) * (A.n_atoms + 1),
+                                  nb.stream));
+          verlet_count_kernel<<<gc, kVerletBlock, 0, nb.stream>>>(
+              da.arr(0), da.arr(1), da.arr(2), A.n_atoms, db.arr(0), db.arr(1),
+              db.arr(2), geom_list_, bgrid, db.starts(ncells_),
+              db.counts(ncells_), db.order(), same, max_neigh_, nb.d_flags,
+              nb.v_counts);
+          std::size_t tb = nb.cubtmp_bytes;
+          TDMD_CU(cub::DeviceScan::ExclusiveSum(nb.d_cubtmp, tb, nb.v_counts,
+                                                off, A.n_atoms + 1, nb.stream));
+          verlet_fill_kernel<<<gc, kVerletBlock, 0, nb.stream>>>(
+              da.arr(0), da.arr(1), da.arr(2), A.n_atoms, db.arr(0), db.arr(1),
+              db.arr(2), geom_list_, bgrid, db.starts(ncells_),
+              db.counts(ncells_), db.order(), same, max_neigh_, off, idx);
+        }
         zone_pair_verlet_kernel<PairF><<<gc, kVerletBlock, 0, nb.stream>>>(
-            args, geom_, pot_, nb.v_offsets, nb.v_idx);
+            args, geom_, pot_, off, idx);
       } else if (o_.cell_lists) {  // culled path — bitwise ≡ tiles (B1)
         const CellGrid bgrid = zone_grid(B.fsm.id);
         zone_pair_cells_kernel<PairF><<<grid, kZoneBlock, 0, nb.stream>>>(
@@ -971,14 +1013,19 @@ class GpuTimeConveyor {
           gh.hdr.sent_pos = sent;
           const Lambda lamb =
               (sent + 1 < n_) ? slot[std::size_t(sent + 1)].lam_in : agg;
-          if (sent == 0)
+          if (sent == 0) {
             dt_next = o_.auto_step
                           ? core::buffer::auto_dt(lamb.v, dt, o_.ts, lamb.k2cap)
                           : o_.dt_initial;
+            decide_rebuild(skin_in, R_buf, skin_out, rebuild_next);
+          }
           gh.hdr.dt_next = (sent == 0) ? dt_next : 0.0;
           gh.hdr.v_full = lamb.v;
           gh.hdr.a_full = lamb.a;
           gh.hdr.k2cap_full = lamb.k2cap;
+          gh.hdr.skin_consumed = skin_out;  // broadcast to EVERY header
+          gh.hdr.rebuild_now = rebuild_next ? 1 : 0;
+          gh.hdr.verlet_active = o_.verlet_reuse ? 1 : 0;
           gh.n_atoms = s.n_atoms;
           gh.dst_slot = -1;  // the receiver picks its own slot
           if (o_.mixed_transport) {
@@ -1043,14 +1090,19 @@ class GpuTimeConveyor {
         gh.hdr.sent_pos = sent;
         const Lambda lam =
             (sent + 1 < n_) ? slot[std::size_t(sent + 1)].lam_in : agg;
-        if (sent == 0)
+        if (sent == 0) {
           dt_next = o_.auto_step
                         ? core::buffer::auto_dt(lam.v, dt, o_.ts, lam.k2cap)
                         : o_.dt_initial;
+          decide_rebuild(skin_in, R_buf, skin_out, rebuild_next);
+        }
         gh.hdr.dt_next = (sent == 0) ? dt_next : 0.0;
         gh.hdr.v_full = lam.v;
         gh.hdr.a_full = lam.a;
         gh.hdr.k2cap_full = lam.k2cap;
+        gh.hdr.skin_consumed = skin_out;  // broadcast to EVERY header
+        gh.hdr.rebuild_now = rebuild_next ? 1 : 0;
+        gh.hdr.verlet_active = o_.verlet_reuse ? 1 : 0;
         gh.n_atoms = s.n_atoms;
         gh.dst_slot = dst;
         core::ZoneFSM::apply(s.fsm, core::ZoneEvent::SEND);  // T5
@@ -1066,24 +1118,30 @@ class GpuTimeConveyor {
       ensure_drift(j);
       if (j + 1 < n_) ensure_drift(j + 1);
       PassSlot& s = slot[std::size_t(j)];
-      if (j == 0) core::seed_first_zone(s.fsm);  // §7.1
+      if (j == 0) {
+        core::seed_first_zone(s.fsm);  // §7.1
+        if (o_.verlet_reuse && rebuild_now_pass)  // once per pass (rebuild_now
+          verlet_rebuilds_.fetch_add(1, std::memory_order_relaxed);  // uniform)
+      }
       if (j > 0 && !slot[std::size_t(j - 1)].computed)
         throw std::logic_error("gpu conveyor: INV-1 violated");
       core::ZoneFSM::apply(s.fsm, core::ZoneEvent::START);  // T3
       {
         NvtxScope nv("pairs");
-        launch_pairs(s, s, /*same=*/true, /*energy=*/true);
+        // role: 0=SELF, 1=NEXT (partner is A's +1 / wrap), 2=PREV (partner is
+        // A's -1 / wrap) — the persistent Verlet list key (PR-1b-ii).
+        launch_pairs(s, s, /*same=*/true, /*energy=*/true, /*role=*/0);
         if (j + 1 < n_) {
           PassSlot& nx = slot[std::size_t(j + 1)];
           core::ZoneFSM::apply(nx.fsm, core::ZoneEvent::SPHERE);  // T2
           nx.fsm.contrib_mask |= 1u;
-          launch_pairs(s, nx, false, true);   // A-side: energy once
-          launch_pairs(nx, s, false, false);  // B-side: Newton-3 partner
+          launch_pairs(s, nx, false, true, 1);   // A=j: partner j+1 is NEXT
+          launch_pairs(nx, s, false, false, 2);  // A=j+1: partner j is PREV
         } else if (defer_head && j == n_ - 1) {
           PassSlot& hd = slot[0];
           hd.fsm.contrib_mask |= 2u;
-          launch_pairs(s, hd, false, true);   // closure (rotation §7.2)
-          launch_pairs(hd, s, false, false);
+          launch_pairs(s, hd, false, true, 1);   // A=n-1: NEXT wraps to 0
+          launch_pairs(hd, s, false, false, 2);  // A=0:   PREV wraps to n-1
         }
         }
       s.computed = true;
@@ -1192,6 +1250,15 @@ class GpuTimeConveyor {
   std::size_t packed_bytes() const {
     return sizeof(double) * cap_ + 9 * sizeof(int) * std::size_t(cap_);
   }
+  // PR-1b-ii skin recurrence (NL-INV-2a): charge 2*R_buf — the per-step pair
+  // approach bound INV-4 enforces (R_buf = C_buf*v_pred*dt). z-independent (a
+  // scalar over the lagged Λ-forecast), so the rebuild sequence is too.
+  void decide_rebuild(double skin_in, double R_buf, double& skin_out,
+                      bool& rebuild) const {
+    skin_out = skin_in + 2.0 * R_buf;
+    rebuild = (skin_out >= o_.verlet_skin);
+    if (rebuild) skin_out = 0.0;
+  }
   CellGrid zone_grid(int zone_id) const {
     const double len[3] = {box_.len(0), box_.len(1), box_.len(2)};
     const bool per[3] = {box_.periodic[0], box_.periodic[1], box_.periodic[2]};
@@ -1206,6 +1273,16 @@ class GpuTimeConveyor {
   int n_ = 1, z_ = 1, Z_ = 1, S_ = 3, cap_ = 0;
   int ncells_ = 1;
   int max_neigh_ = 1;  // PR-1: per-atom Verlet stride (CSR capacity = cap*this)
+  // PR-1b-ii: persistent Verlet lists keyed by (zone-id, role), role ∈
+  // {SELF,NEXT,PREV} — a zone pairs only with itself + its slab neighbours.
+  // SHARED across nodes (a list built at the rebuild step is read at later
+  // reuse steps by whichever node owns them): correct because the existing
+  // arrival-event chain orders consecutive steps' access to each zone, and the
+  // stored LOCAL indices are slot-independent (static membership). idx capacity
+  // = cap*max_neigh_, offsets = cap+1, per (zone,role) => 3*n_ buffers.
+  static constexpr int kRoles = 3;  // 0=SELF, 1=NEXT, 2=PREV
+  std::vector<int*> vl_off_;   // [zone*kRoles + role], cap+1 ints
+  std::vector<int*> vl_idx_;   // [zone*kRoles + role], cap*max_neigh_ ints
   int node0_ = 0;
   std::deque<int> bfree_;          // local slot pool of a boundary-fed node 0
   std::deque<int> p1free_;         // pass-1 upload reserve / self-loop pool
@@ -1223,6 +1300,7 @@ class GpuTimeConveyor {
   std::unique_ptr<StreamTransport> transport_;
   std::vector<HostZone> final_;
   core::ConveyorResult res_;
+  std::atomic<long> verlet_rebuilds_{0};  // PR-1b-ii rebuild count (all nodes)
 
   std::atomic<bool> halt_on_{false};
   std::mutex halt_mu_;
