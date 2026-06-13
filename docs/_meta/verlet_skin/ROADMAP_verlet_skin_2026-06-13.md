@@ -115,7 +115,8 @@ _Базис: `SPEC_verlet_skin_criterion.md`, `SKIN_CRITERION_SYNTHESIS_2026-06-
 | PR-2 K-aware fallback (И1) | ✅ | `2e6716f` — `VerletFallbackBitwiseVsCells` (GATE-06/07) |
 | Бенч (выигрыш + новый флагман) | ✅ | `674b973` — 3.73e7 a-st/s (1M mixed FMA), `TD_MD_Core_Bench` §Verlet |
 | GATE-01 standalone геометрический Oracle (NL-INV-1) | ✅ | `ca77bb2` — `VerletListGeometricOracle` |
-| **Sparse cross-role CSR (память 1e7)** | ⏳ **отложено** | см. ниже |
+| **Sparse cross-role CSR — 1e7 прогоняется** | ✅ | `3d5a104` — half-sphere stride; 1e7 = 3.83e7 a-st/s, ~9.8 ГБ в карте |
+| Boundary-пропорциональный cross (таргет 3.5 ГиБ) | ⏳ отложено | gold-plating; см. ниже |
 | PR-3 гибридный префикс `d_(1)+d_(2)` (И2/И4) | ⏳ backlog | после измеренного потолка |
 | PR-4 дрейф-коррекция L2 (И3) | ⏳ backlog | research-ось |
 
