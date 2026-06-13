@@ -10,8 +10,10 @@
 #include <gtest/gtest.h>
 #include <cuda_runtime.h>
 
+#include <climits>
 #include <cmath>
 #include <cstring>
+#include <set>
 #include <vector>
 
 #include "tdmd/core/soa.hpp"
@@ -19,6 +21,8 @@
 #include "tdmd/core/zones.hpp"
 #include "tdmd/cuda/zone_force.cuh"
 #include "tdmd/cuda/zone_integrate.cuh"
+#include "tdmd/cuda/zone_verlet.cuh"
+#include <cub/device/device_scan.cuh>
 #include "tdmd/potentials/cutoff.hpp"
 #include "tdmd/potentials/morse.hpp"
 #include "tdmd/potentials/pair_lj.hpp"
@@ -253,6 +257,152 @@ GpuPassResult gpu_raw_pass(const core::AtomSoA<double>& a,
   return res;
 }
 
+// --- GPU runner over the PERSISTENT Verlet path (zone_verlet.cuh): build a
+// per-zone cell grid at (rcut+skin), materialise a CSR partner list per (A,B)
+// launch, then force from the stored list. Same pass structure as
+// gpu_raw_pass — its raw accumulators MUST equal the tile path bit-for-bit
+// (single pass => the list is an exact geometric superset of within-rcut). ---
+
+template <typename PairF>
+GpuPassResult gpu_verlet_pass(const core::AtomSoA<double>& a,
+                              const core::Box& box,
+                              const core::ZoneDecomposition& zd, double rcut,
+                              double skin, const PairF& pot) {
+  const core::PairGeom geom(box, rcut);
+  const core::PairGeom geom_list(box, rcut + skin);
+  const int n = zd.n_zones;
+  const double len[3] = {box.len(0), box.len(1), box.len(2)};
+  const bool per[3] = {box.periodic[0], box.periodic[1], box.periodic[2]};
+
+  auto excl_scan = [](const int* in, int* out, int num) {
+    void* tmp = nullptr;
+    std::size_t bytes = 0;
+    cub::DeviceScan::ExclusiveSum(nullptr, bytes, in, out, num);
+    EXPECT_EQ(cudaMalloc(&tmp, bytes), cudaSuccess);
+    cub::DeviceScan::ExclusiveSum(tmp, bytes, in, out, num);
+    cudaFree(tmp);
+  };
+
+  struct ZBuf {
+    double *x, *y, *z;
+    long long *fx, *fy, *fz;
+    int m, nc;
+    tdcu::CellGrid grid;
+    int *cell_of, *order, *counts, *starts, *cursor;
+  };
+  std::vector<ZBuf> zb(n);
+  std::vector<int*> scratch;  // freed after the final sync (async kernels)
+
+  for (int zi = 0; zi < n; ++zi) {
+    const auto& mem = zd.members[zi];
+    std::vector<double> hx, hy, hz;
+    for (int i : mem) { hx.push_back(a.x[i]); hy.push_back(a.y[i]); hz.push_back(a.z[i]); }
+    std::vector<long long> zero(mem.size(), 0);
+    ZBuf b{};
+    b.m = int(mem.size());
+    b.x = upload(hx); b.y = upload(hy); b.z = upload(hz);
+    b.fx = upload(zero); b.fy = upload(zero); b.fz = upload(zero);
+    b.grid = tdcu::make_zone_grid(box.lo.data(), len, per, rcut + skin, n, zi);
+    b.nc = b.grid.ncells();
+    EXPECT_EQ(cudaMalloc(&b.cell_of, sizeof(int) * std::max(b.m, 1)), cudaSuccess);
+    EXPECT_EQ(cudaMalloc(&b.order, sizeof(int) * std::max(b.m, 1)), cudaSuccess);
+    EXPECT_EQ(cudaMalloc(&b.counts, sizeof(int) * b.nc), cudaSuccess);
+    EXPECT_EQ(cudaMalloc(&b.starts, sizeof(int) * b.nc), cudaSuccess);
+    EXPECT_EQ(cudaMalloc(&b.cursor, sizeof(int) * b.nc), cudaSuccess);
+    cudaMemset(b.counts, 0, sizeof(int) * b.nc);
+    if (b.m > 0) {
+      const int g = (b.m + tdcu::kVerletBlock - 1) / tdcu::kVerletBlock;
+      tdcu::cell_count_kernel<<<g, tdcu::kVerletBlock>>>(b.x, b.y, b.z, b.m,
+                                                         b.grid, b.cell_of, b.counts);
+    }
+    excl_scan(b.counts, b.starts, b.nc);
+    cudaMemcpy(b.cursor, b.starts, sizeof(int) * b.nc, cudaMemcpyDeviceToDevice);
+    if (b.m > 0) {
+      const int g = (b.m + tdcu::kVerletBlock - 1) / tdcu::kVerletBlock;
+      tdcu::cell_scatter_kernel<<<g, tdcu::kVerletBlock>>>(b.cell_of, b.m, b.cursor, b.order);
+    }
+    zb[zi] = b;
+  }
+
+  std::vector<long long> pe0{0};
+  std::vector<unsigned long long> mr0{0x7FF0000000000000ULL};
+  std::vector<int> of0{0};
+  long long* dpe = upload(pe0);
+  unsigned long long* dmr = upload(mr0);
+  int* dof = upload(of0);
+
+  auto launch = [&](int za, int zo, bool same, bool energy) {
+    const int na = zb[za].m;
+    if (na == 0) return;
+    int *dcounts = nullptr, *doffsets = nullptr;
+    EXPECT_EQ(cudaMalloc(&dcounts, sizeof(int) * (na + 1)), cudaSuccess);
+    EXPECT_EQ(cudaMalloc(&doffsets, sizeof(int) * (na + 1)), cudaSuccess);
+    cudaMemset(dcounts, 0, sizeof(int) * (na + 1));
+    const int g = (na + tdcu::kVerletBlock - 1) / tdcu::kVerletBlock;
+    tdcu::verlet_count_kernel<<<g, tdcu::kVerletBlock>>>(
+        zb[za].x, zb[za].y, zb[za].z, na, zb[zo].x, zb[zo].y, zb[zo].z,
+        geom_list, zb[zo].grid, zb[zo].starts, zb[zo].counts, zb[zo].order,
+        same, INT_MAX, nullptr, dcounts);
+    excl_scan(dcounts, doffsets, na + 1);
+    int total = 0;
+    cudaMemcpy(&total, doffsets + na, sizeof(int), cudaMemcpyDeviceToHost);
+    int* didx = nullptr;
+    if (total > 0) EXPECT_EQ(cudaMalloc(&didx, sizeof(int) * total), cudaSuccess);
+    tdcu::verlet_fill_kernel<<<g, tdcu::kVerletBlock>>>(
+        zb[za].x, zb[za].y, zb[za].z, na, zb[zo].x, zb[zo].y, zb[zo].z,
+        geom_list, zb[zo].grid, zb[zo].starts, zb[zo].counts, zb[zo].order,
+        same, INT_MAX, doffsets, didx);
+    tdcu::ZoneForceArgs args{zb[za].x,  zb[za].y,  zb[za].z,  na,
+                             zb[zo].x,  zb[zo].y,  zb[zo].z,  zb[zo].m,
+                             zb[za].fx, zb[za].fy, zb[za].fz, dpe, dmr, dof,
+                             same,      energy};
+    tdcu::zone_pair_verlet_kernel<PairF><<<g, tdcu::kVerletBlock>>>(
+        args, geom, pot, doffsets, didx);
+    EXPECT_EQ(cudaGetLastError(), cudaSuccess);
+    scratch.push_back(dcounts);
+    scratch.push_back(doffsets);
+    if (didx) scratch.push_back(didx);
+  };
+
+  for (int q = 0; q < n; ++q) {
+    const int zi = q;
+    launch(zi, zi, /*same=*/true, /*energy=*/true);
+    if (n > 1) {
+      const int zn = (zi + 1) % n;
+      if (zn > zi || box.periodic[2]) {
+        launch(zi, zn, false, true);
+        launch(zn, zi, false, false);
+      }
+    }
+  }
+  EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+
+  GpuPassResult res;
+  res.raw.fx.resize(n); res.raw.fy.resize(n); res.raw.fz.resize(n);
+  for (int zi = 0; zi < n; ++zi) {
+    const int m = zb[zi].m;
+    res.raw.fx[zi].resize(m); res.raw.fy[zi].resize(m); res.raw.fz[zi].resize(m);
+    if (m > 0) {
+      cudaMemcpy(res.raw.fx[zi].data(), zb[zi].fx, m * 8, cudaMemcpyDeviceToHost);
+      cudaMemcpy(res.raw.fy[zi].data(), zb[zi].fy, m * 8, cudaMemcpyDeviceToHost);
+      cudaMemcpy(res.raw.fz[zi].data(), zb[zi].fz, m * 8, cudaMemcpyDeviceToHost);
+    }
+    for (auto* p : {zb[zi].x, zb[zi].y, zb[zi].z}) cudaFree(p);
+    for (auto* p : {zb[zi].fx, zb[zi].fy, zb[zi].fz}) cudaFree(p);
+    for (auto* p : {zb[zi].cell_of, zb[zi].order, zb[zi].counts, zb[zi].starts,
+                    zb[zi].cursor})
+      cudaFree(p);
+  }
+  unsigned long long mr = 0;
+  cudaMemcpy(&res.raw.pe, dpe, 8, cudaMemcpyDeviceToHost);
+  cudaMemcpy(&mr, dmr, 8, cudaMemcpyDeviceToHost);
+  cudaMemcpy(&res.overflow, dof, 4, cudaMemcpyDeviceToHost);
+  std::memcpy(&res.min_r2, &mr, 8);
+  for (int* p : scratch) cudaFree(p);
+  cudaFree(dpe); cudaFree(dmr); cudaFree(dof);
+  return res;
+}
+
 ::testing::AssertionResult raw_eq(const RawForces& a, const RawForces& b) {
   if (a.pe != b.pe)
     return ::testing::AssertionFailure()
@@ -266,7 +416,117 @@ GpuPassResult gpu_raw_pass(const core::AtomSoA<double>& a,
   return ::testing::AssertionSuccess();
 }
 
+// GATE-01 helper: materialise the single-zone SELF Verlet list (radius
+// rcut+skin) at `a`'s positions and return it to the host as per-atom partner
+// index lists.
+std::vector<std::vector<int>> materialize_self_list(const core::AtomSoA<double>& a,
+                                                    const core::Box& box,
+                                                    double rcut, double skin) {
+  const int n = a.n;
+  const core::PairGeom geom_list(box, rcut + skin);
+  const double len[3] = {box.len(0), box.len(1), box.len(2)};
+  const bool per[3] = {box.periodic[0], box.periodic[1], box.periodic[2]};
+  const tdcu::CellGrid grid =
+      tdcu::make_zone_grid(box.lo.data(), len, per, rcut + skin, 1, 0);
+  const int nc = grid.ncells();
+  auto scan = [](const int* in, int* out, int num) {
+    void* tmp = nullptr; std::size_t b = 0;
+    cub::DeviceScan::ExclusiveSum(nullptr, b, in, out, num);
+    cudaMalloc(&tmp, b); cub::DeviceScan::ExclusiveSum(tmp, b, in, out, num);
+    cudaFree(tmp);
+  };
+  double *dx = upload(a.x), *dy = upload(a.y), *dz = upload(a.z);
+  int *cell_of, *order, *counts, *starts, *cursor;
+  cudaMalloc(&cell_of, n * 4); cudaMalloc(&order, n * 4);
+  cudaMalloc(&counts, nc * 4); cudaMalloc(&starts, nc * 4); cudaMalloc(&cursor, nc * 4);
+  cudaMemset(counts, 0, nc * 4);
+  const int g = (n + tdcu::kVerletBlock - 1) / tdcu::kVerletBlock;
+  tdcu::cell_count_kernel<<<g, tdcu::kVerletBlock>>>(dx, dy, dz, n, grid, cell_of, counts);
+  scan(counts, starts, nc);
+  cudaMemcpy(cursor, starts, nc * 4, cudaMemcpyDeviceToDevice);
+  tdcu::cell_scatter_kernel<<<g, tdcu::kVerletBlock>>>(cell_of, n, cursor, order);
+  int *vc, *voff;
+  cudaMalloc(&vc, (n + 1) * 4); cudaMalloc(&voff, (n + 1) * 4); cudaMemset(vc, 0, (n + 1) * 4);
+  tdcu::verlet_count_kernel<<<g, tdcu::kVerletBlock>>>(
+      dx, dy, dz, n, dx, dy, dz, geom_list, grid, starts, counts, order,
+      /*same=*/true, INT_MAX, nullptr, vc);
+  scan(vc, voff, n + 1);
+  int total = 0; cudaMemcpy(&total, voff + n, 4, cudaMemcpyDeviceToHost);
+  int* vidx = nullptr; if (total > 0) cudaMalloc(&vidx, total * 4);
+  tdcu::verlet_fill_kernel<<<g, tdcu::kVerletBlock>>>(
+      dx, dy, dz, n, dx, dy, dz, geom_list, grid, starts, counts, order,
+      /*same=*/true, INT_MAX, voff, vidx);
+  cudaDeviceSynchronize();
+  std::vector<int> hoff(n + 1), hidx(std::max(total, 1));
+  cudaMemcpy(hoff.data(), voff, (n + 1) * 4, cudaMemcpyDeviceToHost);
+  if (total > 0) cudaMemcpy(hidx.data(), vidx, total * 4, cudaMemcpyDeviceToHost);
+  for (auto* p : {dx, dy, dz}) cudaFree(p);
+  for (auto* p : {cell_of, order, counts, starts, cursor, vc, voff}) cudaFree(p);
+  if (vidx) cudaFree(vidx);
+  std::vector<std::vector<int>> out(n);
+  for (int i = 0; i < n; ++i)
+    for (int t = hoff[i]; t < hoff[i + 1]; ++t) out[i].push_back(hidx[t]);
+  return out;
+}
+
 }  // namespace
+
+// --- GATE-01: standalone GEOMETRIC oracle for the Verlet list (NL-INV-1),
+// independent of the cell-path reference. (1) The materialised list is EXACTLY
+// the set of within-(rcut+skin) partners (the 27-cell sweep misses none).
+// (2) After any per-atom displacement < skin/2, every within-rcut pair is
+// still in the build-time list — the superset guarantee the skin budget rests
+// on. ---
+
+TEST(CudaZones, VerletListGeometricOracle) {
+  core::Box box;
+  auto a = make_fcc(box, 3, 3, 6);  // 216 atoms, single zone, PBC
+  core::thermal::maxwell_init(a, 300.0, 19);
+  const double skin = 1.0;
+  const auto list = materialize_self_list(a, box, kRcut, skin);
+  ASSERT_EQ(int(list.size()), a.n);
+
+  // (1) exact coverage at build positions
+  core::PairGeom gl(box, kRcut + skin);
+  for (int i = 0; i < a.n; ++i) {
+    std::set<int> listed(list[i].begin(), list[i].end());
+    for (int j = 0; j < a.n; ++j) {
+      if (j == i) continue;
+      double dx = a.x[i] - a.x[j], dy = a.y[i] - a.y[j], dz = a.z[i] - a.z[j], r2;
+      const bool in_skin = gl.reduce(dx, dy, dz, r2);
+      ASSERT_EQ(in_skin, listed.count(j) > 0) << "coverage i=" << i << " j=" << j;
+    }
+  }
+
+  // (2) superset survives a bounded displacement (|d_i| < skin/2)
+  core::AtomSoA<double> moved = a;
+  unsigned s = 12345;
+  auto rnd = [&] { s = s * 1664525u + 1013904223u; return (s >> 8) * (1.0 / 16777216.0); };
+  const double dmax = (skin / 2.0) * 0.99 / std::sqrt(3.0);  // => |d| < skin/2
+  for (int i = 0; i < a.n; ++i) {
+    moved.x[i] += (2 * rnd() - 1) * dmax;
+    moved.y[i] += (2 * rnd() - 1) * dmax;
+    moved.z[i] += (2 * rnd() - 1) * dmax;
+  }
+  core::PairGeom gc(box, kRcut);
+  long checked = 0;
+  for (int i = 0; i < a.n; ++i) {
+    std::set<int> listed(list[i].begin(), list[i].end());
+    for (int j = 0; j < a.n; ++j) {
+      if (j == i) continue;
+      double dx = moved.x[i] - moved.x[j], dy = moved.y[i] - moved.y[j],
+             dz = moved.z[i] - moved.z[j], r2;
+      if (gc.reduce(dx, dy, dz, r2)) {
+        ASSERT_TRUE(listed.count(j) > 0)
+            << "missed within-rcut pair after drift: i=" << i << " j=" << j;
+        ++checked;
+      }
+    }
+  }
+  EXPECT_GT(checked, 0);  // the test actually exercised within-rcut pairs
+  std::printf("Test_CUDA_Zones[oracle]: %ld within-rcut pairs all covered "
+              "after |d|<skin/2 drift\n", checked);
+}
 
 // --- the headline: LJ raw accumulators, CPU == GPU bit-for-bit ---
 
@@ -296,6 +556,34 @@ TEST(CudaZones, LjRawAccumulatorsBitwiseCpuVsGpu) {
       EXPECT_EQ(b.fz[i],
                 double(cpu.fz[zi][s]) / core::fixed::ForceAccum::kScale);
     }
+}
+
+// --- PR-1: the Verlet-list force path == the cell/tile path bit-for-bit ---
+// (zone_verlet.cuh). Single pass at equal positions => the materialised list
+// is an exact geometric superset of the within-rcut pairs, so re-testing
+// r2<rcut2 over the list reproduces the tile accumulators exactly (NL-INV-5).
+
+TEST(CudaZones, VerletListBitwiseVsTiles) {
+  struct Case { int cx, cy, cz, nz; bool pbc_z; double skin; const char* name; };
+  const Case cases[] = {
+      {2, 2, 6, 4, true,  1.0, "pbc 4 zones"},
+      {2, 2, 6, 4, false, 1.0, "free-z 4 zones"},
+      {3, 3, 6, 1, true,  1.0, "single zone pbc"},
+      {2, 2, 8, 5, true,  2.0, "5 zones wide skin"},
+  };
+  for (const auto& c : cases) {
+    core::Box box;
+    auto a = make_fcc(box, c.cx, c.cy, c.cz);
+    box.periodic = {true, true, c.pbc_z};
+    core::thermal::maxwell_init(a, 300.0, 31);
+    const auto zd = core::ZoneDecomposition::build(a, box, c.nz, kRcut);
+    const auto lj = make_lj(0.4, 2.55, kRcut);
+
+    const auto tiles = gpu_raw_pass(a, box, zd, kRcut, lj);
+    const auto verlet = gpu_verlet_pass(a, box, zd, kRcut, c.skin, lj);
+    EXPECT_EQ(verlet.overflow, 0) << c.name;
+    EXPECT_TRUE(raw_eq(tiles.raw, verlet.raw)) << c.name;
+  }
 }
 
 // --- Morse: tolerance vs CPU (exp ulps), bitwise GPU-internal ---
