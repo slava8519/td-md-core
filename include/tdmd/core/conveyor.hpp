@@ -111,6 +111,16 @@ struct ConveyorOptions {
   // N=10⁶+) and start from zero forces. TIMING USE ONLY: the first kick is
   // physically wrong, trajectories are not comparable to honest runs.
   bool   skip_t0_forces = false;
+  // Verlet-skin neighbor-list reuse (GPU ring only; docs/_meta/verlet_skin).
+  // Persistent per-zone list reused for K>1 passes; rebuild gated by a
+  // deterministic skin budget on the Λ-chain (charge = 2*R_buf, NL-INV-2a).
+  // OFF until the feature lands. The CPU ring (the bitwise reference) ignores
+  // these — it uses the w-pass tiling, not GPU cells.
+  bool   verlet_reuse = false;     // master enable (GPU ring)
+  double verlet_skin = 1.0;        // Å, list radius = rcut + skin (s)
+  double verlet_K_on = 3.0;        // fallback: enable reuse at K_pred >= K_on (I1, PR-2)
+  double verlet_K_off = 1.5;       // ...fall back to cell-raster below K_off
+  bool   verlet_default = false;   // initial verlet_active at cold start
 };
 
 // Per-pass record. v_max/a_max/k2cap are the pass aggregates that feed the

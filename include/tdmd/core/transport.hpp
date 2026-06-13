@@ -1,6 +1,7 @@
 #pragma once
 #include <condition_variable>
 #include <cstddef>
+#include <cstdint>
 #include <deque>
 #include <memory>
 #include <mutex>
@@ -35,6 +36,17 @@ struct ZoneHeader {
   double v_full = 0.0;     // Λ-chain: lagged full-pass v_max
   double a_full = 0.0;     // Λ-chain: lagged full-pass a_max
   double k2cap_full = 0.0; // Λ-chain: lagged full-pass K2 dt cap (min)
+  // Verlet-skin neighbor-list reuse (GPU ring only; docs/_meta/verlet_skin).
+  // Unlike dt_next (point-to-point on sent_pos==0), these are a PER-PASS
+  // decision the head BROADCASTS into EVERY header so all n zones rebuild or
+  // reuse together (NL-INV-4); else the superset (NL-INV-1) breaks at the
+  // n-1-pass light-cone boundary. Inert on the CPU ring (it uses w-tiling, not
+  // GPU cells) — carried for layout/wire parity only. The skin charge MUST be
+  // 2*R_buf, never 2*v_pred*dt (NL-INV-2a). Defaults => rebuild every pass =
+  // current behavior, so PR-0 is a bitwise no-op.
+  double skin_consumed = 0.0;  // accumulated 2*R_buf budget since last rebuild
+  uint8_t rebuild_now = 1;     // 1 => materialize the list this pass
+  uint8_t verlet_active = 0;   // 1 => Verlet reuse path; 0 => cell-raster (Базис A)
 };
 
 // Zone payload. deterministic_fp64 mode ships plain FP64 global coordinates
