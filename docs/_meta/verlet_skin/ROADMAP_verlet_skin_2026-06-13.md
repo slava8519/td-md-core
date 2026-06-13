@@ -101,3 +101,34 @@ PR-0 ──▶ PR-1 ──▶ PR-2 ──▶ [профиль] ──▶ PR-3 ─
 ---
 
 _Базис: `SPEC_verlet_skin_criterion.md`, `SKIN_CRITERION_SYNTHESIS_2026-06-13.md`, `K_FALLBACK_INTEGRATION_2026-06-13.md`, `DRIFT_CORRECTION_PROOF_2026-06-13.md`. Привязка к коду — grounding-воркфлоу wf_be43d850-e41 (5 агентов, подтверждённые file:line). Имена полей/функций сверены с актуальными `transport.hpp`/`conveyor_gpu.cuh`/`zone_cells.cuh`._
+
+---
+
+## Статус реализации (обновляется по ходу; ветка `verlet-skin`)
+
+| Этап | Состояние | Коммит / тест |
+|---|---|---|
+| PR-0 каркас (header + ConveyorOptions) | ✅ | `c6ae2dc` — no-op, CPU 14/14, CUDA+MPI 6/6 |
+| PR-1a ядра `zone_verlet.cuh` | ✅ | `4edfc2d` — `VerletListBitwiseVsTiles` (≡ tiles побитово) |
+| PR-1b-i интеграция в кольцо, K=1 | ✅ | `58994bc` — ≡ cell-путь побитово |
+| PR-1b-ii persistent reuse K>1 + критерий `2·R_buf` + broadcast | ✅ | `f10081f` — `VerletReuseBitwiseVsCells` (GATE-02/03), racecheck 0 hazards |
+| PR-2 K-aware fallback (И1) | ✅ | `2e6716f` — `VerletFallbackBitwiseVsCells` (GATE-06/07) |
+| Бенч (выигрыш + новый флагман) | ✅ | `674b973` — 3.73e7 a-st/s (1M mixed FMA), `TD_MD_Core_Bench` §Verlet |
+| GATE-01 standalone геометрический Oracle (NL-INV-1) | ✅ | `ca77bb2` — `VerletListGeometricOracle` |
+| **Sparse cross-role CSR (память 1e7)** | ⏳ **отложено** | см. ниже |
+| PR-3 гибридный префикс `d_(1)+d_(2)` (И2/И4) | ⏳ backlog | после измеренного потолка |
+| PR-4 дрейф-коррекция L2 (И3) | ⏳ backlog | research-ось |
+
+**Что работает и доказано:** детерминированное переиспользование списка соседей (K>1) с `2·R_buf`-критерием и K-aware fallback; побитово ≡ cell-путь (GATE-02/03), fallback ≡ cells, независимый геометрический оракул NL-INV-1 (GATE-01), racecheck/memcheck чисты, CUDA+MPI 6/6, CPU 14/14. **Новый флагман 3.73e7 atom-steps/s** (1M, mixed, FMA), ×1.49 к прежнему.
+
+**Остаток — sparse cross-role CSR (единственное до `verlet_reuse` default-on):**
+flat-cap CSR `cap·max_neigh` на каждую из 3·n (зона,роль) помещается на 1M
+(~3–4 ГБ), но на **1e7 ≈9 ГБ только списков** — сверх бюджета 3.5 ГиБ.
+NEXT/PREV разрежены (партнёры только у приграничных атомов), но сейчас
+аллоцируются на всю `cap`. **Безопасное (без overflow) уменьшение через меньший
+`max_neigh_cross` — лишь ~×0.6** (cap-пропорционально). Реальный ×3 требует
+**boundary-пропорциональной** ёмкости cross-idx (`~cap·(rcut+skin)/w`), что
+геометро-зависимо и при патологической кластеризации даёт overflow→HALT (громко,
+не молча — а GATE-02 поймал бы и молчаливый пропуск). ⇒ отдельный аккуратный
+заход с mem-probe-тестом, не торопясь. До него `verlet_reuse` — **opt-in**
+(master-флаг по умолчанию OFF); на ≤1M всё работает и измерено.
