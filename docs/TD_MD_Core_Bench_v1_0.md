@@ -233,3 +233,34 @@ Fermi-LAMMPS на melt-бенче; после нормировки на сосе
 кольца — все три не свойства TD-метода. По детерминизму мы в классе AMBER SPFP
 (побитово run-to-run И 1-vs-z в обоих режимах), строже LAMMPS/HOOMD/OpenMM
 по умолчанию. Одно-GPU пик — не целевая функция движка.
+
+## Verlet-skin reuse (PR-2, ветка verlet-skin · 2026-06-13)
+
+`--verlet --skin S` (persistent пер-зонный список, K-aware fallback). Различное
+таймирование t(W+steps)−t(W), `--ring-only --skip-t0`. Verlet vs cell-путь в
+одном прогоне (одинаковые условия). skin=1.0 Å ⇒ K≈25–35 (1 перестройка на
+прогон — почти чистый reuse).
+
+| N | конфиг | режим / сборка | cells, a-st/s | **verlet, a-st/s** | verlet/cells |
+|---|---|---|---|---|---|
+| 42 592 | z=4, n=16 | fp64, verify | 9.40e6 | **1.49e7** | **×1.59** |
+| 1 048 576 | z=4, n=32 | fp64, verify | 2.43e7 | **3.13e7** | ×1.29 |
+| 1 048 576 | z=4, n=32 | mixed, verify | 2.71e7 | **3.36e7** | ×1.24 |
+| 1 048 576 | z=4, n=32 | **mixed, FMA** | 2.88e7 | **3.73e7** | ×1.30 |
+
+**Новый флагман: 3.73e7 atom-steps/s** (1M, mixed, FMA, reuse) — ×1.49 к
+прежнему задокументированному флагману 2.50e7 (cells). Выигрыш растёт к меньшим
+N (×1.59 на 42.6k): на 1M зона крупнее, cell-build и так хорошо амортизирован
+occupancy, и доминирует FP64-геометрия пары (вывод `VERLET_SKIN_DESIGN`/
+`PERF_LANDSCAPE` подтверждён — reuse убирает амортизацию cell-build + просева
+кандидатов, но НЕ сам force-eval ~28–31 FP64-соседа). Это ниже оптимистичных
+~2× роадмапа — честно, по той же причине.
+
+**Память:** flat-cap CSR (cap·max_neigh на (зона,роль), 3·n буферов) — на 1M
+помещается (~1 ГБ списков + слот-пул, итого ~3–4 ГБ из 15.5). На **1e7 flat ≈
+9 ГБ только списков — сверх бюджета**; нужен sparse cross-role CSR (NEXT/PREV
+разрежены — только приграничные атомы): task hardening. До него `verlet_reuse` —
+opt-in (master-флаг по умолчанию OFF).
+
+Воспроизведение: `./build-cuda/bench_conveyor[_fma] --cells 64 --zones 32
+--nodes 4 --steps 20 --ring-only --skip-t0 --verlet --skin 1.0 [--mode mixed]`.

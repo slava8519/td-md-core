@@ -154,7 +154,8 @@ double run_baseline(const core::AtomSoA<double>& init, const core::Box& box,
 template <typename PairF>
 double run_ring(const core::AtomSoA<double>& init, const core::Box& box,
                 const PairF& pot, long steps, double dt, int zones, int nodes,
-                bool mixed, bool cells, bool skip_t0) {
+                bool mixed, bool cells, bool skip_t0, bool verlet = false,
+                double skin = 1.0, long* rebuilds = nullptr) {
   core::ConveyorOptions o;
   o.steps = steps;
   o.n_zones = zones;
@@ -164,12 +165,16 @@ double run_ring(const core::AtomSoA<double>& init, const core::Box& box,
   o.mixed_transport = mixed;
   o.cell_lists = cells;
   o.skip_t0_forces = skip_t0;
+  o.verlet_reuse = verlet;
+  o.verlet_default = verlet;  // active from the cold start (bench)
+  o.verlet_skin = skin;
   core::AtomSoA<double> a = init;
   const double t0 = now_s();
   auto r = tdcu::run_conveyor_gpu(a, box, kRcut, pot, o);
   const double t = now_s() - t0;
   if (r.halt != core::Halt::None)
     std::printf("ring HALT: %s\n", r.halt_msg.c_str());
+  if (rebuilds) *rebuilds = r.verlet_rebuilds;
   return t;
 }
 
@@ -257,7 +262,8 @@ int main(int argc, char** argv) {
   int cells = 14, zones = 8, nodes = 4;
   long steps = 30;
   bool mixed = false, probe = false, use_cells = true, skip_t0 = false,
-       ring_only = false, vdet = false;
+       ring_only = false, vdet = false, use_verlet = false;
+  double skin = 1.0;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&] { return std::stol(argv[++i]); };
@@ -271,6 +277,8 @@ int main(int argc, char** argv) {
     else if (a == "--skip-t0") skip_t0 = true;
     else if (a == "--ring-only") ring_only = true;  // baseline O(N²) infeasible at 1e6
     else if (a == "--verify-det") vdet = true;
+    else if (a == "--verlet") use_verlet = true;            // PR-2: list reuse
+    else if (a == "--skin") skin = std::stod(argv[++i]);    // Å
   }
 
   cudaDeviceProp p{};
@@ -332,6 +340,19 @@ int main(int argc, char** argv) {
                 nodes, zones, tr, as_r);
     if (!ring_only)
       std::printf("  ring speedup over baseline: x%.3f  [%s]\n", tb / tr, mode);
+    if (use_verlet) {  // PR-2: persistent reuse vs the cell-raster ring
+      long reb = 0;
+      run_ring(atoms, box, pot, W, dt, zones, nodes, mixed, use_cells, skip_t0,
+               true, skin, &reb);  // warmup
+      const double tv = run_ring(atoms, box, pot, W + steps, dt, zones, nodes,
+                                 mixed, use_cells, skip_t0, true, skin, &reb) -
+                        run_ring(atoms, box, pot, W, dt, zones, nodes, mixed,
+                                 use_cells, skip_t0, true, skin, &reb);
+      const double as_v = double(atoms.n) * steps / tv;
+      std::printf("  TD ring  VERLET skin=%.2f:  %8.3f s  -> %.3e atom-steps/s "
+                  "(%ld rebuilds / %ld steps)\n", skin, tv, as_v, reb, W + steps);
+      std::printf("  verlet speedup over cells:  x%.3f  [%s]\n", tr / tv, mode);
+    }
   };
   if (mixed) bench(make_lj32());
   else bench(make_lj64());
