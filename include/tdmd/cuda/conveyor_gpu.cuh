@@ -386,13 +386,21 @@ class GpuTimeConveyor {
       // density, x2 headroom + floor. A truncated atom trips the overflow flag
       // (Halt::Internal), never a silent miss. NB [ENG]: this flat per-atom
       // stride is generous for correctness at test scale; the 1e7 memory
-      // tightening (sparse cross-role CSR) is a follow-up (PR-1b-ii).
+      // strides (CSR capacity = cap*stride). A truncated atom trips the
+      // overflow flag (Halt::Internal), never a silent miss.
+      //   SELF: full (rcut+skin) sphere.
+      //   NEXT/PREV (sparse cross-role): the three roles PARTITION the same
+      //   neighbour sphere, so an atom's cross-partners in ONE adjacent zone
+      //   are at most the HALF-sphere reaching across that face — half the
+      //   storage, guaranteed-safe (the per-atom cap bounds it; no geometry
+      //   estimate, no overflow path). Cuts the 1e7 list footprint ~2x.
       const double vol = box_.len(0) * box_.len(1) * box_.len(2);
       const double dens = vol > 0 ? double(atoms_.n) / vol : 0.0;
       const double rl = rcut_ + o_.verlet_skin;
-      max_neigh_ = std::max(
-          64, int(2.0 * (4.0 / 3.0) * 3.14159265358979323846 * rl * rl * rl *
-                   dens) + 16);
+      const double kPi = 3.14159265358979323846;
+      const double sphere = (4.0 / 3.0) * kPi * rl * rl * rl * dens;
+      max_neigh_ = std::max(64, int(2.0 * sphere) + 16);
+      max_neigh_cross_ = std::max(32, int(2.0 * 0.5 * sphere) + 8);  // half-sphere
     }
     if (o_.cell_lists || o_.verlet_reuse) {
       const double len[3] = {box_.len(0), box_.len(1), box_.len(2)};
@@ -547,9 +555,11 @@ class GpuTimeConveyor {
       vl_off_.assign(std::size_t(n_) * kRoles, nullptr);
       vl_idx_.assign(std::size_t(n_) * kRoles, nullptr);
       for (std::size_t s = 0; s < vl_off_.size(); ++s) {
+        const int role = int(s % kRoles);             // 0=SELF, 1/2=cross
+        const int stride = role == 0 ? max_neigh_ : max_neigh_cross_;
         TDMD_CU(cudaMalloc(&vl_off_[s], sizeof(int) * (cap_ + 1)));
         TDMD_CU(cudaMalloc(&vl_idx_[s],
-                           sizeof(int) * std::size_t(cap_) * max_neigh_));
+                           sizeof(int) * std::size_t(cap_) * stride));
       }
     }
   }
@@ -840,6 +850,7 @@ class GpuTimeConveyor {
         const std::size_t vk = std::size_t(A.fsm.id) * kRoles + role;
         int* off = vl_off_[vk];
         int* idx = vl_idx_[vk];
+        const int stride = role == 0 ? max_neigh_ : max_neigh_cross_;
         const int gc = (A.n_atoms + kVerletBlock - 1) / kVerletBlock;
         if (rebuild_now_pass) {
           const CellGrid bgrid = zone_grid(B.fsm.id);
@@ -848,7 +859,7 @@ class GpuTimeConveyor {
           verlet_count_kernel<<<gc, kVerletBlock, 0, nb.stream>>>(
               da.arr(0), da.arr(1), da.arr(2), A.n_atoms, db.arr(0), db.arr(1),
               db.arr(2), geom_list_, bgrid, db.starts(ncells_),
-              db.counts(ncells_), db.order(), same, max_neigh_, nb.d_flags,
+              db.counts(ncells_), db.order(), same, stride, nb.d_flags,
               nb.v_counts);
           std::size_t tb = nb.cubtmp_bytes;
           TDMD_CU(cub::DeviceScan::ExclusiveSum(nb.d_cubtmp, tb, nb.v_counts,
@@ -856,7 +867,7 @@ class GpuTimeConveyor {
           verlet_fill_kernel<<<gc, kVerletBlock, 0, nb.stream>>>(
               da.arr(0), da.arr(1), da.arr(2), A.n_atoms, db.arr(0), db.arr(1),
               db.arr(2), geom_list_, bgrid, db.starts(ncells_),
-              db.counts(ncells_), db.order(), same, max_neigh_, off, idx);
+              db.counts(ncells_), db.order(), same, stride, off, idx);
         }
         zone_pair_verlet_kernel<PairF><<<gc, kVerletBlock, 0, nb.stream>>>(
             args, geom_, pot_, off, idx);
@@ -1300,7 +1311,8 @@ class GpuTimeConveyor {
   core::ZoneDecomposition zd_;
   int n_ = 1, z_ = 1, Z_ = 1, S_ = 3, cap_ = 0;
   int ncells_ = 1;
-  int max_neigh_ = 1;  // PR-1: per-atom Verlet stride (CSR capacity = cap*this)
+  int max_neigh_ = 1;       // PR-1: SELF per-atom Verlet stride
+  int max_neigh_cross_ = 1;  // PR-1b-ii sparse: NEXT/PREV stride (half-sphere)
   // PR-1b-ii: persistent Verlet lists keyed by (zone-id, role), role ∈
   // {SELF,NEXT,PREV} — a zone pairs only with itself + its slab neighbours.
   // SHARED across nodes (a list built at the rebuild step is read at later
