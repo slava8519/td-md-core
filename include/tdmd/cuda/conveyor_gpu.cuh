@@ -644,6 +644,7 @@ class GpuTimeConveyor {
     // THIS pass's broadcast decision (uniform across zones).
     double skin_in = 0.0, skin_out = 0.0;
     bool rebuild_now_pass = true, rebuild_next = false;
+    uint8_t verlet_active_pass = 0, va_next = 0;  // PR-2: K-aware fallback mode
     Lambda agg{0.0, 0.0, std::numeric_limits<double>::infinity()};
     double ke = 0.0;
 
@@ -672,8 +673,9 @@ class GpuTimeConveyor {
           s.lam_in = lam0_;
           if (arrived == 0) {
             dt = o_.dt_initial;
-            skin_in = 0.0;          // cold start: build all lists on pass 1
-            rebuild_now_pass = true;
+            skin_in = 0.0;          // cold start
+            verlet_active_pass = o_.verlet_default ? 1 : 0;  // PR-2 default mode
+            rebuild_now_pass = verlet_active_pass != 0;      // build iff active
           }
           s.fsm.type = core::initial_zone_type(1);
         } else if (b_in) {
@@ -700,8 +702,9 @@ class GpuTimeConveyor {
           s.lam_in = {gh.hdr.v_full, gh.hdr.a_full, gh.hdr.k2cap_full};
           if (arrived == 0) {
             dt = gh.hdr.dt_next;
-            skin_in = gh.hdr.skin_consumed;        // carried budget
-            rebuild_now_pass = gh.hdr.rebuild_now;  // broadcast decision
+            skin_in = gh.hdr.skin_consumed;            // carried budget
+            rebuild_now_pass = gh.hdr.rebuild_now;      // broadcast decisions
+            verlet_active_pass = gh.hdr.verlet_active;  // (uniform per pass)
           }
           const DevSlot& d = nb.slot[std::size_t(s.dev)];
           if (o_.mixed_transport) {
@@ -732,8 +735,9 @@ class GpuTimeConveyor {
           s.lam_in = {gh.hdr.v_full, gh.hdr.a_full, gh.hdr.k2cap_full};
           if (arrived == 0) {
             dt = gh.hdr.dt_next;
-            skin_in = gh.hdr.skin_consumed;        // carried budget
-            rebuild_now_pass = gh.hdr.rebuild_now;  // broadcast decision
+            skin_in = gh.hdr.skin_consumed;            // carried budget
+            rebuild_now_pass = gh.hdr.rebuild_now;      // broadcast decisions
+            verlet_active_pass = gh.hdr.verlet_active;  // (uniform per pass)
           }
           // INV-2: the payload copy is ordered before this wait by the
           // record-before-push / pop-before-wait protocol invariant.
@@ -778,11 +782,14 @@ class GpuTimeConveyor {
       }
       TDMD_CU(cudaMemsetAsync(d.raw, 0, 3 * sizeof(long long) * cap_,
                               nb.stream));
-      // verlet_reuse: build cells only on a rebuild pass (the materialisation
-      // needs them); on a reuse pass skip the build entirely — that is the
-      // amortisation win. Plain cell path: always.
+      // verlet_reuse + active: build cells only on a rebuild pass (the
+      // materialisation needs them); a reuse pass skips the build — the
+      // amortisation win. Fallback (verlet_active=0, cell-raster path) and the
+      // plain cell path build every pass.
       const bool build_cells =
-          o_.verlet_reuse ? rebuild_now_pass : o_.cell_lists;
+          o_.verlet_reuse
+              ? (verlet_active_pass ? rebuild_now_pass : true)
+              : o_.cell_lists;
       if (build_cells) {  // rebuild cell list at x_h
         TDMD_CU(cudaMemsetAsync(d.counts(ncells_), 0, sizeof(int) * ncells_,
                                 nb.stream));
@@ -822,7 +829,7 @@ class GpuTimeConveyor {
                          da.rfx(),  da.rfy(),  da.rfz(),  nb.d_pe,
                          nb.d_mr2,  nb.d_flags, same,     energy};
       const int grid = (A.n_atoms + kZoneBlock - 1) / kZoneBlock;
-      if (o_.verlet_reuse) {
+      if (o_.verlet_reuse && verlet_active_pass) {
         // PR-1b-ii: persistent (zone,role) list. On a rebuild pass materialise
         // from B's cells at rcut+skin into the shared buffer; on a reuse pass
         // skip the build and force from the stored list. The verlet force
@@ -853,7 +860,8 @@ class GpuTimeConveyor {
         }
         zone_pair_verlet_kernel<PairF><<<gc, kVerletBlock, 0, nb.stream>>>(
             args, geom_, pot_, off, idx);
-      } else if (o_.cell_lists) {  // culled path — bitwise ≡ tiles (B1)
+      } else if (o_.cell_lists || o_.verlet_reuse) {  // cell path — also the
+        // PR-2 fallback (verlet_active=0); bitwise ≡ tiles (B1)
         const CellGrid bgrid = zone_grid(B.fsm.id);
         zone_pair_cells_kernel<PairF><<<grid, kZoneBlock, 0, nb.stream>>>(
             args, geom_, pot_, bgrid, db.starts(ncells_), db.counts(ncells_),
@@ -1017,7 +1025,8 @@ class GpuTimeConveyor {
             dt_next = o_.auto_step
                           ? core::buffer::auto_dt(lamb.v, dt, o_.ts, lamb.k2cap)
                           : o_.dt_initial;
-            decide_rebuild(skin_in, R_buf, skin_out, rebuild_next);
+            decide_pass(skin_in, R_buf, verlet_active_pass, skin_out,
+                        rebuild_next, va_next);
           }
           gh.hdr.dt_next = (sent == 0) ? dt_next : 0.0;
           gh.hdr.v_full = lamb.v;
@@ -1025,7 +1034,7 @@ class GpuTimeConveyor {
           gh.hdr.k2cap_full = lamb.k2cap;
           gh.hdr.skin_consumed = skin_out;  // broadcast to EVERY header
           gh.hdr.rebuild_now = rebuild_next ? 1 : 0;
-          gh.hdr.verlet_active = o_.verlet_reuse ? 1 : 0;
+          gh.hdr.verlet_active = va_next;
           gh.n_atoms = s.n_atoms;
           gh.dst_slot = -1;  // the receiver picks its own slot
           if (o_.mixed_transport) {
@@ -1094,7 +1103,8 @@ class GpuTimeConveyor {
           dt_next = o_.auto_step
                         ? core::buffer::auto_dt(lam.v, dt, o_.ts, lam.k2cap)
                         : o_.dt_initial;
-          decide_rebuild(skin_in, R_buf, skin_out, rebuild_next);
+          decide_pass(skin_in, R_buf, verlet_active_pass, skin_out,
+                      rebuild_next, va_next);
         }
         gh.hdr.dt_next = (sent == 0) ? dt_next : 0.0;
         gh.hdr.v_full = lam.v;
@@ -1102,7 +1112,7 @@ class GpuTimeConveyor {
         gh.hdr.k2cap_full = lam.k2cap;
         gh.hdr.skin_consumed = skin_out;  // broadcast to EVERY header
         gh.hdr.rebuild_now = rebuild_next ? 1 : 0;
-        gh.hdr.verlet_active = o_.verlet_reuse ? 1 : 0;
+        gh.hdr.verlet_active = va_next;
         gh.n_atoms = s.n_atoms;
         gh.dst_slot = dst;
         core::ZoneFSM::apply(s.fsm, core::ZoneEvent::SEND);  // T5
@@ -1120,8 +1130,8 @@ class GpuTimeConveyor {
       PassSlot& s = slot[std::size_t(j)];
       if (j == 0) {
         core::seed_first_zone(s.fsm);  // §7.1
-        if (o_.verlet_reuse && rebuild_now_pass)  // once per pass (rebuild_now
-          verlet_rebuilds_.fetch_add(1, std::memory_order_relaxed);  // uniform)
+        if (o_.verlet_reuse && verlet_active_pass && rebuild_now_pass)
+          verlet_rebuilds_.fetch_add(1, std::memory_order_relaxed);  // per pass
       }
       if (j > 0 && !slot[std::size_t(j - 1)].computed)
         throw std::logic_error("gpu conveyor: INV-1 violated");
@@ -1250,14 +1260,32 @@ class GpuTimeConveyor {
   std::size_t packed_bytes() const {
     return sizeof(double) * cap_ + 9 * sizeof(int) * std::size_t(cap_);
   }
-  // PR-1b-ii skin recurrence (NL-INV-2a): charge 2*R_buf — the per-step pair
-  // approach bound INV-4 enforces (R_buf = C_buf*v_pred*dt). z-independent (a
-  // scalar over the lagged Λ-forecast), so the rebuild sequence is too.
-  void decide_rebuild(double skin_in, double R_buf, double& skin_out,
-                      bool& rebuild) const {
-    skin_out = skin_in + 2.0 * R_buf;
-    rebuild = (skin_out >= o_.verlet_skin);
-    if (rebuild) skin_out = 0.0;
+  // PR-1b-ii skin recurrence (NL-INV-2a) + PR-2 K-aware fallback (I1). All
+  // inputs are z-independent scalars over the lagged Λ-forecast, so the whole
+  // decision (skin budget, rebuild, AND verlet_active) is bitwise z-independent.
+  //   * charge 2*R_buf — the per-step pair-approach bound INV-4 enforces.
+  //   * K_pred = skin/(2*R_buf): predicted reuse factor. Two-threshold
+  //     hysteresis (K_on > K_off) flips verlet_active without chatter; below
+  //     break-even we fall back to the cell-raster path (worst case == current
+  //     engine, not "+tax"). A 0->1 turn-on forces a rebuild (no list yet).
+  void decide_pass(double skin_in, double R_buf, uint8_t va_prev,
+                   double& skin_out, bool& rebuild, uint8_t& va_next) const {
+    const double charge = 2.0 * R_buf;
+    const double K_pred = charge > 1e-300
+                              ? o_.verlet_skin / charge
+                              : std::numeric_limits<double>::infinity();
+    va_next = va_prev;
+    if (va_prev == 0 && K_pred >= o_.verlet_K_on) va_next = 1;
+    else if (va_prev == 1 && K_pred < o_.verlet_K_off) va_next = 0;
+    if (!va_next) {                 // fallback (cell-raster): budget idle
+      rebuild = false; skin_out = 0.0;
+    } else if (va_prev == 0) {      // turned ON: no list yet -> force rebuild
+      rebuild = true; skin_out = 0.0;
+    } else {
+      skin_out = skin_in + charge;
+      rebuild = (skin_out >= o_.verlet_skin);
+      if (rebuild) skin_out = 0.0;
+    }
   }
   CellGrid zone_grid(int zone_id) const {
     const double len[3] = {box_.len(0), box_.len(1), box_.len(2)};

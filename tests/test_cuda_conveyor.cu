@@ -217,6 +217,37 @@ TEST(CudaConveyor, VerletReuseBitwiseVsCells) {
                                      // => ~39 reuse steps (strong superset test)
 }
 
+// --- PR-2 (I1): K-aware fallback to cell-raster == current engine, bitwise ---
+// Below break-even the engine must run the cell-raster path (worst case ==
+// today's engine, not "+tax"), deterministically and z-independently. Forced
+// with K_on=1e9 (never turns on). verlet_rebuilds==0 proves no list was ever
+// built. GATE-06 (flip determinism) up-direction is covered by VerletReuse
+// (verlet_default=false there => all z turn on at the same pass, bitwise).
+
+TEST(CudaConveyor, VerletFallbackBitwiseVsCells) {
+  const auto lj = make_lj(0.4, 2.55, kRcut);
+  for (bool pbc : {false, true}) {
+    core::Box box;
+    auto init = make_fcc(box, 2, 2, 8, pbc);
+    core::thermal::maxwell_init(init, 300.0, 51);
+    core::ConveyorOptions oc;
+    oc.steps = 30; oc.n_zones = 4; oc.n_nodes = 1; oc.dt_initial = 0.001;
+    const auto cells = run_gpu(init, box, oc, lj);
+    for (int z : {1, 2, 3}) {
+      auto ov = oc;
+      ov.n_nodes = z;
+      ov.verlet_reuse = true;
+      ov.verlet_default = false;
+      ov.verlet_skin = 1.0;
+      ov.verlet_K_on = 1e9;  // never crosses => pure cell-raster fallback
+      core::ConveyorResult rv;
+      const auto verlet = run_gpu(init, box, ov, lj, &rv);
+      EXPECT_TRUE(bitwise_eq(cells, verlet)) << "pbc=" << pbc << " z=" << z;
+      EXPECT_EQ(rv.verlet_rebuilds, 0) << "must stay in fallback";
+    }
+  }
+}
+
 // --- auto dt: the Λ-chain fed by DEVICE reductions matches the CPU ---
 
 TEST(CudaConveyor, LjAutoDtMatchesCpuConveyor) {
