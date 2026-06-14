@@ -55,8 +55,10 @@ class EamRing {
     if (o_.steps < 1) throw std::invalid_argument("eam_ring: steps must be >= 1");
     if (o_.n_nodes < 1) throw std::invalid_argument("eam_ring: n_nodes must be >= 1");
     if (!(o_.dt_initial > 0.0)) throw std::invalid_argument("eam_ring: dt_initial > 0");
-    if (box_.periodic[2])
-      throw std::invalid_argument("eam_ring: periodic-z EAM ring is a follow-up (free-z only)");
+    // periodic-z is supported (PR-E3b-PBC): cyclic window + defer_head + tail-
+    // batched sends. ZoneDecomposition::build rejects periodic n_zones in 2..4
+    // for reach_mult=2, so PBC only reaches n=1 (free path) or n>=5 (distinct
+    // cyclic zones — no window dedup ever needed).
     fb_ = pot_.math.density_fracbits();  // 44 (Q19.44) or 40 (Q23.40)
   }
 
@@ -126,6 +128,8 @@ class EamRing {
     const int in_edge = (k - 1 + z_) % z_;
     const int out_edge = k;
     const auto io = core::node_io_order(k + 1);  // §7.4 parity (1-based)
+    const int r = box_.periodic[2] ? int((h - 1) % n_) : 0;  // pass-order rotation
+    const bool defer_head = box_.periodic[2] && n_ > 1;      // §7.2 closure ([ENG])
     const core::PairGeom geom(box_, rcut_);
     const double rho_cap = pot_.math.density_grid_max();
 
@@ -146,7 +150,7 @@ class EamRing {
         } else if (!transport_->recv(in_edge, s.msg)) {
           return false;
         }
-        const int want_id = arrived;  // free-z: no pass rotation (r=0)
+        const int want_id = (r + arrived) % n_;  // PBC: pass rotation (free-z: r=0)
         if (s.msg.hdr.zone_id != want_id || s.msg.hdr.step_h != h - 1 ||
             s.msg.hdr.sent_pos != arrived)
           throw std::logic_error("eam_ring: ring arrival out of order");
@@ -248,12 +252,23 @@ class EamRing {
 
     // finalize CENTER zone j over the resident window {j-1, j, j+1} (free-z).
     auto finalize_owned = [&](int j) -> bool {
-      // window slot positions (free-z: drop out-of-range)
+      // window slot positions. PBC: CYCLIC {(j-1)%n, j, (j+1)%n} (n>=5 ⇒ all
+      // distinct). free-z: drop out-of-range. (PR-E3b-PBC)
       int wslots[3], nw = 0;
-      for (int d = -1; d <= 1; ++d) {
-        const int p = j + d;
-        if (p >= 0 && p < n_) wslots[nw++] = p;
+      if (box_.periodic[2]) {
+        wslots[nw++] = (j - 1 + n_) % n_;
+        wslots[nw++] = j;
+        wslots[nw++] = (j + 1) % n_;
+      } else {
+        for (int d = -1; d <= 1; ++d) {
+          const int p = j + d;
+          if (p >= 0 && p < n_) wslots[nw++] = p;
+        }
       }
+      // self-drift the cyclic members: the scan-boundary ensure_drift(j-1,j,j+1)
+      // clamps out-of-range, so the wrap neighbour (owned 0 / n-1) isn't drifted
+      // there. ensure_drift is idempotent (checks s.drifted).
+      for (int t = 0; t < nw; ++t) ensure_drift(wslots[t]);
       // residence-precondition (adversarial fix): all window slots live.
       for (int t = 0; t < nw; ++t) {
         const Slot& w = slot[std::size_t(wslots[t])];
@@ -310,11 +325,16 @@ class EamRing {
       return !halt_on_.load(std::memory_order_relaxed);
     };
 
-    // --- the pass (free-z): finalize CENTER j at scan j; send the DELAYED j-1 ---
+    // --- the pass. free-z: finalize CENTER j at scan j, send the DELAYED j-1.
+    // PBC (defer_head): finalize owned 1..n-1 in-scan, defer owned 0 to the tail
+    // (its cyclic window {n-1,0,1} needs slot n-1 = last arrival); ALL sends are
+    // tail-batched in slot order 1,2,...,n-1,0 (head last). ---
     for (int j = 0; j < n_; ++j) {
       for (core::IoOp op : io) {
         if (op == core::IoOp::SEND) {
-          if (j >= 2 && !send_slot(j - 2)) return false;  // delayed: j-2 finalized at scan j-1
+          // free-z: delayed in-scan send (j-2 finalized at scan j-1).
+          // defer_head: scan SEND is a NO-OP (sends are tail-batched).
+          if (!defer_head && j >= 2 && !send_slot(j - 2)) return false;
         } else {
           if (!ensure_arrival(std::min(j + 1, n_ - 1))) return false;
         }
@@ -323,11 +343,21 @@ class EamRing {
       if (!ensure_arrival(j)) return false;
       if (j + 1 < n_ && !ensure_arrival(j + 1)) return false;
       ensure_drift(j - 1); ensure_drift(j); ensure_drift(j + 1);
-      if (!finalize_owned(j)) return false;
+      if (!(defer_head && j == 0))  // PBC: owned 0 deferred to the tail
+        if (!finalize_owned(j)) return false;
     }
-    // tail: the last two finalized zones (n-2, n-1) are still unsent.
-    if (n_ >= 2 && !send_slot(n_ - 2)) return false;
-    if (!send_slot(n_ - 1)) return false;
+    if (defer_head) {
+      // owned 0 FIRST (reads slots n-1,0,1 + contributes to agg) — then send
+      // 1,2,...,n-1, then the head (slot 0) LAST at sent_pos n-1.
+      if (!finalize_owned(0)) return false;
+      for (int p = 1; p < n_; ++p)
+        if (!send_slot(p)) return false;
+      if (!send_slot(0)) return false;
+    } else {
+      // free-z: the last two finalized zones (n-2, n-1) are still unsent.
+      if (n_ >= 2 && !send_slot(n_ - 2)) return false;
+      if (!send_slot(n_ - 1)) return false;
+    }
 
     const double pass_pe = pe.value();
     if (!std::isfinite(pass_pe + ke))
@@ -370,13 +400,22 @@ class EamRing {
   bool membership_ok(const Slot& s) const {
     const double w = zd_.width;
     const double g = 0.5 * (w - 2.0 * rcut_);  // many-body reach (reach_mult=2)
-    const double lo_box = box_.lo[2];
+    const double lo_box = box_.lo[2], Lz = box_.len(2);
     const double lo = lo_box + s.fsm.id * w, hi = lo + w;
     const bool first = (s.fsm.id == 0), last = (s.fsm.id == n_ - 1);
     for (double zc : s.msg.z) {
+      double zw = zc;
+      if (box_.periodic[2]) zw -= Lz * std::floor((zw - lo_box) / Lz);  // wrap
       double excess = 0.0;
-      if (zc < lo) { excess = lo - zc; if (first) excess = 0.0; }
-      else if (zc > hi) { excess = zc - hi; if (last) excess = 0.0; }
+      if (zw < lo) {
+        excess = lo - zw;
+        if (box_.periodic[2]) excess = std::min(excess, zw + Lz - hi);  // cyclic min
+        else if (first) excess = 0.0;
+      } else if (zw > hi) {
+        excess = zw - hi;
+        if (box_.periodic[2]) excess = std::min(excess, lo + Lz - zw);
+        else if (last) excess = 0.0;
+      }
       if (excess > g) return false;
     }
     return true;

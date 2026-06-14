@@ -234,6 +234,103 @@ TEST(EamRing, VacuumGapEmptyZones) {
   }
 }
 
+// ===================== PR-E3b-PBC: periodic-z ring =====================
+namespace {
+// FCC slab made FULLY periodic in z (12 cells = exact lattice period ⇒ seamless
+// PBC nn via min-image). reach_mult=2 ⇒ periodic n_zones must be 1 or >=5.
+core::AtomSoA<double> make_fcc_pbc(core::Box& box) {
+  auto a = make_fcc(3, 3, 12, 4.05, box);
+  box.periodic[2] = true;
+  return a;
+}
+std::array<double, 3> total_momentum(const core::AtomSoA<double>& a) {
+  std::array<double, 3> p{0, 0, 0};
+  for (int i = 0; i < a.n; ++i) {
+    p[0] += a.mass[i] * a.vx[i]; p[1] += a.mass[i] * a.vy[i]; p[2] += a.mass[i] * a.vz[i];
+  }
+  return p;
+}
+}  // namespace
+
+// --- PBC: z=1 ring ≡ serial VV over the CYCLIC-window oracle, bitwise (the only
+// test that catches a wrong/clamped cyclic window — a deterministic miss) ---
+TEST(EamRingPBC, SingleNodeMatchesSerialVV) {
+  core::Box box;
+  auto base = make_fcc_pbc(box);
+  const auto m = test_eam();
+  EamPotential<double, AnalyticEam<double>> pot(m);
+  const double dt = 0.002; const long steps = 8;
+  core::AtomSoA<double> ref = base;
+  const auto zd = core::ZoneDecomposition::build(ref, box, 6, kRcut, 2);  // cyclic window
+  serial_vv(ref, box, pot, zd, steps, dt);
+  core::AtomSoA<double> ring = base;
+  const auto res = potentials::run_eam_ring(ring, box, pot, ring_opts(steps, 6, 1, dt));
+  ASSERT_EQ(int(res.halt), int(core::Halt::None)) << res.halt_msg;
+  EXPECT_TRUE(state_bitwise_equal(ring, ref)) << "PBC z=1 ring ≠ serial cyclic oracle";
+}
+
+// --- PBC 1-vs-z bitwise (rotation + defer_head + tail-batched sends) ---
+TEST(EamRingPBC, OneVsZBitwise) {
+  core::Box box;
+  auto base = make_fcc_pbc(box);
+  const auto m = test_eam();
+  EamPotential<double, AnalyticEam<double>> pot(m);
+  core::AtomSoA<double> ref = base;
+  const auto r1 = potentials::run_eam_ring(ref, box, pot, ring_opts(10, 6, 1, 0.002));
+  ASSERT_EQ(int(r1.halt), int(core::Halt::None)) << r1.halt_msg;
+  for (int z : {2, 3, 6}) {
+    core::AtomSoA<double> a = base;
+    const auto rz = potentials::run_eam_ring(a, box, pot, ring_opts(10, 6, z, 0.002));
+    ASSERT_EQ(int(rz.halt), int(core::Halt::None)) << "z=" << z << " " << rz.halt_msg;
+    EXPECT_TRUE(state_bitwise_equal(a, ref)) << "PBC z=" << z << " ≠ z=1 bitwise";
+  }
+}
+
+// --- PBC momentum conservation (fully periodic ⇒ no boundary force leak) ---
+TEST(EamRingPBC, MomentumConservation) {
+  core::Box box;
+  auto base = make_fcc_pbc(box);
+  const auto m = test_eam();
+  EamPotential<double, AnalyticEam<double>> pot(m);
+  const auto p0 = total_momentum(base);
+  core::AtomSoA<double> a = base;
+  const auto r = potentials::run_eam_ring(a, box, pot, ring_opts(60, 6, 3, 0.002));
+  ASSERT_EQ(int(r.halt), int(core::Halt::None)) << r.halt_msg;
+  const auto p1 = total_momentum(a);
+  for (int d = 0; d < 3; ++d)
+    EXPECT_LT(std::fabs(p1[d] - p0[d]), 1e-9) << "momentum drift, dim " << d;
+}
+
+// --- PBC §3.6-style long run: 1 node vs 4 nodes, zero deviation ---
+TEST(EamRingPBC, LongRunReplicaBitwise) {
+  core::Box box;
+  auto base = make_fcc_pbc(box);
+  const auto m = test_eam();
+  EamPotential<double, AnalyticEam<double>> pot(m);
+  const long steps = 150;
+  core::AtomSoA<double> ref = base;
+  const auto r1 = potentials::run_eam_ring(ref, box, pot, ring_opts(steps, 5, 1, 0.001));
+  ASSERT_EQ(int(r1.halt), int(core::Halt::None)) << r1.halt_msg;
+  core::AtomSoA<double> a = base;
+  const auto r4 = potentials::run_eam_ring(a, box, pot, ring_opts(steps, 5, 4, 0.001));
+  ASSERT_EQ(int(r4.halt), int(core::Halt::None)) << r4.halt_msg;
+  EXPECT_TRUE(state_bitwise_equal(a, ref)) << "PBC " << steps << "-step 1-vs-4 deviation";
+}
+
+// --- PBC anti-deadlock (n=1 free path; n>=5 cyclic; n in 2..4 throws at build) ---
+TEST(EamRingPBC, AntiDeadlock) {
+  core::Box box;
+  auto base = make_fcc_pbc(box);
+  const auto m = test_eam();
+  EamPotential<double, AnalyticEam<double>> pot(m);
+  for (int z : {1, 2, 3, 4, 5}) {
+    core::AtomSoA<double> a = base;
+    const auto r = potentials::run_eam_ring(a, box, pot, ring_opts(2 * z + 3, 5, z, 0.002));
+    EXPECT_EQ(int(r.halt), int(core::Halt::None)) << "z=" << z << " " << r.halt_msg;
+    EXPECT_EQ(r.steps_done, 2 * z + 3);
+  }
+}
+
 // --- anti-deadlock across node counts ---
 TEST(EamRing, AntiDeadlock) {
   core::Box box;

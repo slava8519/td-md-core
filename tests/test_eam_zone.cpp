@@ -171,6 +171,38 @@ TEST(EamZone, ForwardOnlyWindowDiverges) {
          "then be unnecessary (contradicts the adversarial halo finding)";
 }
 
+// --- cyclic (PBC) window vs a fully INDEPENDENT FP64 O(N²) min-image oracle.
+// The 1-vs-z test shares eam_window_force, so it cannot catch a shared cyclic-
+// window/kernel error; eam_direct_fp64 is a separate code path (adversarial
+// acceptance blind-spot closure). ---
+TEST(EamZone, PbcCyclicWindowVsFp64Oracle) {
+  core::Box box;
+  auto a = make_fcc(3, 3, 12, 4.05, box);  // periodic in all axes
+  ASSERT_TRUE(box.periodic[2]);
+  std::mt19937 rng(42);
+  std::uniform_real_distribution<double> jit(-0.05, 0.05);
+  for (int i = 0; i < a.n; ++i) { a.x[i] += jit(rng); a.y[i] += jit(rng); a.z[i] += jit(rng); }
+  const auto m = test_eam();  // rcut = kRcut = 3.0
+  potentials::EamPotential<double, AnalyticEam<double>> pot(m);
+
+  core::AtomSoA<double> zone = a;  // cyclic-window zone force (fixed-point), z=6
+  core::zero_forces(zone);
+  const auto zd = core::ZoneDecomposition::build(zone, box, 6, kRcut, 2);
+  potentials::zone_eam_pass(zone, box, zd, pot);
+
+  core::AtomSoA<double> oracle = a;  // independent FP64 O(N²) min-image EAM
+  core::zero_forces(oracle);
+  potentials::eam_direct_fp64<double, AnalyticEam<double>>(oracle, box, m, true);
+
+  double maxdev = 0;
+  for (int i = 0; i < a.n; ++i) {
+    maxdev = std::max(maxdev, std::fabs(zone.fx[i] - oracle.fx[i]));
+    maxdev = std::max(maxdev, std::fabs(zone.fy[i] - oracle.fy[i]));
+    maxdev = std::max(maxdev, std::fabs(zone.fz[i] - oracle.fz[i]));
+  }
+  EXPECT_LT(maxdev, 1e-10) << "cyclic window ≠ FP64 oracle: " << maxdev;
+}
+
 // --- residence guard: zone width < 2·rcut (rcut mismatch) HALTs, not silently
 // computes a wrong force (the determinism gates would not catch it) ---
 TEST(EamZone, NarrowZoneHalts) {
