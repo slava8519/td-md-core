@@ -37,3 +37,23 @@ via `eam_direct_fp64`, and compares to the frozen LAMMPS numbers at
 and a reference implementation. (Bit-for-bit vs LAMMPS is NOT claimed — that
 would need replicating LAMMPS's exact eval order; our bitwise contract is
 CPU↔GPU / 1-vs-z internally. M6_EAM_MANYBODY_DESIGN §7 [RISK].)
+
+## Frozen RDF reference (`eam_rdf_864.*`, PR-E7)
+
+`gen_rdf.in`: FCC-Al 6×6×6 (864 atoms), `velocity create 300 K`, **NVE** EAM
+(Al_zhou) equilibrated 1000 steps, then `compute rdf` time-averaged over 500
+steps (100 bins, cutoff 6.0 Å).
+
+| file | content |
+|---|---|
+| `eam_rdf_864.data` | the equilibrated config (positions + velocities) |
+| `eam_rdf_864.gr`   | LAMMPS time-averaged g(r): rows `bin r g(r) coord` |
+
+`Test_EAM_RDF` (default CI, no LAMMPS at run time) reads the config + `Al_zhou`,
+computes our g(r), and asserts the FCC shell **peak positions** (nn≈2.86, 2nd≈4.05,
+3rd≈4.96 Å) coincide with LAMMPS's within ±1 bin — a STRUCTURE cross-check on top
+of the E2 static force/PE match (~1e-12). **Deferred** (long-run physics
+experiments, not code PRs): the dynamics-averaged RDF from our own trajectory and
+melt-coexistence T_m — both need long NVE runs (our CPU EAM is O(N²)); the force
+match + NVE conservation + structure agreement already validate the EAM physics.
+See `_meta/VALIDATION_EXPERIMENT_2026-06-12.md` §5/§7 for the melt protocol.

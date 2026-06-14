@@ -186,6 +186,10 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_eam_zone PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_EAM_Zone COMMAND test_eam_zone)
 
+  add_executable(test_eam_rdf tests/test_eam_rdf.cpp)      # M6 PR-E7: RDF vs frozen LAMMPS
+  target_link_libraries(test_eam_rdf PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_EAM_RDF COMMAND test_eam_rdf)
+
   add_executable(test_eam_ring tests/test_eam_ring.cpp)    # M6 PR-E3b: threaded EAM ring
   target_link_libraries(test_eam_ring PRIVATE tdmd_core GTest::gtest_main Threads::Threads)
   add_test(NAME Test_EAM_Ring COMMAND test_eam_ring)
