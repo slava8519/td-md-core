@@ -331,6 +331,46 @@ TEST(EamRingPBC, AntiDeadlock) {
   }
 }
 
+// ===================== PR-E4: EAM NVE energy conservation =====================
+// Total energy E = PE + KE has bounded fluctuation (no secular drift) over a
+// long NVE run. The force-shifted analytic EAM is C1 ⇒ no shift-discontinuity
+// floor (unlike the pair Morse-shift NVE). Multi-zone ≡ 1-zone is already proven
+// bitwise (LongRunReplica); here we check the PHYSICS invariant.
+TEST(EamRing, NveEnergyConservation) {
+  core::Box box;
+  auto base = make_fcc_pbc(box);  // fully periodic ⇒ no surface, clean NVE
+  const auto m = test_eam();
+  potentials::EamPotential<double, AnalyticEam<double>> pot(m);
+  // 1000 steps (0.5 ps) stays within the static-membership margin g=0.5(w-2rcut)
+  // (atom migration past the slab is deferred to a future PR); enough to show the
+  // NVE invariant.
+  const long steps = 1000;
+  const double dt = 0.0005;
+  core::AtomSoA<double> a = base;
+  const auto r = potentials::run_eam_ring(a, box, pot, ring_opts(steps, 5, 3, dt));
+  ASSERT_EQ(int(r.halt), int(core::Halt::None)) << r.halt_msg;
+  ASSERT_EQ(int(r.stats.size()), int(steps));
+
+  // E(t) per pass; relative fluctuation + secular drift (2nd-half − 1st-half mean).
+  std::vector<double> E(steps);
+  for (long t = 0; t < steps; ++t) E[t] = r.stats[t].pe + r.stats[t].ke;
+  double emin = E[0], emax = E[0], e0 = E[0];
+  double s1 = 0, s2 = 0;
+  for (long t = 0; t < steps; ++t) {
+    emin = std::min(emin, E[t]); emax = std::max(emax, E[t]);
+    if (t < steps / 2) s1 += E[t]; else s2 += E[t];
+  }
+  const double mean1 = s1 / (steps / 2), mean2 = s2 / (steps - steps / 2);
+  const double scale = std::fabs(e0) + 1e-12;
+  const double fluct = (emax - emin) / scale;       // bounded oscillation
+  const double drift = std::fabs(mean2 - mean1) / scale;  // secular trend
+  // velocity-Verlet + C1 force ⇒ BOUNDED fluctuation (the PE/KE half-step phase
+  // oscillation, ~1e-4 here, not a defect) and ~ZERO secular drift (the real NVE
+  // invariant: no systematic energy gain/loss).
+  EXPECT_LT(fluct, 5e-4) << "energy fluctuation " << fluct;
+  EXPECT_LT(drift, 1e-5) << "secular energy drift " << drift;
+}
+
 // --- anti-deadlock across node counts ---
 TEST(EamRing, AntiDeadlock) {
   core::Box box;
