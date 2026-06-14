@@ -12,6 +12,7 @@
 #include <cmath>
 #include <map>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 #include "tdmd/core/fixed_accum.hpp"
@@ -192,6 +193,20 @@ TEST(Eam, DensityFracbitsGuard) {
   potentials::AnalyticEam<double> extreme;
   extreme.beta = 5.0;  // beyond even Q23.40
   EXPECT_THROW(extreme.density_fracbits(), std::runtime_error);
+}
+
+// --- P0 (adversarial finding): the fixed-point path is hardwired to Q19.44, so
+// a potential whose guard demands Q23.40 must HALT, not silently wrap. ---
+TEST(Eam, FixedPathRejectsQ23Fallback) {
+  core::Box box;
+  auto a = load72(box);
+  potentials::AnalyticEam<double> steep;
+  steep.beta = 3.3;  // density_fracbits()==40 (asserted in DensityFracbitsGuard)
+  steep.finalize();
+  ASSERT_EQ(steep.density_fracbits(), 40);
+  potentials::EamPotential<double, potentials::AnalyticEam<double>> pot(steep);
+  core::zero_forces(a);
+  EXPECT_THROW(potentials::eam_run_fixed(a, box, pot), std::runtime_error);
 }
 
 // --- IManyBodyPotential instance: fixed-point passes ≈ FP64 oracle (within

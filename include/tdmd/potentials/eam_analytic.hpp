@@ -1,5 +1,6 @@
 #pragma once
 #include <cmath>
+#include <limits>
 #include <stdexcept>
 
 // M6 PR-E1 — analytic Finnis–Sinclair EAM (Al-flavoured): the CPU FP64 ORACLE
@@ -97,6 +98,11 @@ struct AnalyticEam {
         "AnalyticEam: density bound exceeds even Q23.40 — ρ_a table too steep "
         "(M6 §4.1 load-time guard)");
   }
+
+  // Embedding F(ρ) is closed-form (valid for any ρ ≥ 0) — no tabulation grid,
+  // so no upper bound. The setfl/spline form (eam_spline.hpp) returns its finite
+  // grid top, which the drivers HALT past (vs LAMMPS's silent clamp).
+  double density_grid_max() const { return std::numeric_limits<double>::infinity(); }
 
  private:
   double phi_rc_ = 0.0, dphi_rc_ = 0.0, rhoa_rc_ = 0.0, drhoa_rc_ = 0.0;

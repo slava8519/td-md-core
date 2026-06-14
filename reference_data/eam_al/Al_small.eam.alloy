@@ -1,0 +1,12 @@
+# TDMD test fixture — not a real potential, do not use for simulation.
+# Format: setfl (single-species), N_rho=10, N_r=10.
+# Generated 2026-04-18 for tests/potentials/test_eam_file.cpp.
+1 Al
+10 0.1 10 0.5 5.0
+13 26.98 4.05 FCC
+0.0 -0.1 -0.2 -0.3 -0.4
+-0.5 -0.55 -0.6 -0.65 -0.7
+1.0 0.9 0.8 0.6 0.4
+0.25 0.15 0.08 0.03 0.01
+100.0 80.0 60.0 45.0 30.0
+20.0 12.0 7.0 3.0 1.0

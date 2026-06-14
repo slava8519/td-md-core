@@ -54,6 +54,17 @@ EamAccum eam_direct_fp64(AtomSoA<Real>& a, const Box& box, const Math& m,
       rho[j] += ra;
     }
 
+  // density-range guard (adversarial finding P1): a tabulated embedding F(ρ)
+  // has a finite grid; ρ past it would be silently clamped to the last knot
+  // (wrong force/energy under compression/melt, fully deterministic ⇒ invisible
+  // to 1-vs-z). Closed-form Math returns +inf here (never trips). HALT instead.
+  const double rho_cap = m.density_grid_max();
+  for (int i = 0; i < a.n; ++i)
+    if (rho[i] > rho_cap)
+      throw std::runtime_error(
+          "eam_direct_fp64: ρ exceeds the F(ρ) tabulation grid (compression "
+          "beyond table) — extend rho_max or this would be silently clamped");
+
   // pass 2: embedding F(ρ_i) — local per-atom; F'(ρ_i) feeds the force pass.
   std::vector<double> fp(a.n);
   for (int i = 0; i < a.n; ++i) {
@@ -139,6 +150,16 @@ constexpr PassDecl EamPotential<Real, Math>::kPasses[3];
 template <typename Real, typename Math>
 EamAccum eam_run_fixed(AtomSoA<Real>& a, const Box& box,
                        EamPotential<Real, Math>& pot) {
+  // P0 stopgap (adversarial finding): the fixed-point density buffer below is
+  // hardwired to DensityAccum = FixedAccum<44>. A potential whose load-time
+  // guard demands Q23.40 (density_fracbits()==40) would silently wrap int64 in
+  // <44> (the per-contribution add() guard ≈ coincides with the <44> ceiling).
+  // The dual-format dispatch lands with the ring in PR-E3; until then, HALT
+  // loudly rather than corrupt ρ. Normal Al returns 44 (no-op).
+  if (pot.math.density_fracbits() != 44)
+    throw std::runtime_error(
+        "eam_run_fixed: potential needs Q23.40 density, but this path is "
+        "hardwired to Q19.44 — dual-format dispatch lands in PR-E3");
   const PairGeom geom(box, pot.math.rcut);
   std::vector<core::fixed::DensityAccum> rho(a.n);
   std::vector<double> fp(a.n, 0.0);
@@ -156,7 +177,13 @@ EamAccum eam_run_fixed(AtomSoA<Real>& a, const Box& box,
             fn(i, j, PairGeomResult{dx, dy, dz, r2, std::sqrt(r2)});
           }
       };
-  for (int p = 0; p < 3; ++p) pot.run_pass(p, a, geom, st, visit);
+  pot.run_pass(0, a, geom, st, visit);  // density
+  const double rho_cap = pot.math.density_grid_max();  // P1 guard (see eam_direct_fp64)
+  for (int i = 0; i < a.n; ++i)
+    if (rho[i].value() > rho_cap)
+      throw std::runtime_error("eam_run_fixed: ρ exceeds the F(ρ) tabulation grid");
+  pot.run_pass(1, a, geom, st, visit);  // embedding
+  pot.run_pass(2, a, geom, st, visit);  // force
 
   for (int i = 0; i < a.n; ++i) {
     a.fx[i] += Real(fx[i].value());
