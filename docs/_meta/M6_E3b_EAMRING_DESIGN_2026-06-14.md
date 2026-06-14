@@ -1,6 +1,6 @@
 # TD-MD M6 PR-E3b — EamRing: threaded EAM TD-кольцо (дизайн, отдельный драйвер)
 
-> Статус: **[DESIGN]** (адверсариально проверено; критические правки детерминизма/дедлока внесены). Целевой потенциал — EAM (Финнис—Синклер, PR-E1), ядро силы — `potentials::zone_eam_pass` (PR-E3, `include/tdmd/potentials/eam_zone.hpp`). Единицы LAMMPS `metal`, ансамбль NVE. Точность-эталон — `deterministic_fp64`.
+> Статус: **✅ РЕАЛИЗОВАНО 2026-06-14** (free-z; PBC-z — follow-up). `include/tdmd/potentials/eam_ring.hpp` + `Test_EAM_Ring` (8 кейсов: z=1≡serial-VV, 1-vs-z fixed&auto-dt, dual-format Q23.40, 150-шаг §3.6-style 1-vs-4, vacuum-gap пустые зоны, overlap-HALT, anti-deadlock z=1..6). Состязательная приёмка прошла: 1 реальный баг (пустые зоны → ложный HALT) исправлен+покрыт; send-delay/полнота окна/deadlock/FSM/изоляция — SOUND. Дизайн ниже — [DESIGN] (адверсариально проверен до кода). Целевой потенциал — EAM (Финнис—Синклер, PR-E1), ядро силы — `potentials::zone_eam_pass` (PR-E3, `include/tdmd/potentials/eam_zone.hpp`). Единицы LAMMPS `metal`, ансамбль NVE. Точность-эталон — `deterministic_fp64`.
 
 ---
 

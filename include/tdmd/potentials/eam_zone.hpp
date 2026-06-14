@@ -55,82 +55,109 @@ inline std::vector<int> zone_eam_window(const core::ZoneDecomposition& zd, int z
   return w;
 }
 
+// M6 PR-E3b-1 — the 3-pass EAM force on ONE owned zone over a CONTIGUOUS window,
+// addressed by local index. Extracted from the per-zone body so BOTH the serial
+// oracle (global AtomSoA) and the threaded EamRing (fragmented per-zone payloads
+// gathered into a window) call the SAME code (the ring has no global AtomSoA
+// mid-pass). Bit-exact to the pre-refactor oracle by construction (same multiset
+// of int64 contributions). `key` is the canonical φ-once order (serial: global
+// atom index; ring: atom id) — either gives φ exactly once per undirected pair,
+// PE order-invariant. Forces written into wF{x,y,z}[owned] (local); pe/min_r2
+// accumulated. Caller zeroes the accumulators.
+template <typename Math, typename DensAccum>
+void eam_window_force(const double* wx, const double* wy, const double* wz,
+                      const long* key, int m, const int* owned, int n_owned,
+                      const Math& math, const core::PairGeom& geom, double rho_cap,
+                      std::vector<core::fixed::ForceAccum>& wFx,
+                      std::vector<core::fixed::ForceAccum>& wFy,
+                      std::vector<core::fixed::ForceAccum>& wFz,
+                      core::fixed::EnergyAccum& pe, double& min_r2) {
+  // pass 1: density for every window atom
+  std::vector<DensAccum> rho(m);
+  for (int aa = 0; aa < m; ++aa)
+    for (int bb = 0; bb < m; ++bb) {
+      if (bb == aa) continue;
+      double dx = wx[aa] - wx[bb], dy = wy[aa] - wy[bb], dz = wz[aa] - wz[bb], r2;
+      if (!geom.reduce(dx, dy, dz, r2)) continue;
+      double v, dv;
+      math.eval_rhoa(std::sqrt(r2), v, dv);
+      rho[aa].add(v);
+    }
+  // pass 2: embedding F'(ρ) for window atoms (+ density-range HALT, P1)
+  std::vector<double> fp(m);
+  for (int aa = 0; aa < m; ++aa) {
+    const double r = rho[aa].value();
+    if (r > rho_cap)
+      throw std::runtime_error("eam_window_force: ρ exceeds the F(ρ) grid");
+    double F, Fpv;
+    math.eval_F(r, F, Fpv);
+    fp[aa] = Fpv;
+  }
+  // pass 3: FULL-NEIGHBOUR force for OWNED atoms only
+  for (int o = 0; o < n_owned; ++o) {
+    const int ii = owned[o];
+    double Fi, Fpi;
+    math.eval_F(rho[ii].value(), Fi, Fpi);
+    pe.add(Fi);  // embedding energy, once per owned atom
+    for (int bb = 0; bb < m; ++bb) {
+      if (bb == ii) continue;
+      double dx = wx[ii] - wx[bb], dy = wy[ii] - wy[bb], dz = wz[ii] - wz[bb], r2;
+      const bool ok = geom.reduce(dx, dy, dz, r2);
+      min_r2 = std::min(min_r2, r2);  // before cutoff — captures overlaps too
+      if (!ok) continue;
+      const double r = std::sqrt(r2);
+      double phi, dphi, ra, dra;
+      math.eval_phi(r, phi, dphi);
+      math.eval_rhoa(r, ra, dra);
+      const double f_over_r = -(dphi + (fp[ii] + fp[bb]) * dra) / r;
+      wFx[ii].add(f_over_r * dx);
+      wFy[ii].add(f_over_r * dy);
+      wFz[ii].add(f_over_r * dz);
+      if (key[ii] < key[bb]) pe.add(phi);  // φ once per undirected pair (PE bitwise)
+    }
+  }
+}
+
 template <typename Real, typename Math, typename DensAccum>
 EamAccum zone_eam_pass_impl(core::AtomSoA<Real>& a, const core::Box& box,
                             const core::ZoneDecomposition& zd, const Math& math,
                             const std::vector<int>& order, bool symmetric) {
   const core::PairGeom geom(box, math.rcut);
   const int n = a.n;
-  std::vector<core::fixed::ForceAccum> Fx(n), Fy(n), Fz(n);
   core::fixed::EnergyAccum pe;
   double min_r2 = 1e300;  // overlap probe (B10) — system min over visited pairs
   const double rho_cap = math.density_grid_max();
-  std::vector<int> pos(n, -1);  // atom -> index within the current window
+  std::vector<int> pos(n, -1);  // global atom -> window-local index
 
   for (int zi : order) {
     const auto win = zone_eam_window(zd, zi, box.periodic[2], symmetric);
     const int m = int(win.size());
-    for (int aa = 0; aa < m; ++aa) pos[win[aa]] = aa;
+    // gather the window into contiguous arrays (key = global atom index)
+    std::vector<double> wx(m), wy(m), wz(m);
+    std::vector<long> key(m);
+    for (int aa = 0; aa < m; ++aa) {
+      const int g = win[aa];
+      wx[aa] = a.x[g]; wy[aa] = a.y[g]; wz[aa] = a.z[g]; key[aa] = g;
+      pos[g] = aa;
+    }
+    std::vector<int> owned;
+    owned.reserve(zd.members[zi].size());
+    for (int g : zd.members[zi]) owned.push_back(pos[g]);
 
-    // pass 1: density for every window atom
-    std::vector<DensAccum> rho(m);
-    for (int aa = 0; aa < m; ++aa) {
-      const int i = win[aa];
-      for (int bb = 0; bb < m; ++bb) {
-        if (bb == aa) continue;
-        const int j = win[bb];
-        double dx = a.x[i] - a.x[j], dy = a.y[i] - a.y[j], dz = a.z[i] - a.z[j], r2;
-        if (!geom.reduce(dx, dy, dz, r2)) continue;
-        double v, dv;
-        math.eval_rhoa(std::sqrt(r2), v, dv);
-        rho[aa].add(v);
-      }
-    }
-    // pass 2: embedding F'(ρ) for window atoms (+ density-range HALT, P1)
-    std::vector<double> fp(m);
-    for (int aa = 0; aa < m; ++aa) {
-      const double r = rho[aa].value();
-      if (r > rho_cap)
-        throw std::runtime_error("zone_eam_pass: ρ exceeds the F(ρ) grid");
-      double F, Fpv;
-      math.eval_F(r, F, Fpv);
-      fp[aa] = Fpv;
-    }
-    // pass 3: FULL-NEIGHBOUR force for OWNED atoms only
-    for (int i : zd.members[zi]) {
-      const int ii = pos[i];
-      double Fi, Fpi;
-      math.eval_F(rho[ii].value(), Fi, Fpi);
-      pe.add(Fi);  // embedding energy, once per owned atom
-      for (int bb = 0; bb < m; ++bb) {
-        const int j = win[bb];
-        if (j == i) continue;
-        double dx = a.x[i] - a.x[j], dy = a.y[i] - a.y[j], dz = a.z[i] - a.z[j], r2;
-        const bool ok = geom.reduce(dx, dy, dz, r2);
-        min_r2 = std::min(min_r2, r2);  // before cutoff — captures overlaps too
-        if (!ok) continue;
-        const double r = std::sqrt(r2);
-        double phi, dphi, ra, dra;
-        math.eval_phi(r, phi, dphi);
-        math.eval_rhoa(r, ra, dra);
-        const double f_over_r = -(dphi + (fp[ii] + fp[bb]) * dra) / r;
-        Fx[i].add(f_over_r * dx);
-        Fy[i].add(f_over_r * dy);
-        Fz[i].add(f_over_r * dz);
-        // pair energy ONCE per undirected pair (each pair is visited from both
-        // owned sides) ⇒ bitwise-equal to the Newton-3 monolith (φ quantized
-        // once), NOT 0.5·φ quantized twice (M6 PR-E3 adversarial finding).
-        if (i < j) pe.add(phi);
-      }
+    std::vector<core::fixed::ForceAccum> wFx(m), wFy(m), wFz(m);
+    eam_window_force<Math, DensAccum>(wx.data(), wy.data(), wz.data(), key.data(),
+                                      m, owned.data(), int(owned.size()), math,
+                                      geom, rho_cap, wFx, wFy, wFz, pe, min_r2);
+    // scatter owned forces back (each atom owned by exactly one zone ⇒ once)
+    for (int o = 0; o < int(owned.size()); ++o) {
+      const int loc = owned[o], g = win[loc];
+      a.fx[g] += Real(wFx[loc].value());
+      a.fy[g] += Real(wFy[loc].value());
+      a.fz[g] += Real(wFz[loc].value());
     }
     for (int aa = 0; aa < m; ++aa) pos[win[aa]] = -1;  // reset for next zone
   }
 
-  for (int i = 0; i < n; ++i) {
-    a.fx[i] += Real(Fx[i].value());
-    a.fy[i] += Real(Fy[i].value());
-    a.fz[i] += Real(Fz[i].value());
-  }
   EamAccum acc;
   acc.pe = pe.value();
   acc.min_r2 = min_r2;
