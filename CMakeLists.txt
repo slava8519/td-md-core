@@ -230,6 +230,20 @@ if(TDMD_BUILD_TESTS)
     add_test(NAME Test_CUDA_Zones COMMAND test_cuda_zones)
     set_tests_properties(Test_CUDA_Zones PROPERTIES LABELS cuda)
 
+    # M6 PR-E5: EAM on GPU. --fmad=false is the OQ1 bit-exact precondition; carry
+    # it on a dedicated INTERFACE target so any EAM .cu (incl. the E5b ring) makes
+    # it structural by LINKING (closes the E2-P2 host-only flag-audit finding).
+    add_library(tdmd_eam_cuda_flags INTERFACE)
+    target_compile_options(tdmd_eam_cuda_flags INTERFACE
+      $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+    add_executable(test_cuda_eam tests/test_cuda_eam.cu)
+    target_link_libraries(test_cuda_eam PRIVATE tdmd_core GTest::gtest_main
+                          tdmd_eam_cuda_flags)
+    target_compile_options(test_cuda_eam PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
+    add_test(NAME Test_CUDA_EAM COMMAND test_cuda_eam)
+    set_tests_properties(Test_CUDA_EAM PROPERTIES LABELS cuda)
+
     if(TDMD_WITH_MPI)                                            # M5a: MPI ring
       find_package(MPI REQUIRED COMPONENTS CXX)
       add_executable(test_mpi_conveyor tests/test_mpi_conveyor.cu)
