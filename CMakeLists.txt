@@ -174,6 +174,10 @@ if(TDMD_BUILD_TESTS)
                         GTest::gtest_main)
   add_test(NAME Test_ManyBody_Config COMMAND test_many_body_config)
 
+  add_executable(test_eam tests/test_eam.cpp)              # M6 PR-E1: analytic EAM + FD
+  target_link_libraries(test_eam PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_EAM COMMAND test_eam)
+
   find_package(Threads REQUIRED)                           # M3.5: jthread ring
 
   add_executable(test_conveyor tests/test_conveyor.cpp)    # M3.5: TimeConveyor-CPU
