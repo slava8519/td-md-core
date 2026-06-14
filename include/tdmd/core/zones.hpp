@@ -35,22 +35,33 @@ struct ZoneDecomposition {
 
   // Bins atoms into n_zones equal slabs along z (wrapped into the box on a
   // periodic z). Throws std::invalid_argument on precondition violations.
+  //
+  // reach_mult m = EffectiveRange::cutoff_multiplier of the potential (M6): the
+  // INTERACTION reach in units of rcut. Pair = 1 (energy and force both rcut).
+  // EAM/many-body = 2: the EAM force range is 2·rcut (f_i needs F'(ρ_j), ρ_j
+  // needs j's neighbours up to rcut beyond j — M6_EAM_MANYBODY_DESIGN §1). So a
+  // many-body zone must be >= 2·rcut wide and a periodic decomposition needs
+  // >= 2·m+1 zones (>=5 for EAM) — otherwise the direct interface and the PBC
+  // closure connect overlapping reaches. Default 1 ⇒ pair behaviour verbatim.
   template <typename Real>
   static ZoneDecomposition build(const AtomSoA<Real>& a, const Box& box,
-                                 int n_zones, double rcut) {
+                                 int n_zones, double rcut, int reach_mult = 1) {
     const double L = box.len(2);
     ZoneDecomposition zd;
     zd.n_zones = n_zones;
     zd.width = L / n_zones;
     if (n_zones < 1) throw std::invalid_argument("zones: n_zones must be >= 1");
-    if (n_zones > 1 && zd.width < rcut)
+    if (reach_mult < 1) throw std::invalid_argument("zones: reach_mult must be >= 1");
+    if (n_zones > 1 && zd.width < reach_mult * rcut)
       throw std::invalid_argument(
-          "zones: zone width < r_cut — a zone would reach beyond its "
-          "neighbour (ConfigSchema: decomposition.zone_width >= potential.r_cut)");
-    if (box.periodic[2] && n_zones == 2)
+          "zones: zone width < reach_mult·r_cut — a zone would reach beyond its "
+          "neighbour (ConfigSchema: decomposition.zone_width >= "
+          "reach_mult·potential.r_cut; many-body reach_mult=2)");
+    if (box.periodic[2] && n_zones > 1 && n_zones < 2 * reach_mult + 1)
       throw std::invalid_argument(
-          "zones: 2 zones with periodic z double-count every pair (direct "
-          "interface == PBC closure); use 1 or >= 3 zones");
+          "zones: periodic z needs >= 2·reach_mult+1 zones (pair >=3, "
+          "many-body >=5) — fewer double-count where the direct interface and "
+          "the PBC closure reaches overlap; use 1 or >= 2·reach_mult+1 zones");
     zd.members.assign(n_zones, {});
     for (int i = 0; i < a.n; ++i) {
       double z = a.z[i];

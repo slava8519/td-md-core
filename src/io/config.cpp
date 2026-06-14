@@ -161,7 +161,7 @@ Config load_config(const std::string& path) {
       if (l["sigma"])   c.lj_sigma   = l["sigma"].as<double>();
     }
   }
-  v.check_enum(c.pot_type, "potential.type", {"morse", "lj"});
+  v.check_enum(c.pot_type, "potential.type", {"morse", "lj", "eam"});
   v.check_enum(c.truncation, "potential.truncation",
                {"cut", "shift", "force_shift"});
   v.check(c.rcut > 0.0, "potential.r_cut must be > 0");

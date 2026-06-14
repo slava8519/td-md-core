@@ -57,6 +57,18 @@ int main(int argc, char** argv) {
   // enum/range guards (ensemble, potential, C_buf>=1, ...) live in load_config
   // since B10 — a Config that reaches this point is valid.
 
+  // M6 PR-E0: `potential.type: eam` is a VALID config (parsed + range-checked),
+  // but the EAM force path is not runnable yet — it lands in PR-E1 (analytic
+  // FS-EAM) / PR-E3 (on the ring). Reject explicitly so it can NEVER silently
+  // fall through to the morse branch below (the dispatch is `if lj … else morse`).
+  if (cfg.pot_type == "eam") {
+    std::fprintf(stderr,
+                 "[fatal] potential.type: eam parsed OK but is not runnable in "
+                 "this build — EAM lands in M6 PR-E1+ (see "
+                 "docs/_meta/M6_EAM_MANYBODY_DESIGN_2026-06-14.md)\n");
+    return 2;
+  }
+
   // --- pre-start checklist (Units doc §5, ConfigSchema §3) ---
   std::printf("=== TD-MD Core ===\n");
   std::printf("config       : %s\n", cfg_path.c_str());

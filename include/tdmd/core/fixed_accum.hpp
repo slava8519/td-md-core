@@ -51,4 +51,15 @@ struct FixedAccum {
 using ForceAccum = FixedAccum<40>;   // Q24.40 — per-atom force components
 using EnergyAccum = FixedAccum<30>;  // Q34.30 — PE / virial global sums
 
+// Q19.44 — per-atom EAM electron density (M6, OQ2; quantum 2⁻⁴⁴ ≈ 5.68e-14,
+// range ±2¹⁹ ≈ 5.24e5). Integer-associative like the others ⇒ ρ_i is order-
+// free across neighbours/zones/threads/blocks AND under the redundant halo
+// recompute on the neighbouring node (M6_EAM_MANYBODY_DESIGN §4.1). The per-
+// CONTRIBUTION add() guard (~5.23e5) nearly coincides with this accumulator's
+// ceiling, so density integrity rests on the PHYSICS (ρ≪5e5), not the guard:
+// PR-E1 adds a load-time setfl check that auto-falls back to Q23.40
+// (ForceAccum's scale, ±2²³ ≈ 8.4e6, ×16 headroom) for a pathologically steep
+// ρa table. Both formats are order-invariant identically.
+using DensityAccum = FixedAccum<44>;
+
 }  // namespace tdmd::core::fixed

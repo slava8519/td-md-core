@@ -168,6 +168,12 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_zones PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_Zones COMMAND test_zones)
 
+  add_executable(test_many_body_config                     # M6 PR-E0: descriptor + guards
+                 tests/test_many_body_config.cpp)
+  target_link_libraries(test_many_body_config PRIVATE tdmd_config tdmd_core
+                        GTest::gtest_main)
+  add_test(NAME Test_ManyBody_Config COMMAND test_many_body_config)
+
   find_package(Threads REQUIRED)                           # M3.5: jthread ring
 
   add_executable(test_conveyor tests/test_conveyor.cpp)    # M3.5: TimeConveyor-CPU

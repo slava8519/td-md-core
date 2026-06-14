@@ -124,6 +124,16 @@ struct ConveyorOptions {
   // PR-3/PR-4 (opt-in refinements over the conservative 2*R_buf criterion):
   bool   verlet_hybrid = false;    // measured-displacement criterion (2*d_max + 2*L*R_buf)
   bool   verlet_drift = false;     // subtract mean displacement D0 first (Theorem 1; needs hybrid)
+  // Many-body interaction reach (M6, EffectiveRange). reach_mult = cutoff
+  // multiplier (pair 1, EAM 2 — force range 2·rcut); drives the zone-width /
+  // periodic-zone guard (ZoneDecomposition::build) and the StaleZone membership
+  // margin g = 0.5·(w − reach_mult·rcut). symmetric_reach = node must co-reside
+  // BOTH immediate neighbours {S_{i-1},S_i,S_{i+1}} (EAM density needs the lower
+  // neighbour's positions too — M6_EAM_MANYBODY_DESIGN §1.2). Plumbed here in
+  // PR-E0 (the descriptor + guards); the three-zone residency EXECUTION on the
+  // ring lands in PR-E3. Defaults {1,false} = pair, bitwise no-op.
+  int    reach_mult = 1;
+  bool   symmetric_reach = false;
 };
 
 // Per-pass record. v_max/a_max/k2cap are the pass aggregates that feed the
@@ -190,7 +200,7 @@ class TimeConveyor {
   }
 
   ConveyorResult run() {
-    zd_ = ZoneDecomposition::build(atoms_, box_, o_.n_zones, rcut_);
+    zd_ = ZoneDecomposition::build(atoms_, box_, o_.n_zones, rcut_, o_.reach_mult);
     n_ = zd_.n_zones;
     z_ = o_.n_nodes;
     pbc_z_ = box_.periodic[2];
@@ -604,7 +614,7 @@ class TimeConveyor {
   // skips n_<3); PBC distances are cyclic.
   bool membership_ok(const Slot& s) const {
     const double w = zd_.width;
-    const double g = 0.5 * (w - rcut_);
+    const double g = 0.5 * (w - o_.reach_mult * rcut_);  // many-body reach (M6)
     const double lo_box = box_.lo[2], Lz = box_.len(2);
     const double lo = lo_box + s.fsm.id * w;
     const double hi = lo + w;
