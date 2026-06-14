@@ -182,6 +182,10 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_eam_spline PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_EAM_Spline COMMAND test_eam_spline)
 
+  add_executable(test_eam_zone tests/test_eam_zone.cpp)    # M6 PR-E3: zone EAM (3-zone residence)
+  target_link_libraries(test_eam_zone PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_EAM_Zone COMMAND test_eam_zone)
+
   find_package(Threads REQUIRED)                           # M3.5: jthread ring
 
   add_executable(test_conveyor tests/test_conveyor.cpp)    # M3.5: TimeConveyor-CPU

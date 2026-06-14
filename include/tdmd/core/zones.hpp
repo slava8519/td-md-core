@@ -100,6 +100,20 @@ struct PairGeom {
   }
 };
 
+// Validates that `order` is a permutation of 0..n_zones-1 (a stale/short/dup/
+// out-of-range order would index zd.members out of bounds — UB — or write a
+// zone's forces twice / zero times, silently wrong; M6 PR-E3 adversarial finding).
+inline void validate_zone_order(const std::vector<int>& order, int n_zones) {
+  if (int(order.size()) != n_zones)
+    throw std::invalid_argument("zone order: size != n_zones");
+  std::vector<char> seen(n_zones, 0);
+  for (int z : order) {
+    if (z < 0 || z >= n_zones || seen[z])
+      throw std::invalid_argument("zone order: not a permutation of 0..n_zones-1");
+    seen[z] = 1;
+  }
+}
+
 // One full force assembly over zone passes. PairFn: the drivers' contract —
 // void(double r, double& u, double& f_over_r), FP64 contributions with the
 // truncation scheme already applied (potentials/cutoff.hpp policy).
@@ -115,6 +129,7 @@ template <typename Real, typename PairFn, typename PairHook>
 double zone_force_pass(AtomSoA<Real>& a, const Box& box,
                        const ZoneDecomposition& zd, double rcut, PairFn&& pair,
                        const std::vector<int>& order, PairHook&& on_pair) {
+  validate_zone_order(order, zd.n_zones);
   const PairGeom geom(box, rcut);
 
   std::vector<fixed::ForceAccum> fx(a.n), fy(a.n), fz(a.n);
