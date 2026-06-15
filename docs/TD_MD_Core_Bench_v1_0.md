@@ -277,3 +277,34 @@ opt-in (master-флаг OFF) — это перф-фича под запрос, �
 
 Воспроизведение: `./build-cuda/bench_conveyor[_fma] --cells 64 --zones 32
 --nodes 4 --steps 20 --ring-only --skip-t0 --verlet --skin 1.0 [--mode mixed]`.
+
+---
+
+## M4-N — измерительная обвязка GPU-EAM (перф-трек, «мерить-первым»)
+
+Первый шаг перф-трека после M6: структурированная `ms/step`-разбивка + hit-rate
+для GPU-EAM (`tools/bench_eam.cu` + `metrics/eam_breakdown.hpp`; метрик-математика
+покрыта `Test_Metrics`). Цель И-F: данные, на которых **потом** честно выбирается
+сосед-бэкенд (M4-B бейкофф ClusterFull/Verlet/TileMask), а не декларация.
+
+Замер (RTX 5080, 84 SM, `deterministic_fp64`, EamSetfl-сплайн, **all-window O(N²)
+baseline**, без cell-lists):
+
+| N (cells) | ms/step | density% | force% | embed% | hit-rate | cell-list возможность |
+|---|---|---|---|---|---|---|
+| 864 (6)   | 3.75  | 49.2 | 50.7 | 0.1 | 0.0139 | ~72×  |
+| 2048 (8)  | 7.70  | 50.1 | 49.8 | 0.1 | 0.0059 | ~171× |
+| 4000 (10) | 14.39 | 49.9 | 50.1 | 0.0 | 0.0030 | ~333× |
+
+occupancy (теор.): density 83% · embedding 100% · force 58%.
+
+**Выводы для M4-B (вход бейкоффа):**
+- density и force — по ~50% ms/step (два O(N²)-прохода по окну); embedding ≈ 0%
+  (O(N) пер-атомный map). Оптимизировать надо ОБА O(N²)-прохода.
+- **hit-rate = real/examined падает ~∝1/N** (1.4% → 0.30%): all-window тратит
+  >99% парных вычислений впустую; cell-list/Verlet режет examined на 72–333×, и
+  возможность **растёт с N** — на флагманских 10⁶ она огромна.
+- Это количественно обосновывает культинг-бэкенд для EAM на кольце (E5b + M4-B):
+  не декларация «TileMask лучший», а измеренная возможность ~1/hit-rate.
+
+Воспроизведение: `./build-cuda/bench_eam --cells 8 --steps 50 [--rcut 4.0]`.

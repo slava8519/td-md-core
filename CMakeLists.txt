@@ -103,6 +103,13 @@ if(TDMD_WITH_CUDA)
       target_compile_definitions(${tgt} PRIVATE TDMD_WITH_NVTX)
     endforeach()
   endif()
+
+  # M4-N (perf track): GPU EAM ms/step phase breakdown + hit-rate (measure-first).
+  # --fmad=false to keep the EAM kernels on the deterministic_fp64 contract.
+  add_executable(bench_eam tools/bench_eam.cu)
+  target_link_libraries(bench_eam PRIVATE tdmd_core)
+  target_compile_options(bench_eam PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 endif()
 
 # --- M3 timing evidence: direct vs clustered (manual tool, not a CI gate) ---
@@ -189,6 +196,10 @@ if(TDMD_BUILD_TESTS)
   add_executable(test_eam_rdf tests/test_eam_rdf.cpp)      # M6 PR-E7: RDF vs frozen LAMMPS
   target_link_libraries(test_eam_rdf PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_EAM_RDF COMMAND test_eam_rdf)
+
+  add_executable(test_metrics tests/test_metrics.cpp)      # M4-N: perf-breakdown math
+  target_link_libraries(test_metrics PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_Metrics COMMAND test_metrics)
 
   add_executable(test_eam_ring tests/test_eam_ring.cpp)    # M6 PR-E3b: threaded EAM ring
   target_link_libraries(test_eam_ring PRIVATE tdmd_core GTest::gtest_main Threads::Threads)
