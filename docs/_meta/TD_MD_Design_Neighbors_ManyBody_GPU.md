@@ -307,7 +307,7 @@ on pass head h (light-cone lag n−1):
 | **M3** | Соседи `ClusterFull` (Morton + 32-атомные кластеры, full-list, grid-cull) | ✅ [BUILT] |
 | **M3.5** | TD-кольцо CPU (z·jthread+SPSC, Λ-цепочка `dt` B2, PBC-ротация, INV-4 HALT, StaleZone, NVE bitwise, §3.6-реплика) | ✅ [BUILT] |
 | **M4** | GPU: фикс-пойнт силы (CPU=GPU bit-exact LJ), `zone_integrate`, `StreamTransport` | 🔄 [BUILT, частично] |
-| **M4-N** *(новое, первым)* | **Измерительная обвязка + Physical Oracle** (F.3/F.4): `ms/step`-разбивка, `K`-метрики, Gate-02. *Без default-выбора.* | [DESIGN] |
+| **M4-N** *(новое, первым)* | **Измерительная обвязка + Physical Oracle** (F.3/F.4): `ms/step`-разбивка (GPU-EAM, hit-rate, occupancy), `K`-метрики (`K_eff`/`K_pred` свип равновесие→удар), Gate-02a (Physical Oracle, superset⇒bitwise). *Без default-выбора.* Все три — состязательно спроектированы и приняты; см. `TD_MD_Core_Bench_v1_0.md`. **Остаётся Gate-02b** (GPU cells-vs-verlet на сырых int64, K>1) — до выката PersistentVerlet по умолчанию. | ✅ [BUILT] (CPU/Gate-02a); Gate-02b отложен |
 | **M4-S** | **Скин-критерий на Λ-цепочке** в `conveyor` (D.3): `skin_consumed`/`rebuild_now`/`K_pred` в `ZoneHeader`, **правка `2·R_buf`**, И2 (`d_(1)+d_(2)`), И1 (K-aware fallback). Заменяет глобальный `need_rebuild` в кольце/GPU. | [DESIGN] |
 | **M4-B** | **Backend-ы соседей за `INeighbor`**: `PersistentVerlet`, `TileMaskCellRaster` (JIT в `w`, И-A суперсет, И-B монотонное локальное `ε`). Бейк-офф A/B/C/D. | [DESIGN] |
 | **M5** | **Универсальный многопроходный потенциал `IManyBodyPotential`** (C.3): EAM → MEAM → Tersoff/SW → ReaxFF (+Local QEq, E.4) → ML. Каждый — через валидацию F.1/F.2 и Gate-01/02. Транзиентный micro-Verlet внутри тайла для многопроходных. | [DESIGN] |
