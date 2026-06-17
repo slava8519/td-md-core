@@ -269,6 +269,12 @@ if(TDMD_BUILD_TESTS)
     add_test(NAME Test_CUDA_EAM COMMAND test_cuda_eam)
     set_tests_properties(Test_CUDA_EAM PROPERTIES LABELS cuda)
 
+    add_executable(test_cuda_eam_ring tests/test_cuda_eam_ring.cu)  # M6 E5b-2: EAM GPU ring (single-node)
+    target_link_libraries(test_cuda_eam_ring PRIVATE tdmd_core GTest::gtest_main
+                          tdmd_eam_cuda_flags)
+    add_test(NAME Test_CUDA_EAM_Ring COMMAND test_cuda_eam_ring)
+    set_tests_properties(Test_CUDA_EAM_Ring PROPERTIES LABELS cuda)
+
     if(TDMD_WITH_MPI)                                            # M5a: MPI ring
       find_package(MPI REQUIRED COMPONENTS CXX)
       add_executable(test_mpi_conveyor tests/test_mpi_conveyor.cu)
