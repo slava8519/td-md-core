@@ -17,8 +17,9 @@
 #include "tdmd/core/soa.hpp"
 #include "tdmd/core/zones.hpp"
 #include "tdmd/cuda/zone_eam.cuh"
-#include "tdmd/cuda/zone_eam_cells.cuh"   // E5c: cell-list culled EAM kernels
-#include "tdmd/cuda/zone_eam_verlet.cuh"  // E5c: tight per-atom verlet-list EAM kernels
+#include "tdmd/cuda/zone_eam_cells.cuh"    // E5c: cell-list culled EAM kernels
+#include "tdmd/cuda/zone_eam_verlet.cuh"   // E5c: tight per-atom verlet-list EAM kernels
+#include "tdmd/cuda/zone_eam_newton3.cuh"  // E5c: half-list + Newton-3 EAM kernels
 #include "tdmd/metrics/eam_breakdown.hpp"
 #include "tdmd/potentials/eam_analytic.hpp"
 #include "tdmd/potentials/eam_spline.hpp"
@@ -69,7 +70,7 @@ double occ(K kernel, int block) {
 
 int main(int argc, char** argv) {
   int nc = 8; long steps = 50; double rcut = 4.0; double skin = 1.0;
-  std::string backend = "allwindow";  // E5c bake-off: allwindow | cells | verlet
+  std::string backend = "allwindow";  // E5c bake-off: allwindow | cells | verlet | newton3
   std::string setfl_path;  // like-for-like: a real setfl (e.g. Al_zhou.eam.alloy)
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -80,12 +81,14 @@ int main(int argc, char** argv) {
     else if (a == "--setfl") setfl_path = argv[++i];
     else if (a == "--skin") skin = std::stod(argv[++i]);
   }
-  if (backend != "allwindow" && backend != "cells" && backend != "verlet") {
-    std::printf("bench_eam: --backend must be allwindow|cells|verlet (got '%s')\n", backend.c_str());
+  if (backend != "allwindow" && backend != "cells" && backend != "verlet" &&
+      backend != "newton3") {
+    std::printf("bench_eam: --backend must be allwindow|cells|verlet|newton3 (got '%s')\n", backend.c_str());
     return 2;
   }
   const bool use_cells = (backend == "cells");
   const bool use_verlet = (backend == "verlet");
+  const bool use_newton3 = (backend == "newton3");
   cudaDeviceProp pr{}; cudaGetDeviceProperties(&pr, 0);
   std::printf("bench_eam: %s, %d SMs\n", pr.name, pr.multiProcessorCount);
 
@@ -145,12 +148,16 @@ int main(int argc, char** argv) {
     if (use_cells) {
       if (cg.d_order) tdcu::eam_cells_free(cg);
       cg = tdcu::eam_build_window_grid(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut);
-    } else if (use_verlet) {
+    } else if (use_verlet || use_newton3) {  // both walk a per-atom verlet CSR
       if (vl.d_off) tdcu::eam_verlet_free(vl);
       vl = tdcu::eam_build_verlet_list(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut, skin);
     }
   };
 
+  // The Newton-3 kernels atomicAdd onto d_rho/d_fx/d_fy/d_fz, so those must be
+  // re-zeroed each step before the density/force passes (the full-neighbour
+  // kernels write directly — no zeroing needed, hence this is newton3-only and the
+  // memset is part of the steady-state per-step cost, timed inside the kernels' window).
   auto dens = [&] {
     if (use_cells)
       tdcu::eam_density_cells_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, view, dens_scale,
@@ -159,7 +166,11 @@ int main(int argc, char** argv) {
     else if (use_verlet)
       tdcu::eam_density_verlet_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, view, dens_scale,
                                                    vl.d_off, vl.d_idx, d_rho, d_of);
-    else
+    else if (use_newton3) {
+      cudaMemsetAsync(d_rho, 0, size_t(m) * sizeof(long long));
+      tdcu::eam_density_n3_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, view, dens_scale,
+                                               vl.d_off, vl.d_idx, d_rho, d_of);
+    } else
       tdcu::eam_density_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, view, dens_scale, d_rho, d_of);
   };
   auto emb  = [&] { tdcu::eam_embedding_kernel<<<gd, blk>>>(m, view, dens_scale, rho_cap, d_rho, d_fp, d_of); };
@@ -173,7 +184,16 @@ int main(int argc, char** argv) {
       tdcu::eam_force_verlet_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, view,
                                                  dens_scale, d_rho, d_fp, vl.d_off, vl.d_idx,
                                                  d_fx, d_fy, d_fz, d_pe, d_mr, d_of);
-    else
+    else if (use_newton3) {
+      cudaMemsetAsync(d_fx, 0, size_t(m) * sizeof(long long));
+      cudaMemsetAsync(d_fy, 0, size_t(m) * sizeof(long long));
+      cudaMemsetAsync(d_fz, 0, size_t(m) * sizeof(long long));
+      tdcu::eam_embed_energy_n3_kernel<<<gd, blk>>>(m, downed, m, view, dens_scale,
+                                                    d_rho, d_pe, d_of);
+      tdcu::eam_force_n3_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, view, d_fp,
+                                             vl.d_off, vl.d_idx, d_fx, d_fy, d_fz, d_pe,
+                                             d_mr, d_of);
+    } else
       tdcu::eam_force_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, view, dens_scale, d_rho, d_fp, d_fx, d_fy, d_fz, d_pe, d_mr, d_of);
   };
 
@@ -187,7 +207,7 @@ int main(int argc, char** argv) {
   // its rebuild interval in a real engine (skin-bounded — LAMMPS Neigh ≈0% at
   // equilibrium), so it's reported as a SEPARATE one-time number, not per step.
   if (use_cells) build_struct();
-  if (use_verlet) {
+  if (use_verlet || use_newton3) {
     cudaEventRecord(b0); build_struct(); cudaEventRecord(b1); cudaEventSynchronize(b1);
     float tb = 0; cudaEventElapsedTime(&tb, b0, b1); build_ms_total = tb;
     list_nnz = vl.nnz;
@@ -220,7 +240,7 @@ int main(int argc, char** argv) {
 
   int of = 0; cudaMemcpy(&of, d_of, 4, cudaMemcpyDeviceToHost);
   if (use_cells) tdcu::eam_cells_free(cg);
-  if (use_verlet) tdcu::eam_verlet_free(vl);
+  if (use_verlet || use_newton3) tdcu::eam_verlet_free(vl);
 
   // Candidate enumeration cost per atom — what makes the over-fetch visible:
   //   real/atom    = in-cutoff (rcut) neighbours/atom (the irreducible work)
@@ -260,10 +280,11 @@ int main(int argc, char** argv) {
   if (use_cells)
     std::printf("grid-build: %.4f ms/step (rebuilt over the whole window each step)\n",
                 build_ms_total / double(steps));
-  if (use_verlet)
+  if (use_verlet || use_newton3)
     std::printf("list-build: %.4f ms (ONE-TIME — amortized over the rebuild interval; "
-                "steady-state per-step cost is the iterate-only kernels above)\n",
-                build_ms_total);
+                "steady-state per-step cost is the iterate-only kernels above%s)\n",
+                build_ms_total,
+                use_newton3 ? " + the per-step memset of the int64 atomicAdd targets" : "");
   if (use_cells)
     std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
                 occ(tdcu::eam_density_cells_kernel, blk), occ(tdcu::eam_embedding_kernel, blk),
@@ -272,6 +293,10 @@ int main(int argc, char** argv) {
     std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
                 occ(tdcu::eam_density_verlet_kernel, blk), occ(tdcu::eam_embedding_kernel, blk),
                 occ(tdcu::eam_force_verlet_kernel, blk), of);
+  else if (use_newton3)
+    std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
+                occ(tdcu::eam_density_n3_kernel, blk), occ(tdcu::eam_embedding_kernel, blk),
+                occ(tdcu::eam_force_n3_kernel, blk), of);
   else
     std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
                 occ(tdcu::eam_density_kernel, blk), occ(tdcu::eam_embedding_kernel, blk),
@@ -281,11 +306,13 @@ int main(int argc, char** argv) {
   std::printf("candidate enumeration: real/atom=%.1f | cells exam/atom=%.1f (%.2fx over-fetch)",
               real_per_atom, cells_exam_per_atom,
               real_per_atom > 0 ? cells_exam_per_atom / real_per_atom : 0.0);
-  if (use_verlet)
-    std::printf(" | verlet nbr/atom=%.1f (skin=%.2f, %.2fx over-fetch, %lld total)",
+  if (use_verlet || use_newton3)
+    std::printf(" | %s nbr/atom=%.1f (skin=%.2f, %.2fx over-fetch, %lld total%s)",
+                use_newton3 ? "n3-full-list" : "verlet",
                 double(list_nnz) / double(m), skin,
                 real_per_atom > 0 ? (double(list_nnz) / double(m)) / real_per_atom : 0.0,
-                list_nnz);
+                list_nnz,
+                use_newton3 ? "; the bb>aa gate halves the EVAL to ~half this" : "");
   std::printf("\n");
 
   std::printf(

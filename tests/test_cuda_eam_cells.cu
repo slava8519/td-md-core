@@ -27,6 +27,7 @@
 #include "tdmd/cuda/zone_eam.cuh"
 #include "tdmd/cuda/zone_eam_cells.cuh"
 #include "tdmd/cuda/zone_eam_verlet.cuh"    // E5c tight-list (verlet) EAM kernels
+#include "tdmd/cuda/zone_eam_newton3.cuh"   // E5c HALF-LIST + NEWTON-3 EAM kernels
 #include "tdmd/potentials/eam.hpp"          // eam_direct_fp64 (Test B oracle)
 #include "tdmd/potentials/eam_analytic.hpp"
 #include "tdmd/potentials/eam_spline.hpp"
@@ -127,7 +128,7 @@ struct GpuOut {
 // Backend selector: all-window O(m²) kernels (zone_eam.cuh) vs cell-list culled
 // kernels (zone_eam_cells.cuh). The density/embedding/force order is identical;
 // only the candidate generation of pass 1 + pass 3 differs.
-enum class Backend { AllWindow, Cells, Verlet };
+enum class Backend { AllWindow, Cells, Verlet, Newton3 };
 
 GpuOut run_gpu(const Window& w, const potentials::EamSetfl<double>& setfl,
                double dens_scale, double rho_cap, Backend be, double skin = 1.0) {
@@ -155,19 +156,24 @@ GpuOut run_gpu(const Window& w, const potentials::EamSetfl<double>& setfl,
   tdcu::EamVerletList vl;
   if (be == Backend::Cells)
     cg = tdcu::eam_build_window_grid(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut);
-  else if (be == Backend::Verlet)
+  else if (be == Backend::Verlet || be == Backend::Newton3)
     vl = tdcu::eam_build_verlet_list(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut, skin);
 
+  // density (d_rho was uploaded ZERO; the Newton3 path atomicAdds onto it).
   if (be == Backend::AllWindow) {
     tdcu::eam_density_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, ds.view, dens_scale, d_rho, d_of);
   } else if (be == Backend::Cells) {
     tdcu::eam_density_cells_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, ds.view, dens_scale,
                                                 cg.g, cg.d_starts, cg.d_counts, cg.d_order,
                                                 d_rho, d_of);
-  } else {
+  } else if (be == Backend::Verlet) {
     tdcu::eam_density_verlet_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, ds.view, dens_scale,
                                                  vl.d_off, vl.d_idx, d_rho, d_of);
+  } else {  // Newton3: half-list, atomicAdd to BOTH partners (d_rho pre-zeroed)
+    tdcu::eam_density_n3_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, ds.view, dens_scale,
+                                             vl.d_off, vl.d_idx, d_rho, d_of);
   }
+  // embedding DERIVATIVE F'(rho) -> d_fp (+ rho-cap HALT). Same for every backend.
   tdcu::eam_embedding_kernel<<<gd, blk>>>(m, ds.view, dens_scale, rho_cap, d_rho, d_fp, d_of);
   if (be == Backend::AllWindow) {
     tdcu::eam_force_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, ds.view,
@@ -177,10 +183,16 @@ GpuOut run_gpu(const Window& w, const potentials::EamSetfl<double>& setfl,
                                               dens_scale, d_rho, d_fp, cg.g, cg.d_starts,
                                               cg.d_counts, cg.d_order, d_fx, d_fy, d_fz, d_pe,
                                               d_mr, d_of);
-  } else {
+  } else if (be == Backend::Verlet) {
     tdcu::eam_force_verlet_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, ds.view,
                                                dens_scale, d_rho, d_fp, vl.d_off, vl.d_idx,
                                                d_fx, d_fy, d_fz, d_pe, d_mr, d_of);
+  } else {  // Newton3: embedding ENERGY per-owned (d_pe) + half-list pair force (d_fx pre-zeroed)
+    tdcu::eam_embed_energy_n3_kernel<<<gd, blk>>>(m, downed, m, ds.view, dens_scale,
+                                                  d_rho, d_pe, d_of);
+    tdcu::eam_force_n3_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, ds.view, d_fp,
+                                           vl.d_off, vl.d_idx, d_fx, d_fy, d_fz, d_pe,
+                                           d_mr, d_of);
   }
   EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
   GpuOut o;
@@ -193,7 +205,7 @@ GpuOut run_gpu(const Window& w, const potentials::EamSetfl<double>& setfl,
   cudaMemcpy(&o.min_r2_bits, d_mr, 8, cudaMemcpyDeviceToHost);
   cudaMemcpy(&o.overflow, d_of, 4, cudaMemcpyDeviceToHost);
   if (be == Backend::Cells) tdcu::eam_cells_free(cg);
-  if (be == Backend::Verlet) tdcu::eam_verlet_free(vl);
+  if (be == Backend::Verlet || be == Backend::Newton3) tdcu::eam_verlet_free(vl);
   for (void* p : {(void*)dx, (void*)dy, (void*)dz, (void*)dkey, (void*)downed, (void*)d_rho,
                   (void*)d_fp, (void*)d_fx, (void*)d_fy, (void*)d_fz, (void*)d_pe, (void*)d_mr, (void*)d_of})
     cudaFree(p);
@@ -345,4 +357,39 @@ TEST(CudaEamVerlet, VsOracleQ2340) {  // dropped-donor gate, steep β=3.3
 }
 TEST(CudaEamVerlet, VsOraclePbc) {  // dropped-donor gate across the PERIODIC seam
   check_vs_oracle(1.5, 13, 44, /*pbc=*/true, Backend::Verlet, /*skin=*/1.0);
+}
+
+// ====================== Test A'' (HALF-LIST + NEWTON-3) ======================
+// THE load-bearing gate. The half-list+Newton-3 kernels write the per-atom raw
+// int64 rho / fx / fy / fz / pe via cross-thread int64 atomicAdd (each undirected
+// pair processed ONCE, bb>aa, shared to both partners). This MUST be bit-for-bit
+// equal to the FULL-NEIGHBOUR all-window kernels — it is NOT a determinism
+// tradeoff, by the rint-odd + int64-associativity proof (zone_eam_newton3.cuh
+// header): int64 atomicAdd is associative ⇒ order-free; rint odd ⇒ the bb-side
+// −q == quantize(f_over_r·dx_ba); rho_a/f_over_r symmetric ⇒ same q to both. If
+// this is NOT bitwise-equal the variant is WRONG. fb=44 + fb=40, free-z + PBC.
+
+TEST(CudaEamNewton3, SelfEquivQ1944) {  // BITWISE half-list ≡ all-window, fb=44, free-z
+  check_self_equiv<44>(1.5, 7, Backend::Newton3, /*pbc=*/false, /*skin=*/1.0);
+}
+TEST(CudaEamNewton3, SelfEquivQ2340) {  // steep β=3.3 (fracbits==40)
+  check_self_equiv<40>(3.3, 11, Backend::Newton3, /*pbc=*/false, /*skin=*/1.0);
+}
+TEST(CudaEamNewton3, SelfEquivPbc) {  // BITWISE across the PERIODIC seam (atomicAdd over wrap)
+  check_self_equiv<44>(1.5, 13, Backend::Newton3, /*pbc=*/true, /*skin=*/1.0);
+}
+
+// ====================== Test B'' (HALF-LIST oracle) =========================
+// The half-list density+force vs eam_direct_fp64 (all-pairs FP64, no grid, no
+// quantize) — the physical witness. A dropped donor or a broken Newton-3 share
+// shows here as a wrong per-atom rho/force. <1e-9.
+
+TEST(CudaEamNewton3, VsOracleQ1944) {  // half-list vs FP64 oracle, fb=44, free-z
+  check_vs_oracle(1.5, 7, 44, /*pbc=*/false, Backend::Newton3, /*skin=*/1.0);
+}
+TEST(CudaEamNewton3, VsOracleQ2340) {  // half-list vs FP64 oracle, steep β=3.3
+  check_vs_oracle(3.3, 11, 40, /*pbc=*/false, Backend::Newton3, /*skin=*/1.0);
+}
+TEST(CudaEamNewton3, VsOraclePbc) {  // half-list vs FP64 oracle across the PERIODIC seam
+  check_vs_oracle(1.5, 13, 44, /*pbc=*/true, Backend::Newton3, /*skin=*/1.0);
 }
