@@ -106,11 +106,18 @@ T* up(const std::vector<T>& v) {
 // width>=2·rcut). setfl = the spline Math (the GPU kernels' contract). Bitwise ==
 // serial zone_eam_pass-driven VV. Throws on rho-cap/overflow HALT (symmetric to
 // the CPU oracle's throw).
+// symmetric=true ⇒ the correct 3-zone window {j-1,j,j+1}; false ⇒ FORWARD-ONLY
+// {j,j+1} (drops the lower donor) — the Oracle-A poison that proves a missing
+// donor is DETECTABLE. out_f{x,y,z} (optional, size n) receive the forces at the
+// final config (with steps=0, the step-0 forces — for the independent-oracle gate).
 template <typename Real>
 void eam_gpu_run_singlenode(core::AtomSoA<Real>& a, const core::Box& box,
                             const core::ZoneDecomposition& zd,
                             const potentials::EamSetfl<double>& setfl, long steps,
-                            double dt) {
+                            double dt, bool symmetric = true,
+                            std::vector<double>* out_fx = nullptr,
+                            std::vector<double>* out_fy = nullptr,
+                            std::vector<double>* out_fz = nullptr) {
   using namespace eam_sn_detail;
   const int n = a.n;
   const int nz = zd.n_zones;
@@ -124,7 +131,7 @@ void eam_gpu_run_singlenode(core::AtomSoA<Real>& a, const core::Box& box,
   std::vector<int> gmap_flat, owned_flat, gmap_off{0}, owned_off{0};
   int max_m = 1;
   for (int zi = 0; zi < nz; ++zi) {
-    const auto win = potentials::zone_eam_window(zd, zi, box.periodic[2], /*sym=*/true);
+    const auto win = potentials::zone_eam_window(zd, zi, box.periodic[2], symmetric);
     std::vector<int> pos(n, -1);
     for (int aa = 0; aa < int(win.size()); ++aa) pos[win[aa]] = aa;
     for (int g : win) gmap_flat.push_back(g);
@@ -198,6 +205,9 @@ void eam_gpu_run_singlenode(core::AtomSoA<Real>& a, const core::Box& box,
   cudaDeviceSynchronize();
   check_halt();
 
+  if (out_fx) { out_fx->resize(n); cudaMemcpy(out_fx->data(), dFx, n * 8, cudaMemcpyDeviceToHost); }
+  if (out_fy) { out_fy->resize(n); cudaMemcpy(out_fy->data(), dFy, n * 8, cudaMemcpyDeviceToHost); }
+  if (out_fz) { out_fz->resize(n); cudaMemcpy(out_fz->data(), dFz, n * 8, cudaMemcpyDeviceToHost); }
   cudaMemcpy(hx.data(), dx, n * 8, cudaMemcpyDeviceToHost);
   cudaMemcpy(hy.data(), dy, n * 8, cudaMemcpyDeviceToHost);
   cudaMemcpy(hz.data(), dz, n * 8, cudaMemcpyDeviceToHost);

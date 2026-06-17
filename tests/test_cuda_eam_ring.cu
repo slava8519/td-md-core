@@ -15,7 +15,7 @@
 #include "tdmd/core/soa.hpp"
 #include "tdmd/core/zones.hpp"
 #include "tdmd/cuda/eam_conveyor_gpu.cuh"
-#include "tdmd/potentials/eam.hpp"
+#include "tdmd/potentials/eam.hpp"  // eam_direct_fp64 (independent O(N²) oracle)
 #include "tdmd/potentials/eam_analytic.hpp"
 #include "tdmd/potentials/eam_spline.hpp"
 #include "tdmd/potentials/eam_zone.hpp"
@@ -109,5 +109,55 @@ TEST(CudaEamRing, SingleNodeMatchesSerialVV) {
     tdcu::eam_gpu_run_singlenode(gpu, box, zd, setfl, /*steps=*/20, /*dt=*/0.001);
 
     EXPECT_TRUE(bitwise_eq(ref, gpu)) << "n_zones=" << n_zones;
+  }
+}
+
+namespace {
+double max_force_dev(const core::AtomSoA<double>& ref, const std::vector<double>& gx,
+                     const std::vector<double>& gy, const std::vector<double>& gz) {
+  double mx = 0.0;
+  for (int i = 0; i < ref.n; ++i) {
+    mx = std::max(mx, std::fabs(ref.fx[i] - gx[i]));
+    mx = std::max(mx, std::fabs(ref.fy[i] - gy[i]));
+    mx = std::max(mx, std::fabs(ref.fz[i] - gz[i]));
+  }
+  return mx;
+}
+}  // namespace
+
+// Independent-oracle gate (do NOT accept the EAM ring on 1-vs-z / vs serial alone,
+// since both share zone_eam_window). eam_direct_fp64 is the full-system O(N²) FP64
+// EAM — it shares NO window/zone logic, so it catches a dropped donor the zone
+// path would otherwise reproduce deterministically.
+//
+// Oracle B: the symmetric 3-zone window (width≥2·rcut) is COMPLETE ⇒ GPU forces
+//   match the full O(N²) oracle (not bitwise — int64 quant vs FP64 sum — but <1e-10).
+// Oracle A (forward-only POISON): gathering only {j,j+1} drops the lower donor ⇒
+//   ρ truncated for atoms near the lower face ⇒ forces DIVERGE. Proves the gate
+//   has TEETH: a green Oracle B is only meaningful because Oracle A would fail.
+TEST(CudaEamRing, SingleNodeForcesMatchFp64OracleAndForwardOnlyPoisonDiverges) {
+  const auto setfl = make_setfl();
+  for (int n_zones : {2, 3, 4}) {
+    core::Box box;
+    const auto init = make_fcc(2, 2, 6, 4.05, box);
+    const auto zd = core::ZoneDecomposition::build(init, box, n_zones, kRcut, 2);
+
+    // independent reference: full-system O(N²) FP64 EAM on the SAME spline math.
+    core::AtomSoA<double> ref = init;
+    core::zero_forces(ref);
+    potentials::eam_direct_fp64<double, potentials::EamSetfl<double>>(ref, box, setfl, true);
+
+    // Oracle B — correct symmetric window matches the oracle (complete window).
+    core::AtomSoA<double> g = init;
+    std::vector<double> bx, by, bz;
+    tdcu::eam_gpu_run_singlenode(g, box, zd, setfl, /*steps=*/0, 0.001, /*symmetric=*/true, &bx, &by, &bz);
+    EXPECT_LT(max_force_dev(ref, bx, by, bz), 1e-10) << "n_zones=" << n_zones << " symmetric ≠ O(N²) oracle";
+
+    // Oracle A — forward-only poison MUST diverge (a dropped donor is detectable).
+    core::AtomSoA<double> p = init;
+    std::vector<double> px, py, pz;
+    tdcu::eam_gpu_run_singlenode(p, box, zd, setfl, /*steps=*/0, 0.001, /*symmetric=*/false, &px, &py, &pz);
+    EXPECT_GT(max_force_dev(ref, px, py, pz), 1e-6) << "n_zones=" << n_zones
+        << " forward-only did NOT diverge — the gate is blind to a dropped donor!";
   }
 }
