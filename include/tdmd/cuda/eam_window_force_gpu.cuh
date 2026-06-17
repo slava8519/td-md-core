@@ -8,8 +8,10 @@
 #include <vector>
 
 #include "tdmd/core/fixed_accum.hpp"
+#include "tdmd/core/soa.hpp"   // Box (the cell grid needs box.lo — F1)
 #include "tdmd/core/zones.hpp"  // PairGeom
 #include "tdmd/cuda/zone_eam.cuh"  // eam_density/embedding/force kernels, EamSetflView
+#include "tdmd/cuda/zone_eam_cells.cuh"  // E5c-integration: culled kernels + window grid
 #include "tdmd/potentials/eam_spline.hpp"
 
 // M6 E5b-3b — the GPU WINDOW-FORCE POLICY for the streaming multi-node EAM ring.
@@ -69,7 +71,31 @@ struct GpuEamWindowState {
   unsigned long long sentinel = 0;  // pos_double_bits(1e300) — empty-window seed
   std::mutex mu;
 
-  explicit GpuEamWindowState(const potentials::EamSetfl<double>& setfl) {
+  // E5c-integration — cell-list culling of the per-window density+force (cells ≡
+  // all-window BITWISE by B1, proven in test_cuda_eam_cells). The box is captured
+  // at construction (static membership/box for the run) — compute() only gets a
+  // PairGeom, which lacks box.lo the grid needs (F1). cull=false keeps the O(m²)
+  // all-window path as the in-process bitwise reference. cells_passes is the
+  // non-vacuity witness (the culled path was actually taken in-ring).
+  double box_lo[3] = {0, 0, 0}, box_len[3] = {0, 0, 0};
+  bool periodic[3] = {false, false, false};
+  double rcut = 0.0;
+  bool cull = true;
+  unsigned long long cells_passes = 0;
+  EamCellGrid grid_{};       // persistent — geometry built once, refreshed per pass
+  bool grid_built_ = false;
+
+  GpuEamWindowState(const potentials::EamSetfl<double>& setfl, const core::Box& box,
+                    bool cull_)
+      : cull(cull_) {
+    box_lo[0] = box.lo[0]; box_lo[1] = box.lo[1]; box_lo[2] = box.lo[2];
+    box_len[0] = box.len(0); box_len[1] = box.len(1); box_len[2] = box.len(2);
+    periodic[0] = box.periodic[0]; periodic[1] = box.periodic[1]; periodic[2] = box.periodic[2];
+    rcut = setfl.rcut;
+    init_setfl(setfl);
+  }
+
+  void init_setfl(const potentials::EamSetfl<double>& setfl) {
     std::vector<double> Fspl = setfl.Fspl, rhoaspl = setfl.rhoaspl, rphispl = setfl.rphispl;
     dF = eam_wf_malloc<double>(Fspl.size());
     dra = eam_wf_malloc<double>(rhoaspl.size());
@@ -106,6 +132,32 @@ struct GpuEamWindowState {
     d_fx = eam_wf_malloc<long long>(cap_m);
     d_fy = eam_wf_malloc<long long>(cap_m);
     d_fz = eam_wf_malloc<long long>(cap_m);
+    // cell-list per-atom buffers grow with the window (the cell COUNT — ncells —
+    // is box-static, allocated once in ensure_grid_geometry).
+    if (grid_.d_cell_of) { cudaFree(grid_.d_cell_of); cudaFree(grid_.d_order); }
+    grid_.d_cell_of = eam_wf_malloc<int>(cap_m);
+    grid_.d_order = eam_wf_malloc<int>(cap_m);
+    grid_.m = cap_m;
+  }
+
+  // Build the window cell grid GEOMETRY once (box-static: membership/box fixed for
+  // the run ⇒ make_zone_grid output + ncells are invariant). Per-pass only the
+  // counts/order are refreshed (in compute). Whole-box, periodic-z grid (F3) —
+  // the SAME full-Lz min-image fold geom.reduce uses, so it is a sound superset
+  // filter for the gathered cyclic subset (a z-AABB slab would miss seam pairs).
+  void ensure_grid_geometry() {
+    if (grid_built_) return;
+    grid_.g = make_zone_grid(box_lo, box_len, periodic, rcut, /*n_zones=*/1, /*zone_id=*/0);
+    grid_.ncells = grid_.g.ncells();
+    grid_.d_counts = eam_wf_malloc<int>(std::size_t(grid_.ncells));
+    grid_.d_starts = eam_wf_malloc<int>(std::size_t(grid_.ncells));
+    grid_.d_cursor = eam_wf_malloc<int>(std::size_t(grid_.ncells));
+    std::size_t cub_bytes = 0;
+    cub::DeviceScan::ExclusiveSum(nullptr, cub_bytes, grid_.d_counts, grid_.d_starts,
+                                  grid_.ncells);
+    grid_.cub_bytes = cub_bytes;
+    grid_.d_cub = eam_wf_malloc<char>(cub_bytes);
+    grid_built_ = true;
   }
 
   void free_scratch() {
@@ -120,6 +172,9 @@ struct GpuEamWindowState {
 
   ~GpuEamWindowState() {
     free_scratch();
+    for (void* p : {(void*)grid_.d_cell_of, (void*)grid_.d_order, (void*)grid_.d_counts,
+                    (void*)grid_.d_starts, (void*)grid_.d_cursor, grid_.d_cub})
+      if (p) cudaFree(p);
     for (void* p : {(void*)dF, (void*)dra, (void*)drp, (void*)d_pe, (void*)d_mr, (void*)d_of})
       if (p) cudaFree(p);
   }
@@ -131,8 +186,15 @@ struct GpuEamWindowState {
 struct GpuEamWindowForce {
   std::shared_ptr<GpuEamWindowState> st;
 
-  explicit GpuEamWindowForce(const potentials::EamSetfl<double>& setfl)
-      : st(std::make_shared<GpuEamWindowState>(setfl)) {}
+  // box is REQUIRED — the cell grid needs box.lo (F1); compute() only gets a
+  // PairGeom. cull=true ⇒ cell-list culling (cells ≡ all-window bitwise, B1);
+  // cull=false ⇒ the O(m²) all-window path (the in-process bitwise reference).
+  GpuEamWindowForce(const potentials::EamSetfl<double>& setfl, const core::Box& box,
+                    bool cull = true)
+      : st(std::make_shared<GpuEamWindowState>(setfl, box, cull)) {}
+
+  // non-vacuity witness: how many compute() calls took the culled path.
+  unsigned long long cells_passes() const { return st->cells_passes; }
 
   void compute(const double* wx, const double* wy, const double* wz, const long* key,
                int m, const int* owned, int n_owned, const core::PairGeom& geom,
@@ -161,16 +223,47 @@ struct GpuEamWindowForce {
     cudaMemcpy(s.d_mr, &s.sentinel, 8, cudaMemcpyHostToDevice);
     cudaMemcpy(s.d_of, &zof, 4, cudaMemcpyHostToDevice);
 
-    // 3 stream-ordered launches (verbatim E5 kernels) — ρ → F'(ρ) → force.
-    eam_density_kernel<<<ng(m), kB>>>(s.wx, s.wy, s.wz, m, geom, s.view, s.dens_scale,
-                                      s.d_rho, s.d_of);
-    eam_embedding_kernel<<<ng(m), kB>>>(m, s.view, s.dens_scale, s.rho_cap, s.d_rho,
-                                        s.d_fp, s.d_of);
-    if (n_owned > 0)
-      eam_force_kernel<<<ng(n_owned), kB>>>(s.wx, s.wy, s.wz, s.wkey, m, s.d_owned,
-                                            n_owned, geom, s.view, s.dens_scale,
-                                            s.d_rho, s.d_fp, s.d_fx, s.d_fy, s.d_fz,
-                                            s.d_pe, s.d_mr, s.d_of);
+    // ρ → F'(ρ) → force. embedding (O(m)) is identical on both paths; density and
+    // force are the heavy passes, culled when s.cull. ALL on the null stream (same
+    // as the force kernels) ⇒ grid → density → force ordered within one compute();
+    // the mutex serializes across z nodes ⇒ race-free, no events (do NOT split
+    // streams without an event — E5c per-stream is deferred).
+    if (s.cull) {
+      // refresh the box-static grid over the freshly-uploaded window (count → scan
+      // → scatter; geometry built once). cells ≡ all-window int64 BITWISE (B1:
+      // 27-cell candidates are a SUPERSET; geom.reduce r²<rc² re-test + quantize +
+      // order-free int64 sum unchanged) ⇒ the ring trajectory stays bitwise.
+      s.ensure_grid_geometry();
+      EamCellGrid& g = s.grid_;
+      cudaMemsetAsync(g.d_counts, 0, std::size_t(g.ncells) * sizeof(int));
+      cell_count_kernel<<<ng(m), kB>>>(s.wx, s.wy, s.wz, m, g.g, g.d_cell_of, g.d_counts);
+      cub::DeviceScan::ExclusiveSum(g.d_cub, g.cub_bytes, g.d_counts, g.d_starts, g.ncells);
+      cudaMemcpyAsync(g.d_cursor, g.d_starts, std::size_t(g.ncells) * sizeof(int),
+                      cudaMemcpyDeviceToDevice);
+      cell_scatter_kernel<<<ng(m), kB>>>(g.d_cell_of, m, g.d_cursor, g.d_order);
+      eam_density_cells_kernel<<<ng(m), kB>>>(s.wx, s.wy, s.wz, m, geom, s.view,
+                                              s.dens_scale, g.g, g.d_starts, g.d_counts,
+                                              g.d_order, s.d_rho, s.d_of);
+      eam_embedding_kernel<<<ng(m), kB>>>(m, s.view, s.dens_scale, s.rho_cap, s.d_rho,
+                                          s.d_fp, s.d_of);
+      if (n_owned > 0)
+        eam_force_cells_kernel<<<ng(n_owned), kB>>>(s.wx, s.wy, s.wz, s.wkey, m, s.d_owned,
+                                                    n_owned, geom, s.view, s.dens_scale,
+                                                    s.d_rho, s.d_fp, g.g, g.d_starts,
+                                                    g.d_counts, g.d_order, s.d_fx, s.d_fy,
+                                                    s.d_fz, s.d_pe, s.d_mr, s.d_of);
+      ++s.cells_passes;
+    } else {  // all-window O(m²) — the in-process bitwise reference (verbatim E5).
+      eam_density_kernel<<<ng(m), kB>>>(s.wx, s.wy, s.wz, m, geom, s.view, s.dens_scale,
+                                        s.d_rho, s.d_of);
+      eam_embedding_kernel<<<ng(m), kB>>>(m, s.view, s.dens_scale, s.rho_cap, s.d_rho,
+                                          s.d_fp, s.d_of);
+      if (n_owned > 0)
+        eam_force_kernel<<<ng(n_owned), kB>>>(s.wx, s.wy, s.wz, s.wkey, m, s.d_owned,
+                                              n_owned, geom, s.view, s.dens_scale,
+                                              s.d_rho, s.d_fp, s.d_fx, s.d_fy, s.d_fz,
+                                              s.d_pe, s.d_mr, s.d_of);
+    }
 
     // download the int64 raws + scalars
     int of = 0;

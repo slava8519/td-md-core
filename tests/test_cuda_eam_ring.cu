@@ -186,12 +186,13 @@ core::ConveyorOptions ring_opts(long steps, int n_zones, int n_nodes, double dt)
   return o;
 }
 
-// run the GPU EamRing (fresh device policy) on a copy of `init`.
+// run the GPU EamRing (fresh device policy) on a copy of `init`. cull=true ⇒ the
+// E5c cell-list culled per-window kernels (default); false ⇒ all-window O(m²).
 core::ConveyorResult run_gpu_ring(core::AtomSoA<double>& a, const core::Box& box,
                                   const SetflPot& pot,
                                   const potentials::EamSetfl<double>& setfl,
-                                  const core::ConveyorOptions& o) {
-  return potentials::run_eam_ring(a, box, pot, o, tdcu::GpuEamWindowForce(setfl));
+                                  const core::ConveyorOptions& o, bool cull = true) {
+  return potentials::run_eam_ring(a, box, pot, o, tdcu::GpuEamWindowForce(setfl, box, cull));
 }
 
 // PBC slab: an exact lattice period in z ⇒ seamless cyclic nn. reach_mult=2 needs
@@ -199,6 +200,15 @@ core::ConveyorResult run_gpu_ring(core::AtomSoA<double>& a, const core::Box& box
 // 8 z-cells (Lz=32.4, width 6.48 >= 6). 128 atoms.
 core::AtomSoA<double> make_fcc_pbc(core::Box& box) {
   auto a = make_fcc(2, 2, 8, 4.05, box);  // Lz = 32.4
+  box.periodic[2] = true;
+  return a;
+}
+
+// Fully-periodic WIDE slab: 3×3 in x/y ⇒ Lx=Ly=12.15 ⇒ the cull grid has
+// nx=ny=4 ≥ 3 cells (NON-degenerate) ⇒ exercises the periodic x/y wrap+min-image
+// fold IN-RING (make_fcc_pbc's Lx=Ly=8.1 degenerates x/y to a single cell). 288 atoms.
+core::AtomSoA<double> make_fcc_pbc_wide(core::Box& box) {
+  auto a = make_fcc(3, 3, 8, 4.05, box);  // Lx=Ly=12.15, Lz=32.4
   box.periodic[2] = true;
   return a;
 }
@@ -457,5 +467,47 @@ TEST(CudaEamGpuRing, GpuRingQ2340MatchesCpuRingBitwise) {
     const auto rg = run_gpu_ring(g, box, pot, setfl, ring_opts(steps, n_zones, z, dt));
     ASSERT_EQ(int(rg.halt), int(core::Halt::None)) << "z=" << z << " " << rg.halt_msg;
     EXPECT_TRUE(bitwise_eq(cpu_ref, g)) << "Q23.40 GPU ring z=" << z << " ≠ CPU ring";
+  }
+}
+
+// E5c-integration (the non-vacuity + in-ring transparency gate): the culled
+// (cell-list) ring trajectory + per-pass PE must be BITWISE == the all-window
+// ring (cells ≡ all-window by B1), AND cells must actually run in-ring. The
+// in-ring window geometry — periodic-degenerate x/y + free-z slab (free-z), and
+// whole-box periodic-z (PBC cyclic subset) — differs from the standalone
+// test_cuda_eam_cells, so this re-witnesses transparency in the REAL ring window.
+// (All other CudaEamGpuRing tests default cull=true ⇒ they now gate the culled
+// path against the CPU EamRing automatically.)
+TEST(CudaEamGpuRing, CulledRingMatchesAllWindowRingBitwise) {
+  const auto setfl = make_setfl();
+  const SetflPot pot(setfl);
+  const double dt = 0.001;
+  const long steps = 12;
+  enum Fx { FREE, PBC, PBC_WIDE };  // PBC_WIDE: non-degenerate x/y cull grid (nx≥3)
+  struct Case { Fx fx; int n_zones; };
+  for (Case cs : {Case{FREE, 4}, Case{PBC, 5}, Case{PBC_WIDE, 5}}) {
+    core::Box box;
+    core::AtomSoA<double> init = cs.fx == FREE ? make_fcc(2, 2, 6, 4.05, box)
+                                 : cs.fx == PBC ? make_fcc_pbc(box)
+                                                : make_fcc_pbc_wide(box);
+    const char* tag = cs.fx == FREE ? "free" : cs.fx == PBC ? "pbc" : "pbc-wide";
+    for (int z : {2, 3}) {
+      const auto o = ring_opts(steps, cs.n_zones, z, dt);
+      core::AtomSoA<double> aw = init;  // all-window reference
+      const auto raw = potentials::run_eam_ring(aw, box, pot, o,
+                                                tdcu::GpuEamWindowForce(setfl, box, false));
+      core::AtomSoA<double> cw = init;  // culled
+      tdcu::GpuEamWindowForce wf(setfl, box, true);
+      const auto rc = potentials::run_eam_ring(cw, box, pot, o, wf);
+      ASSERT_EQ(int(raw.halt), int(core::Halt::None)) << raw.halt_msg;
+      ASSERT_EQ(int(rc.halt), int(core::Halt::None)) << rc.halt_msg;
+      EXPECT_TRUE(bitwise_eq(aw, cw))
+          << "culled ≠ all-window ring (" << tag << " z=" << z << ")";
+      ASSERT_EQ(raw.stats.size(), rc.stats.size());
+      for (std::size_t h = 0; h < raw.stats.size(); ++h)  // per-pass PE (INV-9 int64)
+        EXPECT_EQ(raw.stats[h].pe, rc.stats[h].pe) << "pe pass " << h;
+      EXPECT_GT(wf.cells_passes(), 0u) << "cells never ran in-ring (vacuous)";
+      // min_r2 NOT compared across paths — min-over-examined differs by candidate set.
+    }
   }
 }
