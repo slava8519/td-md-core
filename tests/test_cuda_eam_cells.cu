@@ -26,6 +26,7 @@
 #include "tdmd/core/zones.hpp"
 #include "tdmd/cuda/zone_eam.cuh"
 #include "tdmd/cuda/zone_eam_cells.cuh"
+#include "tdmd/cuda/zone_eam_verlet.cuh"    // E5c tight-list (verlet) EAM kernels
 #include "tdmd/potentials/eam.hpp"          // eam_direct_fp64 (Test B oracle)
 #include "tdmd/potentials/eam_analytic.hpp"
 #include "tdmd/potentials/eam_spline.hpp"
@@ -126,10 +127,10 @@ struct GpuOut {
 // Backend selector: all-window O(m²) kernels (zone_eam.cuh) vs cell-list culled
 // kernels (zone_eam_cells.cuh). The density/embedding/force order is identical;
 // only the candidate generation of pass 1 + pass 3 differs.
-enum class Backend { AllWindow, Cells };
+enum class Backend { AllWindow, Cells, Verlet };
 
 GpuOut run_gpu(const Window& w, const potentials::EamSetfl<double>& setfl,
-               double dens_scale, double rho_cap, Backend be) {
+               double dens_scale, double rho_cap, Backend be, double skin = 1.0) {
   const int m = w.m;
   DevSetfl ds = upload_setfl(setfl);
   double* dx = upload(w.wx); double* dy = upload(w.wy); double* dz = upload(w.wz);
@@ -146,31 +147,40 @@ GpuOut run_gpu(const Window& w, const potentials::EamSetfl<double>& setfl,
   const int blk = tdcu::kZoneBlock;
   const int gd = (m + blk - 1) / blk;
 
+  const double box_lo[3] = {w.box.lo[0], w.box.lo[1], w.box.lo[2]};
+  const double box_len[3] = {w.box.hi[0] - w.box.lo[0], w.box.hi[1] - w.box.lo[1],
+                             w.box.hi[2] - w.box.lo[2]};
+  const bool per[3] = {w.box.periodic[0], w.box.periodic[1], w.box.periodic[2]};
   tdcu::EamCellGrid cg;
-  if (be == Backend::Cells) {
-    const double box_lo[3] = {w.box.lo[0], w.box.lo[1], w.box.lo[2]};
-    const double box_len[3] = {w.box.hi[0] - w.box.lo[0], w.box.hi[1] - w.box.lo[1],
-                               w.box.hi[2] - w.box.lo[2]};
-    const bool per[3] = {w.box.periodic[0], w.box.periodic[1], w.box.periodic[2]};
+  tdcu::EamVerletList vl;
+  if (be == Backend::Cells)
     cg = tdcu::eam_build_window_grid(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut);
-  }
+  else if (be == Backend::Verlet)
+    vl = tdcu::eam_build_verlet_list(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut, skin);
 
   if (be == Backend::AllWindow) {
     tdcu::eam_density_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, ds.view, dens_scale, d_rho, d_of);
-  } else {
+  } else if (be == Backend::Cells) {
     tdcu::eam_density_cells_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, ds.view, dens_scale,
                                                 cg.g, cg.d_starts, cg.d_counts, cg.d_order,
                                                 d_rho, d_of);
+  } else {
+    tdcu::eam_density_verlet_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, ds.view, dens_scale,
+                                                 vl.d_off, vl.d_idx, d_rho, d_of);
   }
   tdcu::eam_embedding_kernel<<<gd, blk>>>(m, ds.view, dens_scale, rho_cap, d_rho, d_fp, d_of);
   if (be == Backend::AllWindow) {
     tdcu::eam_force_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, ds.view,
                                         dens_scale, d_rho, d_fp, d_fx, d_fy, d_fz, d_pe, d_mr, d_of);
-  } else {
+  } else if (be == Backend::Cells) {
     tdcu::eam_force_cells_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, ds.view,
                                               dens_scale, d_rho, d_fp, cg.g, cg.d_starts,
                                               cg.d_counts, cg.d_order, d_fx, d_fy, d_fz, d_pe,
                                               d_mr, d_of);
+  } else {
+    tdcu::eam_force_verlet_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, ds.view,
+                                               dens_scale, d_rho, d_fp, vl.d_off, vl.d_idx,
+                                               d_fx, d_fy, d_fz, d_pe, d_mr, d_of);
   }
   EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
   GpuOut o;
@@ -183,6 +193,7 @@ GpuOut run_gpu(const Window& w, const potentials::EamSetfl<double>& setfl,
   cudaMemcpy(&o.min_r2_bits, d_mr, 8, cudaMemcpyDeviceToHost);
   cudaMemcpy(&o.overflow, d_of, 4, cudaMemcpyDeviceToHost);
   if (be == Backend::Cells) tdcu::eam_cells_free(cg);
+  if (be == Backend::Verlet) tdcu::eam_verlet_free(vl);
   for (void* p : {(void*)dx, (void*)dy, (void*)dz, (void*)dkey, (void*)downed, (void*)d_rho,
                   (void*)d_fp, (void*)d_fx, (void*)d_fy, (void*)d_fz, (void*)d_pe, (void*)d_mr, (void*)d_of})
     cudaFree(p);
@@ -198,17 +209,20 @@ potentials::EamSetfl<double> analytic_setfl(double beta) {
 // raw int64 -> physical (for Test B comparison vs the FP64 oracle)
 double force_of(long long raw) { return double(raw) / core::fixed::ForceAccum::kScale; }
 
-// Test A body: cells ≡ all-window, bit-for-bit, for one fb.
+// Test A / A' body: a culled backend (Cells or Verlet) ≡ all-window, bit-for-bit,
+// for one fb. pbc selects the free-z or the periodic-seam window. skin only feeds
+// the Verlet build (ignored by Cells).
 template <int FB>
-void check_self_equiv(double beta, unsigned seed) {
+void check_self_equiv(double beta, unsigned seed, Backend culled = Backend::Cells,
+                      bool pbc = false, double skin = 1.0) {
   const auto setfl = analytic_setfl(beta);
   ASSERT_EQ(setfl.density_fracbits(), FB);
   const double dens_scale = core::fixed::FixedAccum<FB>::kScale;
   const double rho_cap = setfl.density_grid_max();
-  const auto w = make_window(seed);
+  const auto w = pbc ? make_window_pbc(seed) : make_window(seed);
 
   const auto a = run_gpu(w, setfl, dens_scale, rho_cap, Backend::AllWindow);
-  const auto c = run_gpu(w, setfl, dens_scale, rho_cap, Backend::Cells);
+  const auto c = run_gpu(w, setfl, dens_scale, rho_cap, culled, skin);
 
   EXPECT_EQ(a.overflow, 0);
   EXPECT_EQ(c.overflow, a.overflow) << "overflow flags must match";
@@ -246,7 +260,8 @@ TEST(CudaEamCells, SelfEquivQ2340) {  // steep β=3.3 (fracbits==40)
 // the FP64 oracle (which walks ALL pairs) is the only witness of completeness.
 
 namespace {
-void check_vs_oracle(double beta, unsigned seed, int fb, bool pbc = false) {
+void check_vs_oracle(double beta, unsigned seed, int fb, bool pbc = false,
+                     Backend culled = Backend::Cells, double skin = 1.0) {
   const auto setfl = analytic_setfl(beta);
   ASSERT_EQ(setfl.density_fracbits(), fb);
   const double dens_scale = (fb == 44) ? core::fixed::FixedAccum<44>::kScale
@@ -265,7 +280,7 @@ void check_vs_oracle(double beta, unsigned seed, int fb, bool pbc = false) {
       at, w.box, setfl, /*with_forces=*/true, &rho_oracle);
 
   // culled GPU run
-  const auto c = run_gpu(w, setfl, dens_scale, rho_cap, Backend::Cells);
+  const auto c = run_gpu(w, setfl, dens_scale, rho_cap, culled, skin);
   EXPECT_EQ(c.overflow, 0);
 
   // per-atom density: the fixed-point ρ vs the FP64 oracle ρ (~quantization +
@@ -297,4 +312,37 @@ TEST(CudaEamCells, VsOracleQ2340) {  // dropped-donor gate, steep β=3.3
 }
 TEST(CudaEamCells, VsOraclePbc) {  // dropped-donor gate across the PERIODIC seam
   check_vs_oracle(1.5, 13, 44, /*pbc=*/true);  // exercises grid wrap + min-image
+}
+
+// ========================== Test A' (verlet) ============================
+// The TIGHT per-atom verlet list ≡ all-window, bit-for-bit (same B1 argument as
+// cells: the list within rcut+skin is a SUPERSET of the in-cutoff set; the exact
+// r2<rcut² re-test keeps the in-cutoff multiset identical ⇒ raw int64 bit-equal).
+// fb=44 + fb=40 (steep β=3.3), free-z + a PBC variant. skin=1.0.
+
+TEST(CudaEamVerlet, SelfEquivQ1944) {  // bitwise verlet ≡ all-window, fb=44, free-z
+  check_self_equiv<44>(1.5, 7, Backend::Verlet, /*pbc=*/false, /*skin=*/1.0);
+}
+TEST(CudaEamVerlet, SelfEquivQ2340) {  // steep β=3.3 (fracbits==40)
+  check_self_equiv<40>(3.3, 11, Backend::Verlet, /*pbc=*/false, /*skin=*/1.0);
+}
+TEST(CudaEamVerlet, SelfEquivPbc) {  // verlet ≡ all-window across the PERIODIC seam
+  check_self_equiv<44>(1.5, 13, Backend::Verlet, /*pbc=*/true, /*skin=*/1.0);
+}
+
+// ========================== Test B' (verlet) ============================
+// THE blocking dropped-donor gate for the tight list: verlet density+force vs
+// eam_direct_fp64 (all-pairs FP64, no grid, no quantize). A list that drops a ρ
+// donor (e.g. a build grid too small for rcut+skin, or a half list) truncates ρ
+// deterministically — invisible to A' (verlet-vs-itself); only the FP64 oracle,
+// which walks ALL pairs, witnesses completeness. skin=1.0.
+
+TEST(CudaEamVerlet, VsOracleQ1944) {  // dropped-donor gate, fb=44, free-z
+  check_vs_oracle(1.5, 7, 44, /*pbc=*/false, Backend::Verlet, /*skin=*/1.0);
+}
+TEST(CudaEamVerlet, VsOracleQ2340) {  // dropped-donor gate, steep β=3.3
+  check_vs_oracle(3.3, 11, 40, /*pbc=*/false, Backend::Verlet, /*skin=*/1.0);
+}
+TEST(CudaEamVerlet, VsOraclePbc) {  // dropped-donor gate across the PERIODIC seam
+  check_vs_oracle(1.5, 13, 44, /*pbc=*/true, Backend::Verlet, /*skin=*/1.0);
 }

@@ -18,6 +18,7 @@
 #include "tdmd/core/zones.hpp"
 #include "tdmd/cuda/zone_eam.cuh"
 #include "tdmd/cuda/zone_eam_cells.cuh"   // E5c: cell-list culled EAM kernels
+#include "tdmd/cuda/zone_eam_verlet.cuh"  // E5c: tight per-atom verlet-list EAM kernels
 #include "tdmd/metrics/eam_breakdown.hpp"
 #include "tdmd/potentials/eam_analytic.hpp"
 #include "tdmd/potentials/eam_spline.hpp"
@@ -67,28 +68,42 @@ double occ(K kernel, int block) {
 }  // namespace
 
 int main(int argc, char** argv) {
-  int nc = 8; long steps = 50; double rcut = 4.0;
-  std::string backend = "allwindow";  // E5c bake-off: allwindow | cells
+  int nc = 8; long steps = 50; double rcut = 4.0; double skin = 1.0;
+  std::string backend = "allwindow";  // E5c bake-off: allwindow | cells | verlet
+  std::string setfl_path;  // like-for-like: a real setfl (e.g. Al_zhou.eam.alloy)
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--cells") nc = std::stoi(argv[++i]);
     else if (a == "--steps") steps = std::stol(argv[++i]);
     else if (a == "--rcut") rcut = std::stod(argv[++i]);
     else if (a == "--backend") backend = argv[++i];
+    else if (a == "--setfl") setfl_path = argv[++i];
+    else if (a == "--skin") skin = std::stod(argv[++i]);
   }
-  if (backend != "allwindow" && backend != "cells") {
-    std::printf("bench_eam: --backend must be allwindow|cells (got '%s')\n", backend.c_str());
+  if (backend != "allwindow" && backend != "cells" && backend != "verlet") {
+    std::printf("bench_eam: --backend must be allwindow|cells|verlet (got '%s')\n", backend.c_str());
     return 2;
   }
   const bool use_cells = (backend == "cells");
+  const bool use_verlet = (backend == "verlet");
   cudaDeviceProp pr{}; cudaGetDeviceProperties(&pr, 0);
   std::printf("bench_eam: %s, %d SMs\n", pr.name, pr.multiProcessorCount);
 
   core::Box box;
   auto at = make_fcc(box, nc, 4.05);
   const int m = at.n;
-  potentials::AnalyticEam<double> am; am.rcut = rcut; am.finalize();
-  const auto setfl = potentials::EamSetfl<double>::from_analytic(am, 4000, 4000, 60.0);
+  // potential: a real setfl (--setfl, identical pair math to LAMMPS) OR the
+  // analytic-tabulated EAM (default). from_setfl carries its own rcut.
+  potentials::EamSetfl<double> setfl = [&] {
+    if (!setfl_path.empty()) {
+      auto s = potentials::EamSetfl<double>::from_setfl(setfl_path);
+      rcut = s.rcut;
+      std::printf("bench_eam: setfl=%s, rcut=%.4f Å (like-for-like)\n", setfl_path.c_str(), s.rcut);
+      return s;
+    }
+    potentials::AnalyticEam<double> am; am.rcut = rcut; am.finalize();
+    return potentials::EamSetfl<double>::from_analytic(am, 4000, 4000, 60.0);
+  }();
   const int fb = setfl.density_fracbits();
   const double dens_scale = (fb == 44) ? core::fixed::FixedAccum<44>::kScale
                                        : core::fixed::FixedAccum<40>::kScale;
@@ -120,9 +135,20 @@ int main(int argc, char** argv) {
   const double box_len[3] = {box.hi[0] - box.lo[0], box.hi[1] - box.lo[1], box.hi[2] - box.lo[2]};
   const bool per[3] = {box.periodic[0], box.periodic[1], box.periodic[2]};
   tdcu::EamCellGrid cg{};
-  auto build_grid = [&] {
-    if (cg.d_order) tdcu::eam_cells_free(cg);
-    cg = tdcu::eam_build_window_grid(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut);
+  tdcu::EamVerletList vl{};
+  // The per-step candidate structure: cells rebuild the rcut grid; verlet
+  // rebuilds the tight (rcut+skin) CSR list. allwindow has none. In a real engine
+  // the verlet list is rebuilt only every K steps (skin amortizes it — LAMMPS's
+  // Neigh was ~0% at equilibrium), so we time the build SEPARATELY (one-time) and
+  // the iterate-only kernels per step (the steady-state cost).
+  auto build_struct = [&] {
+    if (use_cells) {
+      if (cg.d_order) tdcu::eam_cells_free(cg);
+      cg = tdcu::eam_build_window_grid(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut);
+    } else if (use_verlet) {
+      if (vl.d_off) tdcu::eam_verlet_free(vl);
+      vl = tdcu::eam_build_verlet_list(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut, skin);
+    }
   };
 
   auto dens = [&] {
@@ -130,6 +156,9 @@ int main(int argc, char** argv) {
       tdcu::eam_density_cells_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, view, dens_scale,
                                                   cg.g, cg.d_starts, cg.d_counts, cg.d_order,
                                                   d_rho, d_of);
+    else if (use_verlet)
+      tdcu::eam_density_verlet_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, view, dens_scale,
+                                                   vl.d_off, vl.d_idx, d_rho, d_of);
     else
       tdcu::eam_density_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, view, dens_scale, d_rho, d_of);
   };
@@ -140,21 +169,35 @@ int main(int argc, char** argv) {
                                                 dens_scale, d_rho, d_fp, cg.g, cg.d_starts,
                                                 cg.d_counts, cg.d_order, d_fx, d_fy, d_fz, d_pe,
                                                 d_mr, d_of);
+    else if (use_verlet)
+      tdcu::eam_force_verlet_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, view,
+                                                 dens_scale, d_rho, d_fp, vl.d_off, vl.d_idx,
+                                                 d_fx, d_fy, d_fz, d_pe, d_mr, d_of);
     else
       tdcu::eam_force_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, view, dens_scale, d_rho, d_fp, d_fx, d_fy, d_fz, d_pe, d_mr, d_of);
   };
 
   cudaEvent_t e0, e1, e2, e3; for (auto* e : {&e0, &e1, &e2, &e3}) cudaEventCreate(e);
-  // warmup
-  if (use_cells) build_grid();
+  cudaEvent_t b0, b1; cudaEventCreate(&b0); cudaEventCreate(&b1);
+  double build_ms_total = 0.0;   // cells: summed over steps; verlet: one-time
+  long long list_nnz = 0;        // verlet: total neighbours (avg = nnz/m)
+
+  // warmup + (for verlet) build the tight list ONCE. The realistic steady-state
+  // per-step cost is the iterate-only kernels; the list rebuild is amortized over
+  // its rebuild interval in a real engine (skin-bounded — LAMMPS Neigh ≈0% at
+  // equilibrium), so it's reported as a SEPARATE one-time number, not per step.
+  if (use_cells) build_struct();
+  if (use_verlet) {
+    cudaEventRecord(b0); build_struct(); cudaEventRecord(b1); cudaEventSynchronize(b1);
+    float tb = 0; cudaEventElapsedTime(&tb, b0, b1); build_ms_total = tb;
+    list_nnz = vl.nnz;
+  }
   dens(); emb(); frc(); cudaDeviceSynchronize();
 
   metrics::EamPhaseBreakdown bd; bd.n_atoms = m; bd.steps = steps;
-  double build_ms_total = 0.0;
-  cudaEvent_t b0, b1; cudaEventCreate(&b0); cudaEventCreate(&b1);
   for (long s = 0; s < steps; ++s) {
     if (use_cells) {
-      cudaEventRecord(b0); build_grid(); cudaEventRecord(b1); cudaEventSynchronize(b1);
+      cudaEventRecord(b0); build_struct(); cudaEventRecord(b1); cudaEventSynchronize(b1);
       float tb = 0; cudaEventElapsedTime(&tb, b0, b1); build_ms_total += tb;
     }
     float td = 0, te = 0, tf = 0;
@@ -177,22 +220,79 @@ int main(int argc, char** argv) {
 
   int of = 0; cudaMemcpy(&of, d_of, 4, cudaMemcpyDeviceToHost);
   if (use_cells) tdcu::eam_cells_free(cg);
+  if (use_verlet) tdcu::eam_verlet_free(vl);
+
+  // Candidate enumeration cost per atom — what makes the over-fetch visible:
+  //   real/atom    = in-cutoff (rcut) neighbours/atom (the irreducible work)
+  //   cells exam/atom = the 27-cell (rcut-grid) candidates/atom (the over-fetch)
+  //   verlet nbr/atom = the tight (rcut+skin) list size/atom (what we measure)
+  const double real_per_atom = double(real) / double(m);
+  // cells examined/atom: replicate the 27-cell rcut-grid neighbourhood count on CPU.
+  long long cells_exam = 0;
+  {
+    tdcu::CellGrid g = tdcu::make_zone_grid(box_lo, box_len, per, setfl.rcut, 1, 0);
+    std::vector<int> cell_of(m);
+    std::vector<std::vector<int>> cells_atoms(g.ncells());
+    for (int i = 0; i < m; ++i) {
+      int ix, iy, iz; g.coords(wx[i], wy[i], wz[i], ix, iy, iz);
+      const int c = g.idx(ix, iy, iz); cell_of[i] = c; cells_atoms[c].push_back(i);
+    }
+    for (int i = 0; i < m; ++i) {
+      int cxi, cyi, czi; g.coords(wx[i], wy[i], wz[i], cxi, cyi, czi);
+      const int dzlo = (g.nz == 1) ? 0 : -1, dzhi = (g.nz == 1) ? 0 : 1;
+      const int dylo = (g.ny == 1) ? 0 : -1, dyhi = (g.ny == 1) ? 0 : 1;
+      const int dxlo = (g.nx == 1) ? 0 : -1, dxhi = (g.nx == 1) ? 0 : 1;
+      for (int dz = dzlo; dz <= dzhi; ++dz) {
+        int zc = czi + dz; if (g.wrapz) zc = (zc + g.nz) % g.nz; else if (zc < 0 || zc >= g.nz) continue;
+        for (int dy = dylo; dy <= dyhi; ++dy) {
+          int yc = cyi + dy; if (g.wrapy) yc = (yc + g.ny) % g.ny; else if (yc < 0 || yc >= g.ny) continue;
+          for (int dx = dxlo; dx <= dxhi; ++dx) {
+            int xc = cxi + dx; if (g.wrapx) xc = (xc + g.nx) % g.nx; else if (xc < 0 || xc >= g.nx) continue;
+            cells_exam += (long long)cells_atoms[g.idx(xc, yc, zc)].size();  // includes self in own cell
+          }
+        }
+      }
+    }
+  }
+  const double cells_exam_per_atom = double(cells_exam) / double(m);
+
   bd.report(backend.c_str());
   if (use_cells)
     std::printf("grid-build: %.4f ms/step (rebuilt over the whole window each step)\n",
                 build_ms_total / double(steps));
+  if (use_verlet)
+    std::printf("list-build: %.4f ms (ONE-TIME — amortized over the rebuild interval; "
+                "steady-state per-step cost is the iterate-only kernels above)\n",
+                build_ms_total);
   if (use_cells)
     std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
                 occ(tdcu::eam_density_cells_kernel, blk), occ(tdcu::eam_embedding_kernel, blk),
                 occ(tdcu::eam_force_cells_kernel, blk), of);
+  else if (use_verlet)
+    std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
+                occ(tdcu::eam_density_verlet_kernel, blk), occ(tdcu::eam_embedding_kernel, blk),
+                occ(tdcu::eam_force_verlet_kernel, blk), of);
   else
     std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
                 occ(tdcu::eam_density_kernel, blk), occ(tdcu::eam_embedding_kernel, blk),
                 occ(tdcu::eam_force_kernel, blk), of);
+
+  // The over-fetch table: real (irreducible) vs cells-27-cell vs verlet-tight.
+  std::printf("candidate enumeration: real/atom=%.1f | cells exam/atom=%.1f (%.2fx over-fetch)",
+              real_per_atom, cells_exam_per_atom,
+              real_per_atom > 0 ? cells_exam_per_atom / real_per_atom : 0.0);
+  if (use_verlet)
+    std::printf(" | verlet nbr/atom=%.1f (skin=%.2f, %.2fx over-fetch, %lld total)",
+                double(list_nnz) / double(m), skin,
+                real_per_atom > 0 ? (double(list_nnz) / double(m)) / real_per_atom : 0.0,
+                list_nnz);
+  std::printf("\n");
+
   std::printf(
-      "NOTE: backend=%s. hit-rate %.4f ⇒ predicted cull = 1/hit-rate = %.1fx on the\n"
-      "      candidate set. Run --backend allwindow vs --backend cells at the same\n"
-      "      --cells to read the REALIZED density/force speedup vs this prediction.\n",
+      "NOTE: backend=%s. all-window hit-rate %.4f ⇒ predicted cull = 1/hit-rate = %.1fx\n"
+      "      on the all-pairs candidate set. Run allwindow vs cells vs verlet at the same\n"
+      "      --cells to read the REALIZED density/force speedup; the tight verlet list\n"
+      "      shows how much of the gap is the cells 27-cell over-fetch (~8x).\n",
       backend.c_str(), bd.hit_rate(), bd.hit_rate() > 0 ? 1.0 / bd.hit_rate() : 0.0);
   return 0;
 }
