@@ -252,19 +252,11 @@ class EamRing {
 
     // finalize CENTER zone j over the resident window {j-1, j, j+1} (free-z).
     auto finalize_owned = [&](int j) -> bool {
-      // window slot positions. PBC: CYCLIC {(j-1)%n, j, (j+1)%n} (n>=5 ⇒ all
-      // distinct). free-z: drop out-of-range. (PR-E3b-PBC)
-      int wslots[3], nw = 0;
-      if (box_.periodic[2]) {
-        wslots[nw++] = (j - 1 + n_) % n_;
-        wslots[nw++] = j;
-        wslots[nw++] = (j + 1) % n_;
-      } else {
-        for (int d = -1; d <= 1; ++d) {
-          const int p = j + d;
-          if (p >= 0 && p < n_) wslots[nw++] = p;
-        }
-      }
+      // window slot positions — the SINGLE source of truth shared with the GPU
+      // EamGpuConveyor gather (E5b F4): PBC cyclic {(j-1)%n,j,(j+1)%n} (n>=5 ⇒
+      // distinct), free-z drop out-of-range. (PR-E3b-PBC; factored E5b.)
+      int wslots[3];
+      const int nw = eam_window_layout(j, n_, box_.periodic[2], wslots);
       // self-drift the cyclic members: the scan-boundary ensure_drift(j-1,j,j+1)
       // clamps out-of-range, so the wrap neighbour (owned 0 / n-1) isn't drifted
       // there. ensure_drift is idempotent (checks s.drifted).

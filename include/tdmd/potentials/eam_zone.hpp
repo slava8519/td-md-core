@@ -55,6 +55,33 @@ inline std::vector<int> zone_eam_window(const core::ZoneDecomposition& zd, int z
   return w;
 }
 
+// M6 E5b (F4) — window-slot layout for the 3-zone EAM residence {j-1, j, j+1}:
+// the SINGLE source of truth shared by the CPU EamRing AND the GPU EamGpuConveyor
+// gather, so the center-vs-edge / PBC-cyclic / free-z-drop slot selection is
+// IDENTICAL by construction. A divergence here silently drops a donor ⇒ ρ_j
+// truncated ⇒ force wrong on ALL z (invisible to 1-vs-z) — eliminating that
+// off-by-one class is exactly why this is one function. Returns nw ∈ {2,3} and
+// fills wslots[0..nw) in increasing window order; the CENTER zone j is always
+// present (its owned atoms are the ones finalized).
+//   PBC (z periodic): cyclic {(j-1+n)%n, j, (j+1)%n} — n≥5 ⇒ all distinct
+//     (ZoneDecomposition reach_mult=2 guard). free-z: the in-range subset of
+//     {j-1, j, j+1}, edges DROP (j=0→{0,1}, j=n-1→{n-2,n-1}); never clamp
+//     (clamping would scoop S_{j-2} or duplicate a slot).
+inline int eam_window_layout(int j, int n, bool pbc, int wslots[3]) {
+  int nw = 0;
+  if (pbc) {
+    wslots[nw++] = (j - 1 + n) % n;
+    wslots[nw++] = j;
+    wslots[nw++] = (j + 1) % n;
+  } else {
+    for (int d = -1; d <= 1; ++d) {
+      const int p = j + d;
+      if (p >= 0 && p < n) wslots[nw++] = p;
+    }
+  }
+  return nw;
+}
+
 // M6 PR-E3b-1 — the 3-pass EAM force on ONE owned zone over a CONTIGUOUS window,
 // addressed by local index. Extracted from the per-zone body so BOTH the serial
 // oracle (global AtomSoA) and the threaded EamRing (fragmented per-zone payloads
