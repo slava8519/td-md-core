@@ -207,6 +207,10 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_metrics PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_Metrics COMMAND test_metrics)
 
+  add_executable(test_oracle tests/test_oracle.cpp)        # M4-N Gate-02a: physical oracle
+  target_link_libraries(test_oracle PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_Physical_Oracle COMMAND test_oracle)
+
   add_executable(test_eam_ring tests/test_eam_ring.cpp)    # M6 PR-E3b: threaded EAM ring
   target_link_libraries(test_eam_ring PRIVATE tdmd_core GTest::gtest_main Threads::Threads)
   add_test(NAME Test_EAM_Ring COMMAND test_eam_ring)
