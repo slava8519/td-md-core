@@ -110,6 +110,14 @@ if(TDMD_WITH_CUDA)
   target_link_libraries(bench_eam PRIVATE tdmd_core)
   target_compile_options(bench_eam PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+
+  # E5c FMA twin: same kernels, FMA contraction ON (the GPU default). On the
+  # FP64-1:64 RTX 5080 a fused mul-add is 1 FP64 op vs 2 ⇒ ~2× the FP64
+  # throughput of the --fmad=false determinism build. GPU-INTERNAL determinism
+  # survives FMA (1-vs-z bitwise, B1 empirical — like bench_conveyor_fma); only
+  # the CPU↔GPU bitwise contract is given up. Measures the determinism tax on EAM.
+  add_executable(bench_eam_fma tools/bench_eam.cu)
+  target_link_libraries(bench_eam_fma PRIVATE tdmd_core)
 endif()
 
 # --- M3 timing evidence: direct vs clustered (manual tool, not a CI gate) ---

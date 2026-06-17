@@ -20,6 +20,7 @@
 #include "tdmd/cuda/zone_eam_cells.cuh"    // E5c: cell-list culled EAM kernels
 #include "tdmd/cuda/zone_eam_verlet.cuh"   // E5c: tight per-atom verlet-list EAM kernels
 #include "tdmd/cuda/zone_eam_newton3.cuh"  // E5c: half-list + Newton-3 EAM kernels
+#include "tdmd/cuda/zone_eam_sorted.cuh"   // E5c: spatial-sort + coalesced EAM kernels
 #include "tdmd/metrics/eam_breakdown.hpp"
 #include "tdmd/potentials/eam_analytic.hpp"
 #include "tdmd/potentials/eam_spline.hpp"
@@ -70,7 +71,7 @@ double occ(K kernel, int block) {
 
 int main(int argc, char** argv) {
   int nc = 8; long steps = 50; double rcut = 4.0; double skin = 1.0;
-  std::string backend = "allwindow";  // E5c bake-off: allwindow | cells | verlet | newton3
+  std::string backend = "allwindow";  // E5c bake-off: allwindow | cells | verlet | newton3 | sorted
   std::string setfl_path;  // like-for-like: a real setfl (e.g. Al_zhou.eam.alloy)
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -82,13 +83,14 @@ int main(int argc, char** argv) {
     else if (a == "--skin") skin = std::stod(argv[++i]);
   }
   if (backend != "allwindow" && backend != "cells" && backend != "verlet" &&
-      backend != "newton3") {
-    std::printf("bench_eam: --backend must be allwindow|cells|verlet|newton3 (got '%s')\n", backend.c_str());
+      backend != "newton3" && backend != "sorted") {
+    std::printf("bench_eam: --backend must be allwindow|cells|verlet|newton3|sorted (got '%s')\n", backend.c_str());
     return 2;
   }
   const bool use_cells = (backend == "cells");
   const bool use_verlet = (backend == "verlet");
   const bool use_newton3 = (backend == "newton3");
+  const bool use_sorted = (backend == "sorted");
   cudaDeviceProp pr{}; cudaGetDeviceProperties(&pr, 0);
   std::printf("bench_eam: %s, %d SMs\n", pr.name, pr.multiProcessorCount);
 
@@ -139,8 +141,17 @@ int main(int argc, char** argv) {
   const bool per[3] = {box.periodic[0], box.periodic[1], box.periodic[2]};
   tdcu::EamCellGrid cg{};
   tdcu::EamVerletList vl{};
+  tdcu::EamSortedWindow sw{};
+  // SORTED-slot scratch (the sorted kernels run in cell-sorted slot space; the
+  // per-atom int64 rho/fx/fy/fz are un-sorted back into d_rho/d_fx/... after).
+  long long* d_rho_s = use_sorted ? up(z64) : nullptr;
+  double* d_fp_s = use_sorted ? up(zd) : nullptr;
+  long long* d_fx_s = use_sorted ? up(z64) : nullptr;
+  long long* d_fy_s = use_sorted ? up(z64) : nullptr;
+  long long* d_fz_s = use_sorted ? up(z64) : nullptr;
   // The per-step candidate structure: cells rebuild the rcut grid; verlet
-  // rebuilds the tight (rcut+skin) CSR list. allwindow has none. In a real engine
+  // rebuilds the tight (rcut+skin) CSR list; sorted cell-sorts then builds the
+  // tight list over the sorted positions. allwindow has none. In a real engine
   // the verlet list is rebuilt only every K steps (skin amortizes it — LAMMPS's
   // Neigh was ~0% at equilibrium), so we time the build SEPARATELY (one-time) and
   // the iterate-only kernels per step (the steady-state cost).
@@ -151,6 +162,9 @@ int main(int argc, char** argv) {
     } else if (use_verlet || use_newton3) {  // both walk a per-atom verlet CSR
       if (vl.d_off) tdcu::eam_verlet_free(vl);
       vl = tdcu::eam_build_verlet_list(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut, skin);
+    } else if (use_sorted) {  // cell-sort + tight list over the sorted positions
+      if (sw.sx) tdcu::eam_sorted_free(sw);
+      sw = tdcu::eam_sort_window(dx, dy, dz, dkey, m, box_lo, box_len, per, setfl.rcut, skin);
     }
   };
 
@@ -170,10 +184,20 @@ int main(int argc, char** argv) {
       cudaMemsetAsync(d_rho, 0, size_t(m) * sizeof(long long));
       tdcu::eam_density_n3_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, view, dens_scale,
                                                vl.d_off, vl.d_idx, d_rho, d_of);
-    } else
+    } else if (use_sorted)
+      tdcu::eam_density_sorted_kernel<<<gd, blk>>>(sw.sx, sw.sy, sw.sz, m, geom, view,
+                                                   dens_scale, sw.vl.d_off, sw.vl.d_idx,
+                                                   d_rho_s, d_of);
+    else
       tdcu::eam_density_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, view, dens_scale, d_rho, d_of);
   };
-  auto emb  = [&] { tdcu::eam_embedding_kernel<<<gd, blk>>>(m, view, dens_scale, rho_cap, d_rho, d_fp, d_of); };
+  // embedding runs on the SORTED-slot rho for the sorted backend (-> d_fp_s).
+  auto emb  = [&] {
+    if (use_sorted)
+      tdcu::eam_embedding_kernel<<<gd, blk>>>(m, view, dens_scale, rho_cap, d_rho_s, d_fp_s, d_of);
+    else
+      tdcu::eam_embedding_kernel<<<gd, blk>>>(m, view, dens_scale, rho_cap, d_rho, d_fp, d_of);
+  };
   auto frc  = [&] {
     if (use_cells)
       tdcu::eam_force_cells_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, view,
@@ -193,6 +217,16 @@ int main(int argc, char** argv) {
       tdcu::eam_force_n3_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, view, d_fp,
                                              vl.d_off, vl.d_idx, d_fx, d_fy, d_fz, d_pe,
                                              d_mr, d_of);
+    } else if (use_sorted) {
+      tdcu::eam_force_sorted_kernel<<<gd, blk>>>(sw.sx, sw.sy, sw.sz, sw.s_key, m, geom,
+                                                 view, dens_scale, d_rho_s, d_fp_s,
+                                                 sw.vl.d_off, sw.vl.d_idx, d_fx_s, d_fy_s,
+                                                 d_fz_s, d_pe, d_mr, d_of);
+      // un-sort the per-atom int64 force back to original window order (the
+      // bitwise-correct result; part of the per-step steady-state cost).
+      tdcu::eam_unsort_scatter_kernel<<<gd, blk>>>(d_fx_s, m, sw.d_order, d_fx);
+      tdcu::eam_unsort_scatter_kernel<<<gd, blk>>>(d_fy_s, m, sw.d_order, d_fy);
+      tdcu::eam_unsort_scatter_kernel<<<gd, blk>>>(d_fz_s, m, sw.d_order, d_fz);
     } else
       tdcu::eam_force_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, view, dens_scale, d_rho, d_fp, d_fx, d_fy, d_fz, d_pe, d_mr, d_of);
   };
@@ -207,10 +241,10 @@ int main(int argc, char** argv) {
   // its rebuild interval in a real engine (skin-bounded — LAMMPS Neigh ≈0% at
   // equilibrium), so it's reported as a SEPARATE one-time number, not per step.
   if (use_cells) build_struct();
-  if (use_verlet || use_newton3) {
+  if (use_verlet || use_newton3 || use_sorted) {
     cudaEventRecord(b0); build_struct(); cudaEventRecord(b1); cudaEventSynchronize(b1);
     float tb = 0; cudaEventElapsedTime(&tb, b0, b1); build_ms_total = tb;
-    list_nnz = vl.nnz;
+    list_nnz = use_sorted ? sw.vl.nnz : vl.nnz;
   }
   dens(); emb(); frc(); cudaDeviceSynchronize();
 
@@ -241,6 +275,7 @@ int main(int argc, char** argv) {
   int of = 0; cudaMemcpy(&of, d_of, 4, cudaMemcpyDeviceToHost);
   if (use_cells) tdcu::eam_cells_free(cg);
   if (use_verlet || use_newton3) tdcu::eam_verlet_free(vl);
+  if (use_sorted) tdcu::eam_sorted_free(sw);
 
   // Candidate enumeration cost per atom — what makes the over-fetch visible:
   //   real/atom    = in-cutoff (rcut) neighbours/atom (the irreducible work)
@@ -280,11 +315,12 @@ int main(int argc, char** argv) {
   if (use_cells)
     std::printf("grid-build: %.4f ms/step (rebuilt over the whole window each step)\n",
                 build_ms_total / double(steps));
-  if (use_verlet || use_newton3)
-    std::printf("list-build: %.4f ms (ONE-TIME — amortized over the rebuild interval; "
+  if (use_verlet || use_newton3 || use_sorted)
+    std::printf("%s-build: %.4f ms (ONE-TIME — amortized over the rebuild interval; "
                 "steady-state per-step cost is the iterate-only kernels above%s)\n",
-                build_ms_total,
-                use_newton3 ? " + the per-step memset of the int64 atomicAdd targets" : "");
+                use_sorted ? "sort+list" : "list", build_ms_total,
+                use_newton3 ? " + the per-step memset of the int64 atomicAdd targets"
+                : use_sorted ? " + the per-step un-sort scatter of the int64 force" : "");
   if (use_cells)
     std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
                 occ(tdcu::eam_density_cells_kernel, blk), occ(tdcu::eam_embedding_kernel, blk),
@@ -297,6 +333,10 @@ int main(int argc, char** argv) {
     std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
                 occ(tdcu::eam_density_n3_kernel, blk), occ(tdcu::eam_embedding_kernel, blk),
                 occ(tdcu::eam_force_n3_kernel, blk), of);
+  else if (use_sorted)
+    std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
+                occ(tdcu::eam_density_sorted_kernel, blk), occ(tdcu::eam_embedding_kernel, blk),
+                occ(tdcu::eam_force_sorted_kernel, blk), of);
   else
     std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
                 occ(tdcu::eam_density_kernel, blk), occ(tdcu::eam_embedding_kernel, blk),
@@ -306,13 +346,14 @@ int main(int argc, char** argv) {
   std::printf("candidate enumeration: real/atom=%.1f | cells exam/atom=%.1f (%.2fx over-fetch)",
               real_per_atom, cells_exam_per_atom,
               real_per_atom > 0 ? cells_exam_per_atom / real_per_atom : 0.0);
-  if (use_verlet || use_newton3)
+  if (use_verlet || use_newton3 || use_sorted)
     std::printf(" | %s nbr/atom=%.1f (skin=%.2f, %.2fx over-fetch, %lld total%s)",
-                use_newton3 ? "n3-full-list" : "verlet",
+                use_newton3 ? "n3-full-list" : use_sorted ? "sorted-verlet" : "verlet",
                 double(list_nnz) / double(m), skin,
                 real_per_atom > 0 ? (double(list_nnz) / double(m)) / real_per_atom : 0.0,
                 list_nnz,
-                use_newton3 ? "; the bb>aa gate halves the EVAL to ~half this" : "");
+                use_newton3 ? "; the bb>aa gate halves the EVAL to ~half this"
+                : use_sorted ? "; cell-sorted ⇒ neighbour gathers coalesce" : "");
   std::printf("\n");
 
   std::printf(

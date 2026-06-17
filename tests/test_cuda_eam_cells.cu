@@ -28,6 +28,7 @@
 #include "tdmd/cuda/zone_eam_cells.cuh"
 #include "tdmd/cuda/zone_eam_verlet.cuh"    // E5c tight-list (verlet) EAM kernels
 #include "tdmd/cuda/zone_eam_newton3.cuh"   // E5c HALF-LIST + NEWTON-3 EAM kernels
+#include "tdmd/cuda/zone_eam_sorted.cuh"    // E5c SPATIAL-SORT + coalesced EAM kernels
 #include "tdmd/potentials/eam.hpp"          // eam_direct_fp64 (Test B oracle)
 #include "tdmd/potentials/eam_analytic.hpp"
 #include "tdmd/potentials/eam_spline.hpp"
@@ -128,7 +129,7 @@ struct GpuOut {
 // Backend selector: all-window O(m²) kernels (zone_eam.cuh) vs cell-list culled
 // kernels (zone_eam_cells.cuh). The density/embedding/force order is identical;
 // only the candidate generation of pass 1 + pass 3 differs.
-enum class Backend { AllWindow, Cells, Verlet, Newton3 };
+enum class Backend { AllWindow, Cells, Verlet, Newton3, Sorted };
 
 GpuOut run_gpu(const Window& w, const potentials::EamSetfl<double>& setfl,
                double dens_scale, double rho_cap, Backend be, double skin = 1.0) {
@@ -154,10 +155,54 @@ GpuOut run_gpu(const Window& w, const potentials::EamSetfl<double>& setfl,
   const bool per[3] = {w.box.periodic[0], w.box.periodic[1], w.box.periodic[2]};
   tdcu::EamCellGrid cg;
   tdcu::EamVerletList vl;
+  tdcu::EamSortedWindow sw;
   if (be == Backend::Cells)
     cg = tdcu::eam_build_window_grid(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut);
   else if (be == Backend::Verlet || be == Backend::Newton3)
     vl = tdcu::eam_build_verlet_list(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut, skin);
+  else if (be == Backend::Sorted)
+    sw = tdcu::eam_sort_window(dx, dy, dz, dkey, m, box_lo, box_len, per, setfl.rcut, skin);
+
+  // --- SORTED path (spatial-sort + coalescing): the density/embedding/force run
+  // in SORTED-slot space, then the per-atom int64 rho/fx/fy/fz are UN-SORTED back
+  // to original window order so the outputs compare bit-for-bit to all-window. ---
+  if (be == Backend::Sorted) {
+    long long* d_rho_s = upload(z64);
+    double* d_fp_s = upload(z);
+    long long* d_fx_s = upload(z64); long long* d_fy_s = upload(z64);
+    long long* d_fz_s = upload(z64);
+    tdcu::eam_density_sorted_kernel<<<gd, blk>>>(sw.sx, sw.sy, sw.sz, m, geom, ds.view,
+                                                 dens_scale, sw.vl.d_off, sw.vl.d_idx,
+                                                 d_rho_s, d_of);
+    tdcu::eam_embedding_kernel<<<gd, blk>>>(m, ds.view, dens_scale, rho_cap, d_rho_s, d_fp_s, d_of);
+    tdcu::eam_force_sorted_kernel<<<gd, blk>>>(sw.sx, sw.sy, sw.sz, sw.s_key, m, geom,
+                                               ds.view, dens_scale, d_rho_s, d_fp_s,
+                                               sw.vl.d_off, sw.vl.d_idx, d_fx_s, d_fy_s,
+                                               d_fz_s, d_pe, d_mr, d_of);
+    // un-sort the per-atom int64 accumulators (sorted slot -> original window slot)
+    tdcu::eam_unsort_scatter_kernel<<<gd, blk>>>(d_rho_s, m, sw.d_order, d_rho);
+    tdcu::eam_unsort_scatter_kernel<<<gd, blk>>>(d_fx_s, m, sw.d_order, d_fx);
+    tdcu::eam_unsort_scatter_kernel<<<gd, blk>>>(d_fy_s, m, sw.d_order, d_fy);
+    tdcu::eam_unsort_scatter_kernel<<<gd, blk>>>(d_fz_s, m, sw.d_order, d_fz);
+    EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+    GpuOut o;
+    o.rho.resize(m); o.fx.resize(m); o.fy.resize(m); o.fz.resize(m);
+    cudaMemcpy(o.rho.data(), d_rho, m * 8, cudaMemcpyDeviceToHost);
+    cudaMemcpy(o.fx.data(), d_fx, m * 8, cudaMemcpyDeviceToHost);
+    cudaMemcpy(o.fy.data(), d_fy, m * 8, cudaMemcpyDeviceToHost);
+    cudaMemcpy(o.fz.data(), d_fz, m * 8, cudaMemcpyDeviceToHost);
+    cudaMemcpy(&o.pe, d_pe, 8, cudaMemcpyDeviceToHost);
+    cudaMemcpy(&o.min_r2_bits, d_mr, 8, cudaMemcpyDeviceToHost);
+    cudaMemcpy(&o.overflow, d_of, 4, cudaMemcpyDeviceToHost);
+    tdcu::eam_sorted_free(sw);
+    for (void* p : {(void*)d_rho_s, (void*)d_fp_s, (void*)d_fx_s, (void*)d_fy_s, (void*)d_fz_s})
+      cudaFree(p);
+    for (void* p : {(void*)dx, (void*)dy, (void*)dz, (void*)dkey, (void*)downed, (void*)d_rho,
+                    (void*)d_fp, (void*)d_fx, (void*)d_fy, (void*)d_fz, (void*)d_pe, (void*)d_mr, (void*)d_of})
+      cudaFree(p);
+    free_setfl(ds);
+    return o;
+  }
 
   // density (d_rho was uploaded ZERO; the Newton3 path atomicAdds onto it).
   if (be == Backend::AllWindow) {
@@ -392,4 +437,39 @@ TEST(CudaEamNewton3, VsOracleQ2340) {  // half-list vs FP64 oracle, steep β=3.3
 }
 TEST(CudaEamNewton3, VsOraclePbc) {  // half-list vs FP64 oracle across the PERIODIC seam
   check_vs_oracle(1.5, 13, 44, /*pbc=*/true, Backend::Newton3, /*skin=*/1.0);
+}
+
+// ====================== Test A''' (SPATIAL-SORT + COALESCING) =================
+// THE load-bearing gate for the coalescing optimisation. The sorted kernels run
+// the density/force in cell-sorted slot space (neighbours spatially clustered ⇒
+// coalesced __ldg gathers); the per-atom int64 rho / fx / fy / fz are UN-SORTED
+// back to original window order. That un-sorted result MUST be bit-for-bit equal
+// to the FULL-NEIGHBOUR all-window kernels — by int64 order-freedom (B1: the
+// per-atom sum is invariant under neighbour reordering) + key=ORIGINAL-index (the
+// φ-once gate s_key[aa]<s_key[bb] counts the SAME undirected-pair set). If this is
+// NOT bitwise the sort/key/un-sort handling is WRONG. fb=44 + fb=40, free-z + PBC.
+
+TEST(CudaEamSorted, SelfEquivQ1944) {  // BITWISE sorted ≡ all-window, fb=44, free-z
+  check_self_equiv<44>(1.5, 7, Backend::Sorted, /*pbc=*/false, /*skin=*/1.0);
+}
+TEST(CudaEamSorted, SelfEquivQ2340) {  // steep β=3.3 (fracbits==40)
+  check_self_equiv<40>(3.3, 11, Backend::Sorted, /*pbc=*/false, /*skin=*/1.0);
+}
+TEST(CudaEamSorted, SelfEquivPbc) {  // BITWISE across the PERIODIC seam (sort + min-image)
+  check_self_equiv<44>(1.5, 13, Backend::Sorted, /*pbc=*/true, /*skin=*/1.0);
+}
+
+// ====================== Test B''' (SORTED oracle) ===========================
+// The sorted density+force vs eam_direct_fp64 (all-pairs FP64, no grid, no
+// quantize) — the physical witness. A dropped donor (sort grid too small) or a
+// broken un-sort scatter shows here as a wrong per-atom rho/force. <1e-9.
+
+TEST(CudaEamSorted, VsOracleQ1944) {  // sorted vs FP64 oracle, fb=44, free-z
+  check_vs_oracle(1.5, 7, 44, /*pbc=*/false, Backend::Sorted, /*skin=*/1.0);
+}
+TEST(CudaEamSorted, VsOracleQ2340) {  // sorted vs FP64 oracle, steep β=3.3
+  check_vs_oracle(3.3, 11, 40, /*pbc=*/false, Backend::Sorted, /*skin=*/1.0);
+}
+TEST(CudaEamSorted, VsOraclePbc) {  // sorted vs FP64 oracle across the PERIODIC seam
+  check_vs_oracle(1.5, 13, 44, /*pbc=*/true, Backend::Sorted, /*skin=*/1.0);
 }
