@@ -17,11 +17,19 @@
 #include "tdmd/core/soa.hpp"
 #include "tdmd/core/zones.hpp"
 #include "tdmd/cuda/zone_eam.cuh"
+#include "tdmd/cuda/zone_eam_cells.cuh"   // E5c: cell-list culled EAM kernels
 #include "tdmd/metrics/eam_breakdown.hpp"
 #include "tdmd/potentials/eam_analytic.hpp"
 #include "tdmd/potentials/eam_spline.hpp"
 
-using namespace tdmd;
+// CUB/libcu++ exposes a global ::cuda namespace, and nvcc-generated host stubs
+// reference cuda::std unqualified — `using namespace tdmd` would make `cuda`
+// ambiguous there (the E5c cells header pulls in the CUB scan). Targeted aliases
+// (the test_cuda_zones.cu / test_cuda_conveyor.cu convention).
+namespace core = tdmd::core;
+namespace potentials = tdmd::potentials;
+namespace metrics = tdmd::metrics;
+namespace tdcu = tdmd::cuda;
 
 namespace {
 template <typename T>
@@ -60,12 +68,19 @@ double occ(K kernel, int block) {
 
 int main(int argc, char** argv) {
   int nc = 8; long steps = 50; double rcut = 4.0;
+  std::string backend = "allwindow";  // E5c bake-off: allwindow | cells
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--cells") nc = std::stoi(argv[++i]);
     else if (a == "--steps") steps = std::stol(argv[++i]);
     else if (a == "--rcut") rcut = std::stod(argv[++i]);
+    else if (a == "--backend") backend = argv[++i];
   }
+  if (backend != "allwindow" && backend != "cells") {
+    std::printf("bench_eam: --backend must be allwindow|cells (got '%s')\n", backend.c_str());
+    return 2;
+  }
+  const bool use_cells = (backend == "cells");
   cudaDeviceProp pr{}; cudaGetDeviceProperties(&pr, 0);
   std::printf("bench_eam: %s, %d SMs\n", pr.name, pr.multiProcessorCount);
 
@@ -87,7 +102,7 @@ int main(int argc, char** argv) {
 
   // device setfl view
   double* dF = up(setfl.Fspl); double* dra = up(setfl.rhoaspl); double* drp = up(setfl.rphispl);
-  cuda::EamSetflView view{dF, dra, drp, setfl.Nrho, setfl.Nr, setfl.rdrho, setfl.rdr, setfl.rcut};
+  tdcu::EamSetflView view{dF, dra, drp, setfl.Nrho, setfl.Nr, setfl.rdrho, setfl.rdr, setfl.rcut};
   double* dx = up(wx); double* dy = up(wy); double* dz = up(wz);
   long* dkey = up(key); int* downed = up(owned);
   std::vector<long long> z64(m, 0); std::vector<double> zd(m, 0.0);
@@ -96,18 +111,52 @@ int main(int argc, char** argv) {
   long long* d_pe = up(std::vector<long long>{0});
   unsigned long long* d_mr = up(std::vector<unsigned long long>{0x7FF0000000000000ULL});
   int* d_of = up(std::vector<int>{0});
-  const int blk = cuda::kZoneBlock;
+  const int blk = tdcu::kZoneBlock;
   const int gd = (m + blk - 1) / blk;
-  auto dens = [&] { cuda::eam_density_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, view, dens_scale, d_rho, d_of); };
-  auto emb  = [&] { cuda::eam_embedding_kernel<<<gd, blk>>>(m, view, dens_scale, rho_cap, d_rho, d_fp, d_of); };
-  auto frc  = [&] { cuda::eam_force_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, view, dens_scale, d_rho, d_fp, d_fx, d_fy, d_fz, d_pe, d_mr, d_of); };
+
+  // E5c cell grid (over the WHOLE window — dropped-donor-safe extent). Rebuilt
+  // every step (the realistic per-step work: after the drift the grid moves).
+  const double box_lo[3] = {box.lo[0], box.lo[1], box.lo[2]};
+  const double box_len[3] = {box.hi[0] - box.lo[0], box.hi[1] - box.lo[1], box.hi[2] - box.lo[2]};
+  const bool per[3] = {box.periodic[0], box.periodic[1], box.periodic[2]};
+  tdcu::EamCellGrid cg{};
+  auto build_grid = [&] {
+    if (cg.d_order) tdcu::eam_cells_free(cg);
+    cg = tdcu::eam_build_window_grid(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut);
+  };
+
+  auto dens = [&] {
+    if (use_cells)
+      tdcu::eam_density_cells_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, view, dens_scale,
+                                                  cg.g, cg.d_starts, cg.d_counts, cg.d_order,
+                                                  d_rho, d_of);
+    else
+      tdcu::eam_density_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, view, dens_scale, d_rho, d_of);
+  };
+  auto emb  = [&] { tdcu::eam_embedding_kernel<<<gd, blk>>>(m, view, dens_scale, rho_cap, d_rho, d_fp, d_of); };
+  auto frc  = [&] {
+    if (use_cells)
+      tdcu::eam_force_cells_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, view,
+                                                dens_scale, d_rho, d_fp, cg.g, cg.d_starts,
+                                                cg.d_counts, cg.d_order, d_fx, d_fy, d_fz, d_pe,
+                                                d_mr, d_of);
+    else
+      tdcu::eam_force_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, view, dens_scale, d_rho, d_fp, d_fx, d_fy, d_fz, d_pe, d_mr, d_of);
+  };
 
   cudaEvent_t e0, e1, e2, e3; for (auto* e : {&e0, &e1, &e2, &e3}) cudaEventCreate(e);
   // warmup
+  if (use_cells) build_grid();
   dens(); emb(); frc(); cudaDeviceSynchronize();
 
   metrics::EamPhaseBreakdown bd; bd.n_atoms = m; bd.steps = steps;
+  double build_ms_total = 0.0;
+  cudaEvent_t b0, b1; cudaEventCreate(&b0); cudaEventCreate(&b1);
   for (long s = 0; s < steps; ++s) {
+    if (use_cells) {
+      cudaEventRecord(b0); build_grid(); cudaEventRecord(b1); cudaEventSynchronize(b1);
+      float tb = 0; cudaEventElapsedTime(&tb, b0, b1); build_ms_total += tb;
+    }
     float td = 0, te = 0, tf = 0;
     cudaEventRecord(e0); dens(); cudaEventRecord(e1); emb(); cudaEventRecord(e2); frc(); cudaEventRecord(e3);
     cudaEventSynchronize(e3);
@@ -127,12 +176,23 @@ int main(int argc, char** argv) {
   bd.real_pairs = real;
 
   int of = 0; cudaMemcpy(&of, d_of, 4, cudaMemcpyDeviceToHost);
-  bd.report("all-window");
-  std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
-              occ(cuda::eam_density_kernel, blk), occ(cuda::eam_embedding_kernel, blk),
-              occ(cuda::eam_force_kernel, blk), of);
-  std::printf("NOTE: all-window O(N^2) baseline. hit-rate %.4f ⇒ a cell-list/Verlet "
-              "backend cuts examined pairs ~%.0fx (the M4-B bake-off opportunity).\n",
-              bd.hit_rate(), bd.hit_rate() > 0 ? 1.0 / bd.hit_rate() : 0.0);
+  if (use_cells) tdcu::eam_cells_free(cg);
+  bd.report(backend.c_str());
+  if (use_cells)
+    std::printf("grid-build: %.4f ms/step (rebuilt over the whole window each step)\n",
+                build_ms_total / double(steps));
+  if (use_cells)
+    std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
+                occ(tdcu::eam_density_cells_kernel, blk), occ(tdcu::eam_embedding_kernel, blk),
+                occ(tdcu::eam_force_cells_kernel, blk), of);
+  else
+    std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
+                occ(tdcu::eam_density_kernel, blk), occ(tdcu::eam_embedding_kernel, blk),
+                occ(tdcu::eam_force_kernel, blk), of);
+  std::printf(
+      "NOTE: backend=%s. hit-rate %.4f ⇒ predicted cull = 1/hit-rate = %.1fx on the\n"
+      "      candidate set. Run --backend allwindow vs --backend cells at the same\n"
+      "      --cells to read the REALIZED density/force speedup vs this prediction.\n",
+      backend.c_str(), bd.hit_rate(), bd.hit_rate() > 0 ? 1.0 / bd.hit_rate() : 0.0);
   return 0;
 }

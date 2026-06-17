@@ -487,3 +487,52 @@ int64-массивов напрямую) и физически недостиж�
 
 Цепочка `verlet-K>1 ≡ cells ≡ tiles(all-pairs)` + по-проходная `pe` = независимый
 физический оракул на лаговом кольце. memcheck/racecheck чисто.
+
+---
+
+## E5c — EAM cell-list культинг + бейкофф: TileMask-вердикт (measure-first)
+
+Отвечает на исходный вопрос «оправдан ли TileMask для EAM» ДАННЫМИ (M4-B отложил
+его сюда: «мерить там, где тяжёлая плотность+embedding больше всего благоприятствуют
+культингу»). Состязательно спроектирован (understand 4 + design 3 линзы) + принят.
+
+**Что построено** (additive; `zone_eam.cuh`/`zone_cells.cuh`/E5b-кольцо/пар-кольцо
+БАЙТ-НЕТРОНУТЫ): `cuda/zone_eam_cells.cuh` — `eam_density_cells_kernel` +
+`eam_force_cells_kernel` (копии all-window ядер, внутренний `for(bb<m)` → 27-cell
+loop из `zone_pair_cells_kernel` дословно; сетка над ВСЕМ окном `eam_build_window_grid`
+n_zones=1 rcut-padded — dropped-donor-safe). **Bitwise ≡ all-window** по B1 (тот же
+предикат `geom.reduce`, тот же quantize, та же φ-once, order-free int64 ⇒ in-cutoff
+мультимножество идентично). `Test_CUDA_EAM_Cells` (5): **A** cells≡all-window сырой
+int64 ПОБИТОВО (fb=44+40); **B** (непереуступаемый dropped-donor гейт) cells vs
+`eam_direct_fp64` (all-pairs FP64, без сетки) <1e-9 — free-z + steep + **PBC-seam**
+(wrap+min-image); memcheck/racecheck чисто. (Bitwise-vs-self слеп к выпавшему донору
+— ловит только независимый FP64-оракул; superset подтверждён численно: макс
+cell-separation in-cutoff пар = 1.)
+
+**Бейкофф** (RTX 5080, all-window O(m²) vs cells, density+force — тяжёлые проходы):
+
+| N (cells) | all-window ms/step | cells ms/step | **realized** | predicted (1/hit-rate) | grid-build |
+|---|---|---|---|---|---|
+| 864 (6)    | 3.78  | 0.45 | **8.3×**   | 72×   | 0.022 ms |
+| 4000 (10)  | 14.37 | 0.46 | **31.4×**  | 333×  | 0.024 ms |
+| 16384 (16) | 93.34 | 0.79 | **117.5×** | 1365× | 0.061 ms |
+
+cells сокрушают all-window (растёт с N: O(N²) baseline vs ~линейный cells);
+atom-steps/s 1.76e5 → **2.06e7** (cells, N=16k ≡ флагман M5a). grid-build
+пренебрежимо. **realized ниже предсказания** — 27-cell окрестность это in-cutoff
+СУПЕРСЕТ, объём (3·cell)³≈27·rcut³ vs сфера (4/3)π·rcut³≈4.19 ⇒ **×6.4 over-fetch**
+(1365/6.4≈213 идеал; realized 117 + grid-build + occupancy на прорежённых кандидатах).
+
+**ВЕРДИКТ — TileMask: NO-GO (отложить в ReaxFF).** cells дают доминирующий выигрыш
+(8–117×); **residual gap = over-fetch 27-cell окрестности**, а это **cell-size лёвер**
+(суб-rcut биннинг с более широким стенсилом), НЕ mask-reuse лёвер. Уникальная
+ценность TileMask — амортизация одной перечислимости кандидатов по МНОГИМ проходам;
+EAM культит только 2 (density+force; embedding локален), reuse-выигрыш маргинален.
+TileMask оправдан при 5–6 проходах ReaxFF — туда и отложен. **Тот же вывод, что M4-B
+на LJ/Morse, теперь ИЗМЕРЕН на EAM.** Исходный вопрос пользователя закрыт данными.
+
+**Отложено (E5c+):** TileMask (до ReaxFF), суб-rcut биннинг (cell-size лёвер для
+over-fetch), интеграция cells-ядер в живое GPU-кольцо `EamGpuConveyor` (standalone-окно
+сначала, как E5 до E5b), PersistentVerlet-EAM (memory-gated), MEAM/Tersoff/ReaxFF.
+
+Воспроизведение: `./build-cuda/bench_eam --backend {allwindow|cells} --cells {6|10|16} --steps 30`.

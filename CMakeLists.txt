@@ -275,6 +275,17 @@ if(TDMD_BUILD_TESTS)
     add_test(NAME Test_CUDA_EAM_Ring COMMAND test_cuda_eam_ring)
     set_tests_properties(Test_CUDA_EAM_Ring PROPERTIES LABELS cuda)
 
+    # M6 E5c: cell-list culled EAM kernels. Test A (bitwise cells == all-window)
+    # + Test B (the BLOCKING dropped-donor gate vs eam_direct_fp64). --fmad=false
+    # via tdmd_eam_cuda_flags (the f_over_r/Horner fuse would break 1 ULP).
+    add_executable(test_cuda_eam_cells tests/test_cuda_eam_cells.cu)
+    target_link_libraries(test_cuda_eam_cells PRIVATE tdmd_core GTest::gtest_main
+                          tdmd_eam_cuda_flags)
+    target_compile_options(test_cuda_eam_cells PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
+    add_test(NAME Test_CUDA_EAM_Cells COMMAND test_cuda_eam_cells)
+    set_tests_properties(Test_CUDA_EAM_Cells PROPERTIES LABELS cuda)
+
     if(TDMD_WITH_MPI)                                            # M5a: MPI ring
       find_package(MPI REQUIRED COMPONENTS CXX)
       add_executable(test_mpi_conveyor tests/test_mpi_conveyor.cu)
