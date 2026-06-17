@@ -117,6 +117,12 @@ add_executable(bench_pair tools/bench_pair.cpp)
 target_include_directories(bench_pair PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_options(bench_pair PRIVATE -Wall -Wextra -O3)
 
+# M4-N: K-cadence sweep (CPU NVE; realized K_eff vs predicted K_pred). No CUDA.
+add_executable(bench_kcadence tools/bench_kcadence.cpp)
+target_include_directories(bench_kcadence PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_options(bench_kcadence PRIVATE -Wall -Wextra -O3)
+target_link_libraries(bench_kcadence PRIVATE Threads::Threads)
+
 # --- tests (do NOT depend on yaml-cpp; golden-data driven, no LAMMPS) ---
 if(TDMD_BUILD_TESTS)
   enable_testing()
