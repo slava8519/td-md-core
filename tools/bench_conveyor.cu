@@ -262,8 +262,8 @@ int main(int argc, char** argv) {
   int cells = 14, zones = 8, nodes = 4;
   long steps = 30;
   bool mixed = false, probe = false, use_cells = true, skip_t0 = false,
-       ring_only = false, vdet = false, use_verlet = false;
-  double skin = 1.0;
+       ring_only = false, vdet = false, use_verlet = false, shock = false;
+  double skin = 1.0, temp = 300.0;  // M4-B bake-off: regime knobs
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     auto next = [&] { return std::stol(argv[++i]); };
@@ -279,6 +279,8 @@ int main(int argc, char** argv) {
     else if (a == "--verify-det") vdet = true;
     else if (a == "--verlet") use_verlet = true;            // PR-2: list reuse
     else if (a == "--skin") skin = std::stod(argv[++i]);    // Å
+    else if (a == "--temp") temp = std::stod(argv[++i]);    // K (bake-off regime)
+    else if (a == "--shock") shock = true;                  // counter-slab compression
   }
 
   cudaDeviceProp p{};
@@ -296,7 +298,12 @@ int main(int argc, char** argv) {
 
   core::Box box;
   auto atoms = make_fcc(box, cells);
-  core::thermal::maxwell_init(atoms, 300.0, 7);
+  core::thermal::maxwell_init(atoms, temp, 7);  // M4-B: --temp regime (300/600/…)
+  if (shock) {  // momentum-neutral counter-slab compression in periodic x
+    const double xmid = 0.5 * (box.lo[0] + box.hi[0]);
+    for (int i = 0; i < atoms.n; ++i)
+      atoms.vx[i] += (atoms.x[i] < xmid) ? 10.0 : -10.0;
+  }
   if (vdet) {
     core::Box vb;
     auto va = make_fcc(vb, 6);  // 864 atoms, real grids
@@ -341,17 +348,32 @@ int main(int argc, char** argv) {
     if (!ring_only)
       std::printf("  ring speedup over baseline: x%.3f  [%s]\n", tb / tr, mode);
     if (use_verlet) {  // PR-2: persistent reuse vs the cell-raster ring
-      long reb = 0;
+      long reb = 0, reb_w = 0;
       run_ring(atoms, box, pot, W, dt, zones, nodes, mixed, use_cells, skip_t0,
-               true, skin, &reb);  // warmup
-      const double tv = run_ring(atoms, box, pot, W + steps, dt, zones, nodes,
-                                 mixed, use_cells, skip_t0, true, skin, &reb) -
-                        run_ring(atoms, box, pot, W, dt, zones, nodes, mixed,
-                                 use_cells, skip_t0, true, skin, &reb);
+               true, skin, &reb_w);  // warmup
+      // capture the rebuild count from the FULL (W+steps) run specifically —
+      // each run_ring starts from a fresh atoms copy, so reb is the realized
+      // cadence over the timed window (NOT the 5-step warmup; was a reporting bug).
+      const double t_full = run_ring(atoms, box, pot, W + steps, dt, zones, nodes,
+                                     mixed, use_cells, skip_t0, true, skin, &reb);
+      const double t_warm = run_ring(atoms, box, pot, W, dt, zones, nodes, mixed,
+                                     use_cells, skip_t0, true, skin, &reb_w);
+      const double tv = t_full - t_warm;
       const double as_v = double(atoms.n) * steps / tv;
+      // K_eff = realized passes per rebuild over the TIMED window (W+steps). The
+      // decision is on the ratio + K_eff, not absolute throughput (non-flagship).
+      const double k_eff = reb > 0 ? double(W + steps) / double(reb) : double(W + steps);
       std::printf("  TD ring  VERLET skin=%.2f:  %8.3f s  -> %.3e atom-steps/s "
-                  "(%ld rebuilds / %ld steps)\n", skin, tv, as_v, reb, W + steps);
-      std::printf("  verlet speedup over cells:  x%.3f  [%s]\n", tr / tv, mode);
+                  "(%ld rebuilds / %ld steps, K_eff=%.1f)\n", skin, tv, as_v, reb,
+                  W + steps, k_eff);
+      // VACUITY GUARD (M4-B F3): a ratio is meaningless if verlet rebuilt every
+      // pass (= cells + tax) or never reused. Refuse it; report the regime instead.
+      if (reb >= W + steps)
+        std::printf("  >> VACUOUS: verlet rebuilt every pass (K_eff~1) — ratio "
+                    "withheld; raise skin or lower T/dt for a real reuse window.\n");
+      else
+        std::printf("  verlet speedup over cells:  x%.3f  [%s, K_eff=%.1f]\n",
+                    tr / tv, mode, k_eff);
     }
   };
   if (mixed) bench(make_lj32());

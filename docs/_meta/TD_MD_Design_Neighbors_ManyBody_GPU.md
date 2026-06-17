@@ -182,7 +182,7 @@ last rebuild на эпохе t0; радиус кандидатов r_cut + s (sk
 
 **Детерминизм даром:** `skin_consumed` — скалярная рекуррентность над тем же позиционно-форвардящимся лаговым агрегатом (`v_full`/`a_full`/`dt_next`), что и `dt`. Единственный писатель — голова прохода; сравнение `skin_consumed ≥ s` — один FP64-компар бит-идентичных значений ⇒ булев `rebuild_now` бит-идентичен на любом z. **Реплицируется в КАЖДЫЙ исходящий `ZoneHeader`** (не точка-в-точку как `dt_next`), иначе зоны перестроятся на `n−1` проходов позже и суперсет порвётся на границе.
 
-**Выбор backend-а (И-F, глобально, z-независимо):**
+**Выбор backend-а (И-F, глобально, z-независимо):** [гипотеза K≈2; **ШИПНУТО `K_on=3.0`/`K_off=1.5`**, измерено в M4-B — `K_pred` систематически недосчитывает реюз ⇒ 3.0 уже разрешающий; Bench §M4-B]
 ```
 K_pred = s / (2·R_buf)                       // ожидаемое число шагов между перестройками
 если K_pred < K_off (≈2):  backend = ClusterFull / TileMaskCellRaster (JIT, без материализации списка)
@@ -308,8 +308,8 @@ on pass head h (light-cone lag n−1):
 | **M3.5** | TD-кольцо CPU (z·jthread+SPSC, Λ-цепочка `dt` B2, PBC-ротация, INV-4 HALT, StaleZone, NVE bitwise, §3.6-реплика) | ✅ [BUILT] |
 | **M4** | GPU: фикс-пойнт силы (CPU=GPU bit-exact LJ), `zone_integrate`, `StreamTransport` | 🔄 [BUILT, частично] |
 | **M4-N** *(новое, первым)* | **Измерительная обвязка + Physical Oracle** (F.3/F.4): `ms/step`-разбивка (GPU-EAM, hit-rate, occupancy), `K`-метрики (`K_eff`/`K_pred` свип равновесие→удар), Gate-02a (Physical Oracle, superset⇒bitwise). *Без default-выбора.* Все три — состязательно спроектированы и приняты; см. `TD_MD_Core_Bench_v1_0.md`. **Остаётся Gate-02b** (GPU cells-vs-verlet на сырых int64, K>1) — до выката PersistentVerlet по умолчанию. | ✅ [BUILT] (CPU/Gate-02a); Gate-02b отложен |
-| **M4-S** | **Скин-критерий на Λ-цепочке** в `conveyor` (D.3): `skin_consumed`/`rebuild_now`/`K_pred` в `ZoneHeader`, **правка `2·R_buf`**, И2 (`d_(1)+d_(2)`), И1 (K-aware fallback). Заменяет глобальный `need_rebuild` в кольце/GPU. | [DESIGN] |
-| **M4-B** | **Backend-ы соседей за `INeighbor`**: `PersistentVerlet`, `TileMaskCellRaster` (JIT в `w`, И-A суперсет, И-B монотонное локальное `ε`). Бейк-офф A/B/C/D. | [DESIGN] |
+| **M4-S** | **Скин-критерий на Λ-цепочке** в `conveyor` (D.3): `skin_consumed`/`rebuild_now`/`K_pred` в `ZoneHeader`, **правка `2·R_buf`**, И1 (K-aware fallback), PR-3 hybrid, PR-4 drift L2a. Off-equilibrium валидация (2500K+shock, lag=7). **И2 (`d_(1)+d_(2)`) состязательно отложен** (выигрыш ~0 при L≫1). | ✅ [BUILT] (2026-06-17; `verlet_skin/ROADMAP`) |
+| **M4-B** | **Бейкофф cells/verlet/tiles** (measure-first, `bench_conveyor`): cold **1.64×** verlet→warm 1.22×→shock 1.05×; **default=cells (memory-gated), verlet opt-in лёвер, D K-aware** (`K_on=3.0`/`K_off=1.5` — измерено, НЕ ≈2 §D.3); **Gate-02b SATISFIED** (verlet-K>1≡cells≡tiles + по-проходная pe). TileMask/И-B/И-C/EAM-ring — **отложены** (measure-first). Числа+решение — `TD_MD_Core_Bench_v1_0.md §M4-B`. | ✅ [BUILT] (2026-06-17, минимальный) |
 | **M5** | **Универсальный многопроходный потенциал `IManyBodyPotential`** (C.3): EAM → MEAM → Tersoff/SW → ReaxFF (+Local QEq, E.4) → ML. Каждый — через валидацию F.1/F.2 и Gate-01/02. Транзиентный micro-Verlet внутри тайла для многопроходных. | [DESIGN] |
 | **M5b** | Большие реплики 10⁶–10⁷ (LJ/EAM), внешний бенч vs LAMMPS/HOOMD на одном GPU | [DESIGN] |
 | **M6** | Оптимизации по измерениям: Morton-cadence, И3 (дрейф-коррекция, ударный режим), И-D (топология-как-payload), BVH **только** при высокой полидисперсности (не на критическом пути) | [DESIGN] |

@@ -150,6 +150,9 @@ int main(int argc, char** argv) {
       std::printf("               ВНИМАНИЕ: ring.backend=%s не действует на"
                   " CLI-пути\n",
                   cfg.ring_backend.c_str());
+    if (cfg.verlet_enable)
+      std::printf("               ВНИМАНИЕ: neighbor.verlet не действует на"
+                  " CPU-кольце (PersistentVerlet — только GPU-ring/bench, M4-B)\n");
     core::ConveyorOptions co;
     co.steps = cfg.steps;
     co.n_zones = n_zones;
@@ -157,6 +160,13 @@ int main(int argc, char** argv) {
     co.auto_step = (cfg.ts_mode == "auto");
     co.dt_initial = cfg.dt;
     co.ts = {cfg.C1, cfg.K2, cfg.C3, cfg.C_buf, cfg.cell_size, cfg.dt_max, 1e-6};
+    // M4-B: PersistentVerlet lever (opt-in). Honored by the GPU ring; the CPU
+    // reference ring (this CLI path) ignores it (w-tiling) — forward-compatible.
+    co.verlet_reuse = cfg.verlet_enable;
+    co.verlet_skin = cfg.skin;
+    co.verlet_K_on = cfg.verlet_K_on;
+    co.verlet_K_off = cfg.verlet_K_off;
+    co.verlet_default = cfg.verlet_default;
 
     const potentials::Truncation rtr =
         cfg.truncation == "cut"           ? potentials::Truncation::Cut

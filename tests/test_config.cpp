@@ -74,6 +74,20 @@ TEST(Config, ValidConfigParses) {
   EXPECT_DOUBLE_EQ(c.C_buf, 1.5);
 }
 
+TEST(Config, NeighborVerletParsesAndValidates) {  // M4-B: PersistentVerlet lever
+  TempConfig ok(std::string(kValid) +
+      "neighbor: { mode: cluster, skin: 1.0, verlet: { enable: true, K_on: 4.0, "
+      "K_off: 2.0, default: true } }\n");
+  io::Config c = io::load_config(ok.path());
+  EXPECT_TRUE(c.verlet_enable);
+  EXPECT_DOUBLE_EQ(c.verlet_K_on, 4.0);
+  EXPECT_DOUBLE_EQ(c.verlet_K_off, 2.0);
+  EXPECT_TRUE(c.verlet_default);
+  // K_on < K_off is fatal (the hysteresis band must be well-formed)
+  expect_throws_with(std::string(kValid) +
+      "neighbor: { verlet: { K_on: 1.0, K_off: 2.0 } }\n", "K_on must be >= K_off");
+}
+
 TEST(Config, ShippedConfigsAreValid) {
   EXPECT_NO_THROW(io::load_config(project_root() + "/config/config_m0.yaml"));
   EXPECT_NO_THROW(io::load_config(project_root() + "/config/config_auto.yaml"));

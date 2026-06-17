@@ -35,6 +35,13 @@ struct Config {
   // neighbor (M3)
   std::string neighbor_mode = "direct";  // direct (O(N²) reference) | cluster
   double skin = 1.0;                     // Å, pair-list skin (neighbor.skin)
+  // neighbor.verlet (M4-B): PersistentVerlet list-reuse lever. OPT-IN, GPU ring
+  // only (the CPU reference ring ignores it — w-tiling). default=cells; D
+  // auto-engages verlet when enabled AND K_pred>=K_on (memory-gated, see Bench M4-B).
+  bool verlet_enable = false;            // neighbor.verlet.enable
+  double verlet_K_on = 3.0;              // neighbor.verlet.K_on  (turn-on, >= K_off)
+  double verlet_K_off = 1.5;             // neighbor.verlet.K_off (fall back to cells)
+  bool verlet_default = false;           // neighbor.verlet.default (active at cold start)
   // decomposition (M4: the CLI drives the CPU reference ring when
   // n_zones > 1 or ring.n_nodes > 1; the GPU ring is bench/test-driven)
   std::string decomp_axis = "z";           // z (the only axis, дисс. Гл. 2.1)

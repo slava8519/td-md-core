@@ -58,6 +58,13 @@ neighbor:
                              # идентичность — в id)
   skin: 1.0                  # Å; слой валидности списка пар кластеров (аналог таблиц
                              # Варлета, R_k−R_max); перестройка при смещении > skin/2 (M3)
+  verlet:                    # M4-B: PersistentVerlet-лёвер (opt-in). GPU-ring only —
+                             # CPU-эталонный ринг (CLI) игнорирует (w-tiling). default=cells.
+    enable: false            # bool; включить переиспользование persistent-списка (D авто-
+                             # включит при K_pred >= K_on). Дефолт OFF (memory-gated, Bench M4-B)
+    K_on: 3.0                # float; порог включения verlet (K_pred = skin/(2·R_buf))
+    K_off: 1.5              # float > 0, <= K_on; откат на cells (гистерезис, C_buf-пол)
+    default: false           # bool; verlet активен с холодного старта
 
 potential:
   type: morse                # morse | lj (M3) | eam | fs | meam | ml (backlog)
@@ -122,6 +129,8 @@ logging:
 | `decomposition.ring.steps_per_node` | int ≥ 1 | k шагов на узел (Гл. 3.4) |
 | `decomposition.ring.n_nodes` vs $P_{op}$ | n_nodes ≤ s/s_min | предупреждение, если узлов больше полезного максимума (ур. 44–45) |
 | `neighbor.skin` | float > 0 | слой списка пар; кадрность перестройки из C1-оценки |
+| `neighbor.verlet.K_off` | float > 0 | гистерезис-низ; `K_on >= K_off` ⇒ **fatal** иначе (M4-B) |
+| `neighbor.verlet.{enable,K_on,default}` | bool/float/bool | PersistentVerlet-лёвер (opt-in, GPU-ring); default=cells (memory-gated, Bench M4-B) |
 | `potential.type` | enum: morse/lj | неизвестный тип ⇒ **fatal** |
 | `potential.truncation` | enum: cut/shift/force_shift | неизвестная схема ⇒ **fatal** |
 | `potential.lj.{epsilon,sigma}` | float > 0 | иначе **fatal** |

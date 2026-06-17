@@ -395,3 +395,95 @@ seed/T/длине. (iii) **статический lock** — full-superset ⇒ p
 на сырых int64, K>1), ТРЕБУЕТСЯ до выката PersistentVerlet по умолчанию (не сейчас).
 
 Воспроизведение: `ctest -R Test_Physical_Oracle` (или `./build/test_oracle`).
+
+---
+
+## M4-B — соседский бейкофф (мерить-первым): cells / verlet / tiles
+
+Бейкофф backend-ов на построенной M4-N обвязке (порядок И-F: мерить → выбирать).
+Субстрат — `bench_conveyor` (один ринг, три пути через один диспатч `launch_pairs`):
+**tiles** (`--no-cells`, all-pairs `zone_pair_kernel`), **cells** (дефолт, пер-зонная
+сетка, пересборка каждый проход), **verlet** (`--verlet --skin`, PersistentVerlet
+с переиспользованием списка). Все три побитово эквивалентны (verlet≡cells≡tiles —
+см. Gate-02b ниже). Добавлены `--temp`/`--shock` (режимы) и **vacuity-guard +
+`K_eff`** (отказ печатать ratio при `rebuilds≥steps`; счётчик берётся из timed-
+прогона — исправлен баг чтения из warmup).
+
+**Замер** (RTX 5080, FCC-Al **N=42 592**, z=4/n=8, dt=2 фс, **conservative** скин-
+критерий `2·R_buf`, 60 шагов):
+
+| backend | cold 300 K, atom-steps/s | vs cells |
+|---|---|---|
+| tiles (A, all-pairs) | 3.85e5 | 0.03× |
+| **cells (дефолт)** | 1.15e7 | 1.00× |
+| verlet skin 1.0 (B) | 1.81e7 | **1.64×** |
+
+**verlet vs cells по режимам** (skin 1.0): cold 300 K **1.64×** (K_eff 8.1) → warm
+600 K **1.22×** (K_eff 5.4) → shock **1.05×** (K_eff 4.3, ≈break-even). **skin-свип
+cold:** 0.5 → 1.44× (K_eff 4.3), **1.0 → 1.64× (K_eff 8.1, sweet spot)**, 2.0 →
+1.33× (K_eff 13, толще список ⇒ больше кандидатов на проход). **mixed cold:** 1.59×
+(1.93e7).
+
+**Выводы (вход для решения):**
+- **tiles (all-pairs) неконкурентны** — ×30 медленнее cells на 42k; куллинг
+  обязателен (подтверждает M4-N hit-rate ×72–333).
+- **verlet амортизируется в равновесии** (cold 1.64×: устраняет пер-проходную
+  пересборку cell-сетки при K_eff≫1), **деградирует к ≈cells на ударе** (1.05×:
+  K_eff падает + список «толстеет» на сжатии). Это **ровно** обосновывает K-aware
+  переключатель **D** (откат на cells при `K_pred<K_off`) — фиксированный verlet-
+  дефолт проиграл бы на ударе.
+- **skin=1.0 — sweet spot** (классический Верле-компромисс: меньше — частые
+  перестройки, больше — толще список), измерено, не задекларировано.
+
+**РЕШЕНИЕ (default backend):**
+- **Default = cells.** `verlet_reuse=false`, `verlet_default=false`,
+  `verlet_K_on=3.0`, `verlet_K_off=1.5` (оставлены как есть — НЕ спекулятивный
+  K≈2 из §D.3; K_pred=skin/(2·R_buf) систематически недосчитывает реальный реюз,
+  так что K_on=3 уже разрешающий в равновесии). На ударе verlet/cells ≈ **1.05×**
+  (break-even) ⇒ default=cells ничего не теряет; K-aware D ключится на **K_pred**
+  (порог `K_pred<K_off`, `conveyor_gpu.cuh`), не на conservatism-факторе K-cadence.
+- **Default=cells — решение по ПАМЯТИ, не по перфу:** даже выигрывая бейкофф,
+  verlet не может быть дефолтом-ON — cross-role CSR ~9 ГБ (только списки) при N=10⁷,
+  ~×3 над бюджетом 3.5 ГиБ (boundary-пропорциональное cross-idx сокращение
+  отложено, ROADMAP verlet-skin). **verlet — корректный, быстрый (валидирован ≤1M),
+  opt-in лёвер,** который D авто-включает при `verlet_reuse=true` И `K_pred≥K_on`.
+- Конфиг: `neighbor.verlet.{enable,K_on,K_off,default}` (GPU-ring; CPU-CLI-эталон
+  игнорирует) — `ConfigSchema`.
+
+**Состязательно спроектирован (3 линзы) и принят.** **КАВЕАТ:** это пар-ринг
+(LJ/Morse). **EAM-через-ринг (E5b) отложено** — тяжёлая многопроходная
+амортизация (плотность+embedding), которая БОЛЬШЕ всего благоприятствует
+PersistentVerlet, здесь **не измерена**; дефолт НЕ экстраполировать на EAM.
+**Отложено** (не блокирует, measure-first): **TileMask** (backend C — JIT-маски;
+оправдан только hit-rate ×72–333, но на LJ/Morse cells уже бьёт tiles ×30 ⇒ ждёт
+EAM/ReaxFF), пер-фазный stacked-bar (нужен с EAM-ring), И-B/И-C лёверы, cross-idx
+память (блокирует verlet-default), полный shock-sweep.
+
+Воспроизведение: `./build-cuda/bench_conveyor --cells 22 --zones 8 --nodes 4
+--steps 60 --skip-t0 --ring-only --verlet --skin 1.0 --temp {300|600} [--shock] [--mode mixed]`.
+
+### Gate-02b — независимый оракул verlet K>1 в кольце: SATISFIED
+
+Непереуступаемый гейт перед verlet-как-дефолт. **Закрыт транзитивной цепочкой +
+прямой по-проходной проверкой** (не отдельным глубоким raw-int64 readback-хуком —
+он диспропорционален). Декод int64→double **без потерь** в физическом диапазоне для
+ОБОИХ аккумуляторов (`ForceAccum` Q24.40: lossless при `|F|<2¹³≈8192 эВ/Å`,
+×82 запас к реализованному `|raw|~1e14`; `EnergyAccum` Q34.30: lossless при
+`|E|<2²³≈8.4e6 эВ`, ×13000 запас) ⇒ в этом диапазоне **double-bitwise ⟺ raw-int64**
+(дропнутая in-cutoff пара ≫1 кванта на обоих каналах: ~1500 квантов pe, ~1.5e11
+квантов силы). Узкое окно `r∈[0.86,1.5] Å`, где `|F|∈[2¹³,2²³]` могло бы делать
+декод СИЛЫ лоссовым, **закрыто decode-независимым K=1 raw-leg** (сравнение сырых
+int64-массивов напрямую) и физически недостижимо (causality/overlap-HALT раньше) —
+гейт корректен по конъюнкции трёх ног, не одной по-проходной pe:
+- `VerletListBitwiseVsTiles` (`test_cuda_zones`) — verlet-силовое ядро ≡ tiles
+  (all-pairs) на **сырых int64**, одиночный проход K=1;
+- `CellListsBitwiseVsTiles` — cells ≡ tiles (cells пересобирает сетку **каждый
+  проход** ⇒ свежий rebuild-every-pass эталон, независимый от verlet-триггера);
+- `VerletHybridOffEquilibriumStress1vsZ` (M4-S) — verlet **K>1** реюз ≡ cells
+  **побитово финальное состояние И по-проходная `pe`** (декод int64-EnergyAccum)
+  на **3000 шагов 2500 K + shock, lag L=7, z∈{1,2,4,8}** — многопроходная лаговая
+  проверка, недостижимая для зонного K=1 оракула. Дропнутая пара (разрыв силы
+  Shift ~0.16 эВ/Å) ⇒ расхождение `pe` на проходе ⇒ поймано.
+
+Цепочка `verlet-K>1 ≡ cells ≡ tiles(all-pairs)` + по-проходная `pe` = независимый
+физический оракул на лаговом кольце. memcheck/racecheck чисто.

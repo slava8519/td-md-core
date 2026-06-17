@@ -18,11 +18,19 @@
 //                rcut, |F|~0.16 eV/Å ≫ ULP) ⇒ a flipped bit ⇒ caught.
 //
 // SCOPE (Layer A): proves the superset⇒bitwise lemma and that a too-coarse trigger
-// is caught, on a single-node CPU narrow phase. It does NOT certify the conveyor's
-// 2·R_buf skin budget, the n−1 light-cone lag-ramp, or the C_buf gap — those live
-// in conveyor_gpu.cuh / zone_verlet.cuh and need Gate-02b (GPU, gpu_gate, cells-vs-
-// verlet kernels on RAW int64 accumulators, K>1), REQUIRED before any
-// PersistentVerlet backend ships as default; NOT implemented here.
+// is caught, on a single-node CPU narrow phase. The conveyor's 2·R_buf skin budget,
+// the n−1 light-cone lag-ramp, and the C_buf gap live in conveyor_gpu.cuh /
+// zone_verlet.cuh — that is Gate-02b, now SATISFIED (M4-B, 2026-06-17) by the
+// transitive chain on the GPU lagged ring: VerletHybridOffEquilibriumStress1vsZ
+// (verlet K>1 reuse ≡ rebuild-every-pass cells, 3000 steps @2500K+shock, lag L=7,
+// final-state bitwise AND per-pass pe) + CellListsBitwiseVsTiles (cells ≡ tiles
+// all-pairs) + test_cuda_zones VerletListBitwiseVsTiles (verlet kernel ≡ tiles on
+// RAW int64, K=1, decode-independent). The int64→double decode is lossless in the
+// physical range on BOTH channels (ForceAccum Q24.40: |F|<2¹³≈8192 eV/Å; EnergyAccum
+// Q34.30: |E|<2²³≈8.4e6 eV) ⇒ double-bitwise ⟺ raw-int64 there, so the per-pass-pe /
+// final-state double checks ARE the raw-int64 gate; the narrow r∈[0.86,1.5]Å window
+// where the force decode could be lossy is covered by the K=1 raw leg + is physically
+// unreachable (HALT fires first). Gate by conjunction. See TD_MD_Core_Bench_v1_0.md §M4-B.
 #include <gtest/gtest.h>
 
 #include <algorithm>

@@ -229,12 +229,23 @@ Config load_config(const std::string& path) {
           "decomposition.ring.steps_per_node: k>1 реализовано в MPI-кольце (M5a, тестовый путь); CLI-путь пока k=1");
 
   if (auto nb = root["neighbor"]) {
-    warn_unknown_keys(nb, "neighbor", {"mode", "skin"});
+    warn_unknown_keys(nb, "neighbor", {"mode", "skin", "verlet"});
     if (nb["mode"]) c.neighbor_mode = nb["mode"].as<std::string>();
     if (nb["skin"]) c.skin          = nb["skin"].as<double>();
+    if (auto vl = nb["verlet"]) {  // M4-B: PersistentVerlet lever (GPU ring; opt-in)
+      warn_unknown_keys(vl, "neighbor.verlet",
+                        {"enable", "K_on", "K_off", "default"});
+      if (vl["enable"])  c.verlet_enable  = vl["enable"].as<bool>();
+      if (vl["K_on"])    c.verlet_K_on    = vl["K_on"].as<double>();
+      if (vl["K_off"])   c.verlet_K_off   = vl["K_off"].as<double>();
+      if (vl["default"]) c.verlet_default = vl["default"].as<bool>();
+    }
   }
   v.check_enum(c.neighbor_mode, "neighbor.mode", {"direct", "cluster"});
   v.check(c.skin > 0.0, "neighbor.skin must be > 0");
+  v.check(c.verlet_K_off > 0.0, "neighbor.verlet.K_off must be > 0");
+  v.check(c.verlet_K_on >= c.verlet_K_off,
+          "neighbor.verlet.K_on must be >= K_off (hysteresis band)");
 
   if (auto io = root["io"]) {
     warn_unknown_keys(io, "io", {"trajectory", "rescue"});

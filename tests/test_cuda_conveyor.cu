@@ -377,7 +377,8 @@ TEST(CudaConveyor, VerletHybridOffEquilibriumStress1vsZ) {
     oc.steps = kSteps; oc.n_zones = kNZones; oc.n_nodes = 1; oc.dt_initial = 0.001;
     if (autodt) { oc.auto_step = true; oc.ts.C1 = 0.01; oc.ts.C3 = 1.0; }
 
-    const auto cells = run_gpu(init, box, oc, lj);  // rebuild-every-pass reference, z=1
+    core::ConveyorResult rc_cells;
+    const auto cells = run_gpu(init, box, oc, lj, &rc_cells);  // rebuild-every-pass ref, z=1
 
     auto run_v = [&](bool hybrid, int z, core::ConveyorResult* r) {
       core::ConveyorOptions o = oc;
@@ -400,6 +401,14 @@ TEST(CudaConveyor, VerletHybridOffEquilibriumStress1vsZ) {
     const auto v1 = run_v(true, 1, &rv1);
     // (a) GATE-02: the reused (hybrid) list ≡ rebuild-every-pass cells, bit-for-bit
     EXPECT_TRUE(bitwise_eq(cells, v1)) << tag << " hybrid ≢ cells (dropped pair!)";
+    // (a') GATE-02b closure: PER-PASS potential energy (decoded from the int64
+    // EnergyAccum, lossless in range ⇒ pe-equal ⟺ raw-int64-equal) must match the
+    // rebuild-every-pass reference at EVERY pass — catches a dropped pair AT the
+    // pass it occurs, the int64-level multi-pass-ring check the K=1 zone oracle
+    // (test_cuda_zones VerletListBitwiseVsTiles) cannot reach. See test_oracle.cpp.
+    ASSERT_EQ(rc_cells.stats.size(), rv1.stats.size());
+    for (std::size_t i = 0; i < rc_cells.stats.size(); ++i)
+      EXPECT_EQ(rc_cells.stats[i].pe, rv1.stats[i].pe) << tag << " pe diverged at pass " << i;
     // (d) non-vacuous: the list is reused (>0 rebuilds, <steps) — the criterion is
     // actually the binding constraint, so a too-tight bound WOULD drop a pair here.
     EXPECT_GT(rv1.verlet_rebuilds, 0) << tag << " never rebuilt";
