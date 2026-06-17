@@ -17,8 +17,10 @@
 
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "tdmd/core/fixed_accum.hpp"
@@ -29,6 +31,7 @@
 #include "tdmd/cuda/zone_eam_verlet.cuh"    // E5c tight-list (verlet) EAM kernels
 #include "tdmd/cuda/zone_eam_newton3.cuh"   // E5c HALF-LIST + NEWTON-3 EAM kernels
 #include "tdmd/cuda/zone_eam_sorted.cuh"    // E5c SPATIAL-SORT + coalesced EAM kernels
+#include "tdmd/cuda/zone_eam_mixed.cuh"     // perf MIXED-precision (FP32 math) EAM kernels
 #include "tdmd/potentials/eam.hpp"          // eam_direct_fp64 (Test B oracle)
 #include "tdmd/potentials/eam_analytic.hpp"
 #include "tdmd/potentials/eam_spline.hpp"
@@ -472,4 +475,143 @@ TEST(CudaEamSorted, VsOracleQ2340) {  // sorted vs FP64 oracle, steep β=3.3
 }
 TEST(CudaEamSorted, VsOraclePbc) {  // sorted vs FP64 oracle across the PERIODIC seam
   check_vs_oracle(1.5, 13, 44, /*pbc=*/true, Backend::Sorted, /*skin=*/1.0);
+}
+
+// ====================== MIXED-PRECISION (production_mixed, FP32 math) =========
+// The mixed kernels (zone_eam_mixed.cuh) evaluate the spline + f_over_r in
+// FLOAT (FP32) while keeping FP64 geometry and int64 accumulation. This is NOT
+// bitwise vs the fp64 path ON PURPOSE (FP32 spline math ≠ FP64), so it is tested
+// by TOLERANCE (max relative per-atom force error vs the fp64 all-window path,
+// expected at the FP32 floor ~1e-3..1e-6, asserted < 1e-2). AND it must still be
+// GPU-INTERNAL DETERMINISTIC: the int64 accumulation is order-free even with
+// FP32 inputs ⇒ run-to-run the raw int64 force is BIT-IDENTICAL.
+
+namespace {
+// Raw int64 EAM run with the MIXED (FP32-math) tight-list kernels over a window.
+GpuOut run_gpu_mixed(const Window& w, const potentials::EamSetfl<double>& setfl,
+                     double dens_scale, double rho_cap, double skin = 1.0) {
+  const int m = w.m;
+  // double view (for the verlet-list build only) + FLOAT view (the math).
+  DevSetfl ds = upload_setfl(setfl);
+  tdcu::DevSetflF32 dsf = tdcu::upload_setfl_f32(
+      ds.view, setfl.Nrho, setfl.Nr, setfl.rdrho, setfl.rdr, setfl.rcut,
+      setfl.Fspl, setfl.rhoaspl, setfl.rphispl);
+  double* dx = upload(w.wx); double* dy = upload(w.wy); double* dz = upload(w.wz);
+  long* dkey = upload(w.key); int* downed = upload(w.owned);
+  const core::PairGeom geom(w.box, setfl.rcut);
+  std::vector<long long> z64(m, 0);
+  long long* d_rho = upload(z64);
+  std::vector<double> z(m, 0.0); double* d_fp = upload(z);
+  long long* d_fx = upload(z64); long long* d_fy = upload(z64); long long* d_fz = upload(z64);
+  long long* d_pe = upload(std::vector<long long>{0});
+  unsigned long long sentinel = static_cast<unsigned long long>(d2ll(1e300));
+  unsigned long long* d_mr = upload(std::vector<unsigned long long>{sentinel});
+  int* d_of = upload(std::vector<int>{0});
+  const int blk = tdcu::kZoneBlock;
+  const int gd = (m + blk - 1) / blk;
+
+  const double box_lo[3] = {w.box.lo[0], w.box.lo[1], w.box.lo[2]};
+  const double box_len[3] = {w.box.hi[0] - w.box.lo[0], w.box.hi[1] - w.box.lo[1],
+                             w.box.hi[2] - w.box.lo[2]};
+  const bool per[3] = {w.box.periodic[0], w.box.periodic[1], w.box.periodic[2]};
+  tdcu::EamVerletList vl =
+      tdcu::eam_build_verlet_list(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut, skin);
+
+  tdcu::eam_density_mixed_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, dsf.view, dens_scale,
+                                              vl.d_off, vl.d_idx, d_rho, d_of);
+  tdcu::eam_embedding_mixed_kernel<<<gd, blk>>>(m, dsf.view, dens_scale, rho_cap, d_rho, d_fp, d_of);
+  tdcu::eam_force_mixed_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, dsf.view,
+                                            dens_scale, d_rho, d_fp, vl.d_off, vl.d_idx,
+                                            d_fx, d_fy, d_fz, d_pe, d_mr, d_of);
+  EXPECT_EQ(cudaDeviceSynchronize(), cudaSuccess);
+  GpuOut o;
+  o.rho.resize(m); o.fx.resize(m); o.fy.resize(m); o.fz.resize(m);
+  cudaMemcpy(o.rho.data(), d_rho, m * 8, cudaMemcpyDeviceToHost);
+  cudaMemcpy(o.fx.data(), d_fx, m * 8, cudaMemcpyDeviceToHost);
+  cudaMemcpy(o.fy.data(), d_fy, m * 8, cudaMemcpyDeviceToHost);
+  cudaMemcpy(o.fz.data(), d_fz, m * 8, cudaMemcpyDeviceToHost);
+  cudaMemcpy(&o.pe, d_pe, 8, cudaMemcpyDeviceToHost);
+  cudaMemcpy(&o.min_r2_bits, d_mr, 8, cudaMemcpyDeviceToHost);
+  cudaMemcpy(&o.overflow, d_of, 4, cudaMemcpyDeviceToHost);
+  tdcu::eam_verlet_free(vl);
+  for (void* p : {(void*)dx, (void*)dy, (void*)dz, (void*)dkey, (void*)downed, (void*)d_rho,
+                  (void*)d_fp, (void*)d_fx, (void*)d_fy, (void*)d_fz, (void*)d_pe, (void*)d_mr, (void*)d_of})
+    cudaFree(p);
+  tdcu::free_setfl_f32(dsf);
+  free_setfl(ds);
+  return o;
+}
+
+// max relative per-atom force error mixed vs fp64 (|F_mix - F_64| / max|F_64|).
+template <int FB>
+void check_mixed_tolerance(double beta, unsigned seed, bool pbc, double tol) {
+  const auto setfl = analytic_setfl(beta);
+  ASSERT_EQ(setfl.density_fracbits(), FB);
+  const double dens_scale = core::fixed::FixedAccum<FB>::kScale;
+  const double rho_cap = setfl.density_grid_max();
+  const auto w = pbc ? make_window_pbc(seed) : make_window(seed);
+
+  const auto ref = run_gpu(w, setfl, dens_scale, rho_cap, Backend::AllWindow);
+  const auto mix = run_gpu_mixed(w, setfl, dens_scale, rho_cap);
+  EXPECT_EQ(mix.overflow, 0);
+
+  const double fsc = core::fixed::ForceAccum::kScale;
+  double max_fref = 0.0, max_ferr = 0.0;
+  for (int i = 0; i < w.m; ++i) {
+    const double fx = ref.fx[i] / fsc, fy = ref.fy[i] / fsc, fz = ref.fz[i] / fsc;
+    max_fref = std::fmax(max_fref, std::sqrt(fx * fx + fy * fy + fz * fz));
+    const double dfx = (mix.fx[i] - ref.fx[i]) / fsc, dfy = (mix.fy[i] - ref.fy[i]) / fsc,
+                 dfz = (mix.fz[i] - ref.fz[i]) / fsc;
+    max_ferr = std::fmax(max_ferr, std::sqrt(dfx * dfx + dfy * dfy + dfz * dfz));
+  }
+  const double rel_ferr = max_fref > 0 ? max_ferr / max_fref : 0.0;
+  // PE relative error
+  const double esc = core::fixed::EnergyAccum::kScale;
+  const double pe_mix = double(mix.pe) / esc, pe_ref = double(ref.pe) / esc;
+  const double rel_eerr = pe_ref != 0 ? std::fabs(pe_mix - pe_ref) / std::fabs(pe_ref) : 0.0;
+  // report (visible in ctest -V / when the test prints) — then the sanity gate.
+  std::printf("[mixed] max rel force err = %.3e | energy rel err = %.3e (beta=%.1f pbc=%d)\n",
+              rel_ferr, rel_eerr, beta, int(pbc));
+  EXPECT_LT(rel_ferr, tol) << "mixed FP32 force error above the sanity gate";
+  EXPECT_LT(rel_eerr, tol) << "mixed FP32 energy error above the sanity gate";
+  // not bitwise vs fp64 (it's FP32) — at least one component MUST differ (this is
+  // a real FP32 path, not an accidental fp64 alias). Guards against the float
+  // view silently falling back to double.
+  bool any_diff = false;
+  for (int i = 0; i < w.m && !any_diff; ++i)
+    any_diff = (mix.fx[i] != ref.fx[i] || mix.fy[i] != ref.fy[i] || mix.fz[i] != ref.fz[i]);
+  EXPECT_TRUE(any_diff) << "mixed == fp64 bit-for-bit — FP32 path is not actually FP32";
+}
+}  // namespace
+
+TEST(CudaEamMixed, ToleranceVsFp64Q1944) {  // FP32 force error within the gate, free-z
+  check_mixed_tolerance<44>(1.5, 7, /*pbc=*/false, /*tol=*/1e-2);
+}
+TEST(CudaEamMixed, ToleranceVsFp64Q2340) {  // steep β=3.3 (fb=40)
+  check_mixed_tolerance<40>(3.3, 11, /*pbc=*/false, /*tol=*/1e-2);
+}
+TEST(CudaEamMixed, ToleranceVsFp64Pbc) {  // across the PERIODIC seam
+  check_mixed_tolerance<44>(1.5, 13, /*pbc=*/true, /*tol=*/1e-2);
+}
+
+// GPU-INTERNAL DETERMINISM: the int64 accumulation is order-free even with FP32
+// inputs ⇒ two independent mixed runs of the SAME window produce BIT-IDENTICAL
+// raw int64 ρ / fx / fy / fz / pe (the production_mixed determinism guarantee:
+// 1-vs-z and run-to-run hold; only CPU↔GPU bitwise is given up).
+TEST(CudaEamMixed, RunToRunBitwise) {
+  const auto setfl = analytic_setfl(1.5);
+  const double dens_scale = core::fixed::FixedAccum<44>::kScale;
+  const double rho_cap = setfl.density_grid_max();
+  const auto w = make_window(7);
+  const auto a = run_gpu_mixed(w, setfl, dens_scale, rho_cap);
+  const auto b = run_gpu_mixed(w, setfl, dens_scale, rho_cap);
+  EXPECT_EQ(a.overflow, 0);
+  EXPECT_EQ(b.overflow, 0);
+  for (int i = 0; i < w.m; ++i) {
+    EXPECT_EQ(a.rho[i], b.rho[i]) << "mixed rho run-to-run, atom " << i;
+    EXPECT_EQ(a.fx[i], b.fx[i]) << "mixed fx run-to-run, atom " << i;
+    EXPECT_EQ(a.fy[i], b.fy[i]) << "mixed fy run-to-run, atom " << i;
+    EXPECT_EQ(a.fz[i], b.fz[i]) << "mixed fz run-to-run, atom " << i;
+  }
+  EXPECT_EQ(a.pe, b.pe) << "mixed pe run-to-run";
 }

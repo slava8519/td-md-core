@@ -10,6 +10,7 @@
 #include <array>
 #include <cmath>
 #include <cstdio>
+#include <random>
 #include <string>
 #include <vector>
 
@@ -21,6 +22,7 @@
 #include "tdmd/cuda/zone_eam_verlet.cuh"   // E5c: tight per-atom verlet-list EAM kernels
 #include "tdmd/cuda/zone_eam_newton3.cuh"  // E5c: half-list + Newton-3 EAM kernels
 #include "tdmd/cuda/zone_eam_sorted.cuh"   // E5c: spatial-sort + coalesced EAM kernels
+#include "tdmd/cuda/zone_eam_mixed.cuh"    // perf: MIXED-precision (FP32 math) verlet EAM kernels
 #include "tdmd/metrics/eam_breakdown.hpp"
 #include "tdmd/potentials/eam_analytic.hpp"
 #include "tdmd/potentials/eam_spline.hpp"
@@ -83,11 +85,16 @@ int main(int argc, char** argv) {
     else if (a == "--skin") skin = std::stod(argv[++i]);
   }
   if (backend != "allwindow" && backend != "cells" && backend != "verlet" &&
-      backend != "newton3" && backend != "sorted") {
-    std::printf("bench_eam: --backend must be allwindow|cells|verlet|newton3|sorted (got '%s')\n", backend.c_str());
+      backend != "newton3" && backend != "sorted" && backend != "mixed") {
+    std::printf("bench_eam: --backend must be allwindow|cells|verlet|newton3|sorted|mixed (got '%s')\n", backend.c_str());
     return 2;
   }
   const bool use_cells = (backend == "cells");
+  // MIXED uses the SAME tight verlet list as 'verlet' (the fastest fp64 path) —
+  // only the per-pair math is FP32. It shares the list-build path but launches
+  // its own FP32 kernels (use_mixed gates the kernel dispatch; the list build is
+  // gated on use_verlet || use_mixed below).
+  const bool use_mixed = (backend == "mixed");
   const bool use_verlet = (backend == "verlet");
   const bool use_newton3 = (backend == "newton3");
   const bool use_sorted = (backend == "sorted");
@@ -123,6 +130,11 @@ int main(int argc, char** argv) {
   // device setfl view
   double* dF = up(setfl.Fspl); double* dra = up(setfl.rhoaspl); double* drp = up(setfl.rphispl);
   tdcu::EamSetflView view{dF, dra, drp, setfl.Nrho, setfl.Nr, setfl.rdrho, setfl.rdr, setfl.rcut};
+  // MIXED-precision float spline view (coeffs cast double->float on the host).
+  tdcu::DevSetflF32 view_f32{};
+  if (use_mixed)
+    view_f32 = tdcu::upload_setfl_f32(view, setfl.Nrho, setfl.Nr, setfl.rdrho, setfl.rdr,
+                                      setfl.rcut, setfl.Fspl, setfl.rhoaspl, setfl.rphispl);
   double* dx = up(wx); double* dy = up(wy); double* dz = up(wz);
   long* dkey = up(key); int* downed = up(owned);
   std::vector<long long> z64(m, 0); std::vector<double> zd(m, 0.0);
@@ -159,7 +171,7 @@ int main(int argc, char** argv) {
     if (use_cells) {
       if (cg.d_order) tdcu::eam_cells_free(cg);
       cg = tdcu::eam_build_window_grid(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut);
-    } else if (use_verlet || use_newton3) {  // both walk a per-atom verlet CSR
+    } else if (use_verlet || use_newton3 || use_mixed) {  // all walk a per-atom verlet CSR
       if (vl.d_off) tdcu::eam_verlet_free(vl);
       vl = tdcu::eam_build_verlet_list(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut, skin);
     } else if (use_sorted) {  // cell-sort + tight list over the sorted positions
@@ -173,7 +185,10 @@ int main(int argc, char** argv) {
   // kernels write directly — no zeroing needed, hence this is newton3-only and the
   // memset is part of the steady-state per-step cost, timed inside the kernels' window).
   auto dens = [&] {
-    if (use_cells)
+    if (use_mixed)
+      tdcu::eam_density_mixed_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, view_f32.view,
+                                                  dens_scale, vl.d_off, vl.d_idx, d_rho, d_of);
+    else if (use_cells)
       tdcu::eam_density_cells_kernel<<<gd, blk>>>(dx, dy, dz, m, geom, view, dens_scale,
                                                   cg.g, cg.d_starts, cg.d_counts, cg.d_order,
                                                   d_rho, d_of);
@@ -193,13 +208,19 @@ int main(int argc, char** argv) {
   };
   // embedding runs on the SORTED-slot rho for the sorted backend (-> d_fp_s).
   auto emb  = [&] {
-    if (use_sorted)
+    if (use_mixed)
+      tdcu::eam_embedding_mixed_kernel<<<gd, blk>>>(m, view_f32.view, dens_scale, rho_cap, d_rho, d_fp, d_of);
+    else if (use_sorted)
       tdcu::eam_embedding_kernel<<<gd, blk>>>(m, view, dens_scale, rho_cap, d_rho_s, d_fp_s, d_of);
     else
       tdcu::eam_embedding_kernel<<<gd, blk>>>(m, view, dens_scale, rho_cap, d_rho, d_fp, d_of);
   };
   auto frc  = [&] {
-    if (use_cells)
+    if (use_mixed)
+      tdcu::eam_force_mixed_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, view_f32.view,
+                                                dens_scale, d_rho, d_fp, vl.d_off, vl.d_idx,
+                                                d_fx, d_fy, d_fz, d_pe, d_mr, d_of);
+    else if (use_cells)
       tdcu::eam_force_cells_kernel<<<gd, blk>>>(dx, dy, dz, dkey, m, downed, m, geom, view,
                                                 dens_scale, d_rho, d_fp, cg.g, cg.d_starts,
                                                 cg.d_counts, cg.d_order, d_fx, d_fy, d_fz, d_pe,
@@ -241,7 +262,7 @@ int main(int argc, char** argv) {
   // its rebuild interval in a real engine (skin-bounded — LAMMPS Neigh ≈0% at
   // equilibrium), so it's reported as a SEPARATE one-time number, not per step.
   if (use_cells) build_struct();
-  if (use_verlet || use_newton3 || use_sorted) {
+  if (use_verlet || use_newton3 || use_sorted || use_mixed) {
     cudaEventRecord(b0); build_struct(); cudaEventRecord(b1); cudaEventSynchronize(b1);
     float tb = 0; cudaEventElapsedTime(&tb, b0, b1); build_ms_total = tb;
     list_nnz = use_sorted ? sw.vl.nnz : vl.nnz;
@@ -272,10 +293,101 @@ int main(int argc, char** argv) {
     }
   bd.real_pairs = real;
 
+  // ===================== MIXED ACCURACY (vs fp64 all-window) =================
+  // The mixed path gives up CPU↔GPU / fp64↔mixed bitwise ON PURPOSE (FP32 math).
+  // Quantify the cost on a JITTERED config (the perfect lattice has ~0 net force
+  // by symmetry — a useless relative-error denominator), with CLEAN single-shot
+  // buffers for BOTH the mixed and the fp64 all-window kernels (the per-step
+  // d_fx/d_pe are STEP-ACCUMULATED and must NOT be used). Reports the MAX
+  // RELATIVE per-atom force error + relative total-energy error, plus a
+  // run-to-run determinism check (int64 accumulation is order-free even at FP32).
+  if (use_mixed) {
+    const double fsc = core::fixed::ForceAccum::kScale;
+    const double esc = core::fixed::EnergyAccum::kScale;
+    // jittered positions (±0.08 Å) so forces are O(0.1..1 eV/Å), a real denom.
+    std::vector<double> jx(m), jy(m), jz(m);
+    { std::mt19937_64 rng(12345); std::uniform_real_distribution<double> jit(-0.08, 0.08);
+      for (int i = 0; i < m; ++i) { jx[i] = wx[i] + jit(rng); jy[i] = wy[i] + jit(rng); jz[i] = wz[i] + jit(rng); } }
+    double* jdx = up(jx); double* jdy = up(jy); double* jdz = up(jz);
+    tdcu::EamVerletList jvl =
+        tdcu::eam_build_verlet_list(jdx, jdy, jdz, m, box_lo, box_len, per, setfl.rcut, skin);
+
+    // helper: clean single-shot run, returns force(host int64) + raw pe.
+    auto single_shot = [&](bool mixed, std::vector<long long>& ofx,
+                           std::vector<long long>& ofy, std::vector<long long>& ofz,
+                           long long& ope, int& oover) {
+      std::vector<long long> z64b(m, 0);
+      long long* s_rho = up(z64b); double* s_fp = up(std::vector<double>(m, 0.0));
+      long long* s_fx = up(z64b); long long* s_fy = up(z64b); long long* s_fz = up(z64b);
+      long long* s_pe = up(std::vector<long long>{0});
+      unsigned long long* s_mr = up(std::vector<unsigned long long>{0x7FF0000000000000ULL});
+      int* s_of = up(std::vector<int>{0});
+      if (mixed) {
+        tdcu::eam_density_mixed_kernel<<<gd, blk>>>(jdx, jdy, jdz, m, geom, view_f32.view,
+                                                    dens_scale, jvl.d_off, jvl.d_idx, s_rho, s_of);
+        tdcu::eam_embedding_mixed_kernel<<<gd, blk>>>(m, view_f32.view, dens_scale, rho_cap, s_rho, s_fp, s_of);
+        tdcu::eam_force_mixed_kernel<<<gd, blk>>>(jdx, jdy, jdz, dkey, m, downed, m, geom, view_f32.view,
+                                                  dens_scale, s_rho, s_fp, jvl.d_off, jvl.d_idx,
+                                                  s_fx, s_fy, s_fz, s_pe, s_mr, s_of);
+      } else {  // fp64 ALL-WINDOW reference (matches LAMMPS double to ~1e-12)
+        tdcu::eam_density_kernel<<<gd, blk>>>(jdx, jdy, jdz, m, geom, view, dens_scale, s_rho, s_of);
+        tdcu::eam_embedding_kernel<<<gd, blk>>>(m, view, dens_scale, rho_cap, s_rho, s_fp, s_of);
+        tdcu::eam_force_kernel<<<gd, blk>>>(jdx, jdy, jdz, dkey, m, downed, m, geom, view, dens_scale,
+                                            s_rho, s_fp, s_fx, s_fy, s_fz, s_pe, s_mr, s_of);
+      }
+      cudaDeviceSynchronize();
+      ofx.resize(m); ofy.resize(m); ofz.resize(m);
+      cudaMemcpy(ofx.data(), s_fx, m * 8, cudaMemcpyDeviceToHost);
+      cudaMemcpy(ofy.data(), s_fy, m * 8, cudaMemcpyDeviceToHost);
+      cudaMemcpy(ofz.data(), s_fz, m * 8, cudaMemcpyDeviceToHost);
+      cudaMemcpy(&ope, s_pe, 8, cudaMemcpyDeviceToHost);
+      cudaMemcpy(&oover, s_of, 4, cudaMemcpyDeviceToHost);
+      for (void* p : {(void*)s_rho, (void*)s_fp, (void*)s_fx, (void*)s_fy, (void*)s_fz,
+                      (void*)s_pe, (void*)s_mr, (void*)s_of})
+        cudaFree(p);
+    };
+
+    std::vector<long long> mfx, mfy, mfz, rfx, rfy, rfz, m2x, m2y, m2z;
+    long long mpe_raw = 0, rpe_raw = 0, mpe2 = 0; int mo = 0, ro = 0, mo2 = 0;
+    single_shot(/*mixed=*/true,  mfx, mfy, mfz, mpe_raw, mo);
+    single_shot(/*mixed=*/false, rfx, rfy, rfz, rpe_raw, ro);
+    single_shot(/*mixed=*/true,  m2x, m2y, m2z, mpe2, mo2);  // determinism twin
+
+    // run-to-run determinism: the two mixed shots must be BIT-IDENTICAL int64.
+    bool det = (mpe_raw == mpe2);
+    for (int i = 0; i < m && det; ++i)
+      det = (mfx[i] == m2x[i] && mfy[i] == m2y[i] && mfz[i] == m2z[i]);
+    std::printf("mixed determinism (run-to-run raw int64 force+pe): %s\n",
+                det ? "BIT-IDENTICAL ✓" : "DIVERGED ✗");
+
+    // max relative per-atom force error |F_mixed - F_fp64| / max|F_fp64|.
+    double max_fref = 0.0, max_ferr = 0.0;
+    for (int i = 0; i < m; ++i) {
+      const double fx = rfx[i] / fsc, fy = rfy[i] / fsc, fz = rfz[i] / fsc;
+      max_fref = std::fmax(max_fref, std::sqrt(fx * fx + fy * fy + fz * fz));
+      const double dfx = (mfx[i] - rfx[i]) / fsc, dfy = (mfy[i] - rfy[i]) / fsc,
+                   dfz = (mfz[i] - rfz[i]) / fsc;
+      max_ferr = std::fmax(max_ferr, std::sqrt(dfx * dfx + dfy * dfy + dfz * dfz));
+    }
+    const double rel_ferr = max_fref > 0 ? max_ferr / max_fref : 0.0;
+    const double pe_mixed = double(mpe_raw) / esc, pe_ref = double(rpe_raw) / esc;
+    const double rel_eerr = pe_ref != 0 ? std::fabs(pe_mixed - pe_ref) / std::fabs(pe_ref) : 0.0;
+    std::printf("ACCURACY (mixed-fp32 vs fp64 all-window @ jittered config — "
+                "the fp64 path matches LAMMPS double to ~1e-12):\n");
+    std::printf("  max rel force err = %.3e  (abs %.3e eV/Å, max|F_fp64|=%.4f eV/Å)\n",
+                rel_ferr, max_ferr, max_fref);
+    std::printf("  total energy rel err = %.3e  (mixed %.6f eV, fp64 %.6f eV)\n",
+                rel_eerr, pe_mixed, pe_ref);
+    (void)mo; (void)ro; (void)mo2;
+    tdcu::eam_verlet_free(jvl);
+    for (void* p : {(void*)jdx, (void*)jdy, (void*)jdz}) cudaFree(p);
+  }
+
   int of = 0; cudaMemcpy(&of, d_of, 4, cudaMemcpyDeviceToHost);
   if (use_cells) tdcu::eam_cells_free(cg);
-  if (use_verlet || use_newton3) tdcu::eam_verlet_free(vl);
+  if (use_verlet || use_newton3 || use_mixed) tdcu::eam_verlet_free(vl);
   if (use_sorted) tdcu::eam_sorted_free(sw);
+  if (use_mixed) tdcu::free_setfl_f32(view_f32);
 
   // Candidate enumeration cost per atom — what makes the over-fetch visible:
   //   real/atom    = in-cutoff (rcut) neighbours/atom (the irreducible work)
@@ -315,7 +427,7 @@ int main(int argc, char** argv) {
   if (use_cells)
     std::printf("grid-build: %.4f ms/step (rebuilt over the whole window each step)\n",
                 build_ms_total / double(steps));
-  if (use_verlet || use_newton3 || use_sorted)
+  if (use_verlet || use_newton3 || use_sorted || use_mixed)
     std::printf("%s-build: %.4f ms (ONE-TIME — amortized over the rebuild interval; "
                 "steady-state per-step cost is the iterate-only kernels above%s)\n",
                 use_sorted ? "sort+list" : "list", build_ms_total,
@@ -325,6 +437,10 @@ int main(int argc, char** argv) {
     std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
                 occ(tdcu::eam_density_cells_kernel, blk), occ(tdcu::eam_embedding_kernel, blk),
                 occ(tdcu::eam_force_cells_kernel, blk), of);
+  else if (use_mixed)
+    std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
+                occ(tdcu::eam_density_mixed_kernel, blk), occ(tdcu::eam_embedding_mixed_kernel, blk),
+                occ(tdcu::eam_force_mixed_kernel, blk), of);
   else if (use_verlet)
     std::printf("occupancy: density %.1f%% | embedding %.1f%% | force %.1f%% | overflow=%d\n",
                 occ(tdcu::eam_density_verlet_kernel, blk), occ(tdcu::eam_embedding_kernel, blk),
@@ -346,14 +462,16 @@ int main(int argc, char** argv) {
   std::printf("candidate enumeration: real/atom=%.1f | cells exam/atom=%.1f (%.2fx over-fetch)",
               real_per_atom, cells_exam_per_atom,
               real_per_atom > 0 ? cells_exam_per_atom / real_per_atom : 0.0);
-  if (use_verlet || use_newton3 || use_sorted)
+  if (use_verlet || use_newton3 || use_sorted || use_mixed)
     std::printf(" | %s nbr/atom=%.1f (skin=%.2f, %.2fx over-fetch, %lld total%s)",
-                use_newton3 ? "n3-full-list" : use_sorted ? "sorted-verlet" : "verlet",
+                use_newton3 ? "n3-full-list" : use_sorted ? "sorted-verlet"
+                : use_mixed ? "mixed-verlet" : "verlet",
                 double(list_nnz) / double(m), skin,
                 real_per_atom > 0 ? (double(list_nnz) / double(m)) / real_per_atom : 0.0,
                 list_nnz,
                 use_newton3 ? "; the bb>aa gate halves the EVAL to ~half this"
-                : use_sorted ? "; cell-sorted ⇒ neighbour gathers coalesce" : "");
+                : use_sorted ? "; cell-sorted ⇒ neighbour gathers coalesce"
+                : use_mixed ? "; FP32 per-pair math (production_mixed)" : "");
   std::printf("\n");
 
   std::printf(
