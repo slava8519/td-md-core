@@ -333,6 +333,97 @@ TEST(CudaConveyor, VerletDriftReducesRebuilds) {
               rd.verlet_rebuilds);
 }
 
+// --- M4-S closure: skin criterion validated OFF-EQUILIBRIUM under real stress ---
+// The PR-1..PR-4 skin criterion was only exercised on a mild 300 K / 60-step /
+// n=2 (lag=1) fixture. M4-S closes by re-running GATE-02 (verlet ≡ rebuild-every-
+// pass cells), GATE-03 (1-vs-z bitwise) and non-vacuity under a HOT (2500 K melt)
+// and a coherent counter-slab SHOCK, with n_zones=8 ⇒ light-cone lag L=7 (the
+// multi-pass Λ-carry of d_full that n=2 cannot reach), small skin=0.3 Å (binding,
+// not vacuous), and verlet FORCED on (K_on=0) so the reuse bound is what is tested
+// (the K-aware fallback is its own test). This is the non-vacuous M4-S gate.
+//
+// И2 (the exact prefix d_(1)+d_(2) instead of the shipped 2·d_max) is DEFERRED:
+// adversarially designed 2026-06-17, measured marginal-K ~0 on the flagship
+// (lag-tail 2·L·R_buf dominates; bottleneck is FP64 force geometry, not rebuild
+// rate) — recorded in verlet_skin/ROADMAP. The d_(1)+d_(2) ≤ 2·d_max bound is safe
+// and tighter; if a small-n bake-off ever justifies it, land it with a
+// deterministic shared-mem top-2 merge (NOT a 2-atomic min trick) — see ROADMAP.
+TEST(CudaConveyor, VerletHybridOffEquilibriumStress1vsZ) {
+  const auto lj = make_lj(0.4, 2.55, kRcut);
+  constexpr long kSteps = 3000;
+  constexpr int kNZones = 8;          // free-z ⇒ light-cone lag L = n_zones-1 = 7
+  constexpr double kSkin = 0.3;       // small ⇒ short reuse window ⇒ binding
+
+  // make_fcc(2,2,16): Lz=64.8 Å ⇒ per-zone width 8.1 ≥ 2·rcut (residence ok); 256 atoms.
+  auto build_thermal = [&](core::Box& box) {
+    auto init = make_fcc(box, 2, 2, 16, /*pz=*/false);
+    core::thermal::maxwell_init(init, 2500.0, 51);  // hot melt
+    return init;
+  };
+  // momentum-neutral counter-slab compression in the periodic x: a real coherent
+  // shock (relative pair motion, not a rigid drift the L2a correction would absorb).
+  auto build_shock = [&](core::Box& box) {
+    auto init = make_fcc(box, 2, 2, 16, /*pz=*/false);
+    core::thermal::maxwell_init(init, 300.0, 51);
+    const double xmid = 0.5 * (box.lo[0] + box.hi[0]);
+    for (int i = 0; i < init.n; ++i) init.vx[i] += (init.x[i] < xmid) ? 10.0 : -10.0;
+    return init;
+  };
+
+  auto stress = [&](const char* tag, auto build, bool autodt) {
+    core::Box box;
+    const auto init = build(box);
+    core::ConveyorOptions oc;
+    oc.steps = kSteps; oc.n_zones = kNZones; oc.n_nodes = 1; oc.dt_initial = 0.001;
+    if (autodt) { oc.auto_step = true; oc.ts.C1 = 0.01; oc.ts.C3 = 1.0; }
+
+    const auto cells = run_gpu(init, box, oc, lj);  // rebuild-every-pass reference, z=1
+
+    auto run_v = [&](bool hybrid, int z, core::ConveyorResult* r) {
+      core::ConveyorOptions o = oc;
+      o.n_nodes = z;
+      o.verlet_reuse = true;
+      o.verlet_default = true;
+      o.verlet_skin = kSkin;
+      o.verlet_hybrid = hybrid;
+      o.verlet_K_on = 0.0;     // FORCE verlet active (test the reuse bound, not И1 fallback)
+      o.verlet_K_off = 0.0;
+      return run_gpu(init, box, o, lj, r);
+    };
+
+    // (e) conservative (2·R_buf) reference at z=1
+    core::ConveyorResult rc_cons;
+    const auto cons = run_v(false, 1, &rc_cons);
+    EXPECT_TRUE(bitwise_eq(cells, cons)) << tag << " conservative ≢ cells";
+
+    core::ConveyorResult rv1;
+    const auto v1 = run_v(true, 1, &rv1);
+    // (a) GATE-02: the reused (hybrid) list ≡ rebuild-every-pass cells, bit-for-bit
+    EXPECT_TRUE(bitwise_eq(cells, v1)) << tag << " hybrid ≢ cells (dropped pair!)";
+    // (d) non-vacuous: the list is reused (>0 rebuilds, <steps) — the criterion is
+    // actually the binding constraint, so a too-tight bound WOULD drop a pair here.
+    EXPECT_GT(rv1.verlet_rebuilds, 0) << tag << " never rebuilt";
+    EXPECT_LT(rv1.verlet_rebuilds, kSteps) << tag << " rebuilt every step (vacuous)";
+    // (e) the hybrid (tighter) bound rebuilds no more than conservative, still bitwise
+    EXPECT_LE(rv1.verlet_rebuilds, rc_cons.verlet_rebuilds) << tag << " hybrid looser";
+
+    for (int z : {2, 4, 8}) {  // (b)/(c) 1-vs-z bitwise + z-independent rebuild count
+      core::ConveyorResult rvz;
+      const auto vz = run_v(true, z, &rvz);
+      EXPECT_TRUE(bitwise_eq(v1, vz)) << tag << " 1-vs-z=" << z << " mismatch";
+      EXPECT_EQ(rv1.verlet_rebuilds, rvz.verlet_rebuilds)
+          << tag << " rebuild count z-dependent (reduction not z-independent!) z=" << z;
+    }
+    std::printf("[%s%s] L=%d skin=%.1f: %ld rebuilds / %ld steps (cons %ld)\n", tag,
+                autodt ? "+auto" : "", kNZones - 1, kSkin, rv1.verlet_rebuilds, kSteps,
+                rc_cons.verlet_rebuilds);
+  };
+
+  stress("hot2500", build_thermal, /*autodt=*/false);
+  stress("hot2500", build_thermal, /*autodt=*/true);
+  stress("shock",   build_shock,   /*autodt=*/false);
+}
+
 // --- auto dt: the Λ-chain fed by DEVICE reductions matches the CPU ---
 
 TEST(CudaConveyor, LjAutoDtMatchesCpuConveyor) {

@@ -1395,6 +1395,8 @@ class GpuTimeConveyor {
         // the current pair-approach (d_lagged = max displacement as of t-L,
         // + L steps of R_buf). min() of two upper bounds is the tightest SAFE
         // bound => rebuilds no sooner than conservative (larger K). The
+        // M4-S И2 refinement d_(1)+d_(2) <= 2*d_lagged would tighten the prefix
+        // (still safe, monotone) — DEFERRED (marginal K, see verlet_skin/ROADMAP).
         // post-rebuild stale d_lagged is harmless: skin_out is then tiny, so
         // min() picks it — no rebuild storm (no epoch tracking needed).
         const double hyb = 2.0 * d_lagged + 2.0 * lag * R_buf;
