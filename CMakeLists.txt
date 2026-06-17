@@ -269,9 +269,9 @@ if(TDMD_BUILD_TESTS)
     add_test(NAME Test_CUDA_EAM COMMAND test_cuda_eam)
     set_tests_properties(Test_CUDA_EAM PROPERTIES LABELS cuda)
 
-    add_executable(test_cuda_eam_ring tests/test_cuda_eam_ring.cu)  # M6 E5b-2: EAM GPU ring (single-node)
+    add_executable(test_cuda_eam_ring tests/test_cuda_eam_ring.cu)  # M6 E5b-2/3b: EAM GPU ring (single + streaming z>1)
     target_link_libraries(test_cuda_eam_ring PRIVATE tdmd_core GTest::gtest_main
-                          tdmd_eam_cuda_flags)
+                          tdmd_eam_cuda_flags Threads::Threads)
     add_test(NAME Test_CUDA_EAM_Ring COMMAND test_cuda_eam_ring)
     set_tests_properties(Test_CUDA_EAM_Ring PROPERTIES LABELS cuda)
 

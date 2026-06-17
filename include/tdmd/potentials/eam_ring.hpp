@@ -35,6 +35,16 @@
 //
 // THIS PR: free-z (non-periodic) boundaries. PBC-z (cyclic window closure of
 // owned 0 in the tail) is a follow-up.
+//
+// M6 E5b-3b — POLICY-TEMPLATED window force. The ring's orchestration (threads,
+// SPSC channels, send-delay/second-forward-hop, FSM, Λ-chain dt handoff, PBC
+// defer_head) is the PROVEN bitwise oracle; the ONLY moving part is the per-
+// window EAM force computation. EamRing is parametrized on a WINDOW-FORCE POLICY
+// `WinForce`; the default `CpuEamWindowForce<Math>` wraps eam_window_force ⇒ the
+// CPU ring stays BYTE-IDENTICAL (verified by test_eam_ring / test_eam_zone). The
+// GPU policy (cuda/eam_window_force_gpu.cuh) runs the E5 kernels on the SAME
+// gathered window ⇒ EamGpuRing inherits ALL orchestration ⇒ bitwise ≡ CPU ring
+// by construction (the int64 window-force result is order-free, B1/INV-9).
 namespace tdmd::potentials {
 
 using core::AtomSoA;
@@ -46,12 +56,48 @@ using core::ITransport;
 using core::RingTransport;
 using core::ZoneMsg;
 
-template <typename Real, typename Math>
+// Default (CPU) window-force policy: a thin, stateless wrapper over
+// eam_window_force with the dual-format (Q19.44 / Q23.40) dispatch on
+// density_fracbits(). compute() takes the gathered window and writes the int64
+// force accumulators + accumulates pe / min_r2 EXACTLY as the pre-refactor
+// finalize_owned body did ⇒ the CPU ring is byte-identical. `fb` is the density
+// fracbits (44 or 40); the policy is constructed once per run.
+template <typename Math>
+struct CpuEamWindowForce {
+  const Math* math = nullptr;
+  int fb = 44;
+  explicit CpuEamWindowForce(const Math& m) : math(&m), fb(m.density_fracbits()) {}
+
+  void compute(const double* wx, const double* wy, const double* wz, const long* key,
+               int m, const int* owned, int n_owned, const core::PairGeom& geom,
+               double rho_cap, std::vector<core::fixed::ForceAccum>& wFx,
+               std::vector<core::fixed::ForceAccum>& wFy,
+               std::vector<core::fixed::ForceAccum>& wFz,
+               core::fixed::EnergyAccum& pe, double& min_r2) const {
+    if (fb == 44)
+      eam_window_force<Math, core::fixed::FixedAccum<44>>(
+          wx, wy, wz, key, m, owned, n_owned, *math, geom, rho_cap, wFx, wFy, wFz, pe, min_r2);
+    else
+      eam_window_force<Math, core::fixed::FixedAccum<40>>(
+          wx, wy, wz, key, m, owned, n_owned, *math, geom, rho_cap, wFx, wFy, wFz, pe, min_r2);
+  }
+};
+
+template <typename Real, typename Math, typename WinForce = CpuEamWindowForce<Math>>
 class EamRing {
  public:
+  // The default-policy ctor (CPU): builds the policy from pot.math. Byte-compatible
+  // with the pre-refactor signature — every existing call site is unchanged.
   EamRing(AtomSoA<Real>& atoms, const Box& box, const EamPotential<Real, Math>& pot,
           const ConveyorOptions& o)
-      : atoms_(atoms), box_(box), pot_(pot), o_(o), rcut_(pot.math.rcut) {
+      : EamRing(atoms, box, pot, o, WinForce(pot.math)) {}
+
+  // Policy-injected ctor (GPU / custom): the caller supplies the window-force
+  // policy (e.g. a GpuEamWindowForce holding the device spline + per-node stream).
+  EamRing(AtomSoA<Real>& atoms, const Box& box, const EamPotential<Real, Math>& pot,
+          const ConveyorOptions& o, WinForce winforce)
+      : atoms_(atoms), box_(box), pot_(pot), o_(o), rcut_(pot.math.rcut),
+        winforce_(std::move(winforce)) {
     if (o_.steps < 1) throw std::invalid_argument("eam_ring: steps must be >= 1");
     if (o_.n_nodes < 1) throw std::invalid_argument("eam_ring: n_nodes must be >= 1");
     if (!(o_.dt_initial > 0.0)) throw std::invalid_argument("eam_ring: dt_initial > 0");
@@ -285,14 +331,12 @@ class EamRing {
       }
       const int m = int(wx.size());
       std::vector<core::fixed::ForceAccum> wFx(m), wFy(m), wFz(m);
-      if (fb_ == 44)
-        eam_window_force<Math, core::fixed::FixedAccum<44>>(
-            wx.data(), wy.data(), wz.data(), key.data(), m, ownedloc.data(),
-            int(ownedloc.size()), pot_.math, geom, rho_cap, wFx, wFy, wFz, pe, min_r2);
-      else
-        eam_window_force<Math, core::fixed::FixedAccum<40>>(
-            wx.data(), wy.data(), wz.data(), key.data(), m, ownedloc.data(),
-            int(ownedloc.size()), pot_.math, geom, rho_cap, wFx, wFy, wFz, pe, min_r2);
+      // M6 E5b-3b: the SINGLE moving part — delegate to the window-force policy
+      // (CPU default = eam_window_force; GPU = the E5 kernels). pe/min_r2 are
+      // updated exactly as before; the int64 force result is order-free.
+      winforce_.compute(wx.data(), wy.data(), wz.data(), key.data(), m,
+                        ownedloc.data(), int(ownedloc.size()), geom, rho_cap, wFx,
+                        wFy, wFz, pe, min_r2);
       return end_eam(j, ownedloc, wFx, wFy, wFz);
     };
 
@@ -428,6 +472,7 @@ class EamRing {
   ConveyorOptions o_;
   double rcut_;
   int fb_ = 44;
+  WinForce winforce_;
   core::ZoneDecomposition zd_;
   int n_ = 0, z_ = 0;
   core::conveyor_detail::Lambda lam0_{};
@@ -441,10 +486,22 @@ class EamRing {
 };
 
 // Convenience: run the EAM ring on `atoms` (mutated in place), return result.
+// Default policy (CPU) — byte-identical to the pre-refactor driver.
 template <typename Real, typename Math>
 ConveyorResult run_eam_ring(AtomSoA<Real>& atoms, const Box& box,
                             const EamPotential<Real, Math>& pot, const ConveyorOptions& o) {
   EamRing<Real, Math> r(atoms, box, pot, o);
+  return r.run();
+}
+
+// Policy-injected overload: run the ring with a custom window-force policy
+// (e.g. the GPU GpuEamWindowForce). The orchestration is identical ⇒ bitwise
+// ≡ the CPU ring by construction.
+template <typename Real, typename Math, typename WinForce>
+ConveyorResult run_eam_ring(AtomSoA<Real>& atoms, const Box& box,
+                            const EamPotential<Real, Math>& pot, const ConveyorOptions& o,
+                            WinForce winforce) {
+  EamRing<Real, Math, WinForce> r(atoms, box, pot, o, std::move(winforce));
   return r.run();
 }
 
