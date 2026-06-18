@@ -110,6 +110,14 @@ T* up(const std::vector<T>& v) {
 // {j,j+1} (drops the lower donor) — the Oracle-A poison that proves a missing
 // donor is DETECTABLE. out_f{x,y,z} (optional, size n) receive the forces at the
 // final config (with steps=0, the step-0 forces — for the independent-oracle gate).
+//
+// FIREWALL GAP: this driver runs the EAM SYMMETRIC int64 accumulator (q(j)=−q(i))
+// DIRECTLY from a raw EamSetfl — it has NO PassDecl, so it is NOT covered by
+// GpuEamWindowForce::assert_supported (which gates only the EamRing path). It is the
+// oldest/simplest GPU-EAM entry point (the physics suite copies it) ⇒ the LIKELY MEAM
+// reuse site. A MEAM/Tersoff author MUST NOT run a needs_transpose (angular/bond-order,
+// non-symmetric, force-to-third-atom-k) potential through this — build the transpose
+// accumulator path instead. When MEAM lands, descriptor-gate this driver too (MB1).
 template <typename Real>
 void eam_gpu_run_singlenode(core::AtomSoA<Real>& a, const core::Box& box,
                             const core::ZoneDecomposition& zd,

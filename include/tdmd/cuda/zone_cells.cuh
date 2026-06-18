@@ -182,20 +182,29 @@ static __global__ void zone_pair_cells_kernel(
   if (active) {
     int cxi, cyi, czi;
     bg.coords(xi, yi, zi, cxi, cyi, czi);
-    const int dzlo = (bg.nz == 1) ? 0 : -1, dzhi = (bg.nz == 1) ? 0 : 1;
-    const int dylo = (bg.ny == 1) ? 0 : -1, dyhi = (bg.ny == 1) ? 0 : 1;
-    const int dxlo = (bg.nx == 1) ? 0 : -1, dxhi = (bg.nx == 1) ? 0 : 1;
+    // ±s_d stencil (un-forked from the EAM cull kernels — was hardcoded ±1). The pair
+    // conveyor builds its grid with cell_div=1 ⇒ s_d=1 ⇒ ±s_d ≡ ±1, byte-identical today
+    // (test_cuda_zones). The k>1 traversal is CHARACTER-IDENTICAL to eam_*_cells_kernel,
+    // whose A-k gate (test_cuda_eam_cells) proves it bitwise at k∈{2,3,4}; only the force
+    // body below differs (unchanged). CAVEAT: the k>1 PAIR-specific gate below (same_zone
+    // self-skip, window-local energy-once, cross-zone A-side launch) is NOT unit-tested at
+    // k>1 — unreachable dead code today (no caller wires cell_div>1 into the pair grid). A
+    // future cell_div>1 pair client MUST first add a k>1 cross-zone/energy test_cuda_zones
+    // variant; it then gets sub-rcut for free (AUTO-gated, B1-bitwise).
+    const int dzlo = (bg.nz == 1) ? 0 : -bg.sz, dzhi = (bg.nz == 1) ? 0 : bg.sz;
+    const int dylo = (bg.ny == 1) ? 0 : -bg.sy, dyhi = (bg.ny == 1) ? 0 : bg.sy;
+    const int dxlo = (bg.nx == 1) ? 0 : -bg.sx, dxhi = (bg.nx == 1) ? 0 : bg.sx;
     for (int dz = dzlo; dz <= dzhi; ++dz) {
       int zc = czi + dz;
-      if (bg.wrapz) zc = (zc + bg.nz) % bg.nz;
+      if (bg.wrapz) zc = ((zc % bg.nz) + bg.nz) % bg.nz;  // |dz|>1-safe (nz>=2s+1 guaranteed)
       else if (zc < 0 || zc >= bg.nz) continue;
       for (int dy = dylo; dy <= dyhi; ++dy) {
         int yc = cyi + dy;
-        if (bg.wrapy) yc = (yc + bg.ny) % bg.ny;
+        if (bg.wrapy) yc = ((yc % bg.ny) + bg.ny) % bg.ny;
         else if (yc < 0 || yc >= bg.ny) continue;
         for (int dx = dxlo; dx <= dxhi; ++dx) {
           int xc = cxi + dx;
-          if (bg.wrapx) xc = (xc + bg.nx) % bg.nx;
+          if (bg.wrapx) xc = ((xc % bg.nx) + bg.nx) % bg.nx;
           else if (xc < 0 || xc >= bg.nx) continue;
           const int c = bg.idx(xc, yc, zc);
           const int beg = b_starts[c], cnt = b_counts[c];

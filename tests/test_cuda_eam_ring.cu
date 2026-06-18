@@ -546,3 +546,36 @@ TEST(CudaEamGpuRing, SubRcutRingMatchesAllWindowRingBitwise) {
     }
   }
 }
+
+// Descriptor firewall has TEETH: assert_supported must REFUSE any potential the GPU
+// symmetric int64 accumulator cannot honor (needs_transpose angular/bond-order, iterative
+// QEq, wrong kind/count). Without this the wrong-physics bug ships silently bitwise-green.
+// EAM's actual [Density,Embedding,Force] contract must NOT throw (the no-op guarantee).
+TEST(CudaEamGpuRing, DescriptorFirewallRefusesUnsupported) {
+  using potentials::PassDecl; using potentials::PassKind;
+  const PassDecl eam[3] = {{PassKind::Density, true, false, false, 44},
+                           {PassKind::Embedding, false, false, false, 30},
+                           {PassKind::Force, true, false, false, 40}};
+  EXPECT_NO_THROW(tdcu::GpuEamWindowForce::assert_supported(eam));  // EAM = no-op
+  // seam-is-live: the static method must exist with this exact signature (a future policy
+  // typo/wrong-sign would make EamRing's `requires` silently skip — pin it here).
+  static_assert(requires { tdcu::GpuEamWindowForce::assert_supported(
+      std::span<const potentials::PassDecl>{}); }, "firewall seam must be a live static method");
+  // needs_transpose (MEAM/Tersoff angular → force to a third atom k) + iterative (ReaxFF
+  // QEq) MUST throw AT EVERY SLOT — esp. the Force slot (2), where an angular term lives;
+  // a `p<2` off-by-one refactor would stop checking it, and a slot-2-only test would miss it.
+  for (int slot = 0; slot < 3; ++slot) {
+    PassDecl tr[3] = {eam[0], eam[1], eam[2]}; tr[slot].needs_transpose = true;
+    EXPECT_THROW(tdcu::GpuEamWindowForce::assert_supported(tr), std::runtime_error)
+        << "needs_transpose at slot " << slot << " must be REFUSED (non-symmetric accumulator)";
+    PassDecl it[3] = {eam[0], eam[1], eam[2]}; it[slot].iterative = true;
+    EXPECT_THROW(tdcu::GpuEamWindowForce::assert_supported(it), std::runtime_error)
+        << "iterative at slot " << slot << " must be refused";
+  }
+  // wrong count (4 passes, +BondOrder) — must throw.
+  const PassDecl four[4] = {eam[0], eam[1], eam[2], {PassKind::BondOrder, true, false, false, 40}};
+  EXPECT_THROW(tdcu::GpuEamWindowForce::assert_supported(four), std::runtime_error);
+  // wrong kind at a slot — must throw.
+  const PassDecl badkind[3] = {{PassKind::BondOrder, true, false, false, 44}, eam[1], eam[2]};
+  EXPECT_THROW(tdcu::GpuEamWindowForce::assert_supported(badkind), std::runtime_error);
+}

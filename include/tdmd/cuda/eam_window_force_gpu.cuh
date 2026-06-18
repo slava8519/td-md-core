@@ -11,12 +11,15 @@
 #include <chrono>
 #endif
 
+#include <span>
+
 #include "tdmd/core/fixed_accum.hpp"
 #include "tdmd/core/soa.hpp"   // Box (the cell grid needs box.lo — F1)
 #include "tdmd/core/zones.hpp"  // PairGeom
 #include "tdmd/cuda/zone_eam.cuh"  // eam_density/embedding/force kernels, EamSetflView
 #include "tdmd/cuda/zone_eam_cells.cuh"  // E5c-integration: culled kernels + window grid
 #include "tdmd/potentials/eam_spline.hpp"
+#include "tdmd/potentials/many_body.hpp"  // PassDecl/PassKind — the descriptor firewall
 
 // M6 E5b-3b — the GPU WINDOW-FORCE POLICY for the streaming multi-node EAM ring.
 //
@@ -234,6 +237,50 @@ struct GpuEamWindowForce {
 
   // non-vacuity witness: how many compute() calls took the culled path.
   unsigned long long cells_passes() const { return st->cells_passes; }
+
+  // DESCRIPTOR FIREWALL (correctness, not perf). This GPU policy implements the EAM
+  // SYMMETRIC 3-pass force: the int64 accumulator writes q(j)=−q(i) (zone_force.cuh),
+  // valid ONLY because EAM's (F'_i+F'_j)·dρ bracket is symmetric. A future MEAM/Tersoff
+  // angular / bond-order term is NON-symmetric (writes force to a THIRD atom k, declared
+  // PassDecl.needs_transpose) — and an iterative QEq/CG solver (PassDecl.iterative) is a
+  // different control flow entirely. Today compute() hardcodes the [Density,Embedding,
+  // Force] kernel sequence (heterogeneous device signatures ⇒ no device-side polymorphic
+  // loop); WITHOUT this gate a potential could ship needs_transpose=true, this policy would
+  // silently run the symmetric accumulator and produce DETERMINISTIC, bitwise-stable,
+  // 1-vs-z-identical — and physically WRONG forces, invisible to every consistency gate.
+  // EamRing calls this (via `if constexpr requires`) before the run; EAM's passes() ⇒
+  // exactly [Density,Embedding,Force], all symmetric ⇒ a pure no-op (no behavior change).
+  //
+  // FIREWALL SCOPE (honest): this guards the EamRing STREAMING path ONLY. The z=1 driver
+  // eam_gpu_run_singlenode (eam_conveyor_gpu.cuh — used by eam_drift/eam_rdf_stat/eam_coexist)
+  // runs the symmetric kernels DIRECTLY from a raw EamSetfl, with NO descriptor ⇒ NOT gated
+  // (see its `FIREWALL GAP` anchor). And the `requires`-clause is opt-in: a future GPU policy
+  // that omits/mis-signs assert_supported silently bypasses. Both are contained TODAY
+  // (EamPotential is the sole, final, [D,E,F]-symmetric potential), and both close when MEAM
+  // lands: gate the single-node driver + promote the policy contract to a C++20 concept +
+  // static_assert (the MB1/MB2 acceptance items). This PR converts the EamRing seam from
+  // latent-wrong to loud; it does not claim to cover every GPU-EAM entry point.
+  static void assert_supported(std::span<const potentials::PassDecl> passes) {
+    if (passes.size() != 3)
+      throw std::runtime_error("GpuEamWindowForce: only the EAM 3-pass (Density,Embedding,"
+          "Force) sequence is implemented on the GPU — got " + std::to_string(passes.size()) +
+          " passes (MEAM/Tersoff/ReaxFF GPU dispatch unimplemented)");
+    const potentials::PassKind want[3] = {potentials::PassKind::Density,
+        potentials::PassKind::Embedding, potentials::PassKind::Force};
+    for (std::size_t p = 0; p < 3; ++p) {
+      if (passes[p].kind != want[p])
+        throw std::runtime_error("GpuEamWindowForce: unexpected pass kind at " +
+            std::to_string(p) + " (this policy implements EAM Density→Embedding→Force only)");
+      if (passes[p].needs_transpose)
+        throw std::runtime_error("GpuEamWindowForce: needs_transpose UNIMPLEMENTED — the GPU "
+            "symmetric int64 accumulator (q(j)=−q(i)) CANNOT run a non-symmetric angular/"
+            "bond-order term (MEAM/Tersoff write force to a third atom k). Build the transpose "
+            "accumulator path with that potential; do not silently run the symmetric one.");
+      if (passes[p].iterative)
+        throw std::runtime_error("GpuEamWindowForce: iterative pass (QEq/CG, ReaxFF) "
+            "UNIMPLEMENTED on the GPU window-force policy");
+    }
+  }
 
 #ifdef TDMD_EAM_RING_TIMERS
   // per-phase attribution accessors (bench-only). compute_wall ≈ h2d+rest; the pure
