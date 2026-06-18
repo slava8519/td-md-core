@@ -44,6 +44,7 @@ namespace tdcu = tdmd::cuda;
 namespace {
 constexpr double kA0 = 4.05, kAlMass = 26.9815385;
 using SetflPot = potentials::EamPotential<double, potentials::EamSetfl<double>>;
+int g_cell_div = 1;  // --cellk: sub-rcut binning for the cull legs (E5c-subrcut)
 
 double now_s() {
   using clk = std::chrono::steady_clock;
@@ -113,7 +114,7 @@ double run_ring_once(const core::AtomSoA<double>& init, const core::Box& box,
                      long steps, double dt, int n_zones, int n_nodes, bool cull,
                      unsigned long long* cells_passes = nullptr) {
   core::AtomSoA<double> a = init;  // fresh copy
-  tdcu::GpuEamWindowForce wf(setfl, box, cull);  // fresh device policy
+  tdcu::GpuEamWindowForce wf(setfl, box, cull, cull ? g_cell_div : 1);  // sub-rcut on cull legs
   const auto o = ring_opts(steps, n_zones, n_nodes, dt);
   const double t0 = now_s();
   const auto r = potentials::run_eam_ring(a, box, pot, o, wf);  // wf shares state w/ kept copy
@@ -152,7 +153,7 @@ double per_phase_breakdown(const SetflPot& pot, const potentials::EamSetfl<doubl
   core::Box box; auto init = make_fcc_cubic(box, nc);
   core::thermal::maxwell_init(init, 300.0, 12345u);
   core::AtomSoA<double> a = init;
-  tdcu::GpuEamWindowForce wf(setfl, box, true);  // kept handle (shares state)
+  tdcu::GpuEamWindowForce wf(setfl, box, true, g_cell_div);  // kept handle (shares state)
   const auto r = potentials::run_eam_ring(a, box, pot, ring_opts(steps, 1, 1, dt), wf);
   if (r.halt != core::Halt::None) { std::printf("  breakdown HALT: %s\n", r.halt_msg.c_str()); return -1; }
   const double h2d = wf.timer_h2d_s(), rest = wf.timer_rest_s(), ker = wf.timer_kernel_s();
@@ -175,6 +176,7 @@ int main(int argc, char** argv) {
     else if (s == "--steps") S = std::stol(argv[++i]);
     else if (s == "--warmup") W = std::stol(argv[++i]);
     else if (s == "--reps") reps = std::stoi(argv[++i]);
+    else if (s == "--cellk") g_cell_div = std::stoi(argv[++i]);
   }
   cudaDeviceProp pr{}; cudaGetDeviceProperties(&pr, 0);
   const auto setfl = potentials::EamSetfl<double>::from_setfl(setfl_path);

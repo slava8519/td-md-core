@@ -191,8 +191,9 @@ core::ConveyorOptions ring_opts(long steps, int n_zones, int n_nodes, double dt)
 core::ConveyorResult run_gpu_ring(core::AtomSoA<double>& a, const core::Box& box,
                                   const SetflPot& pot,
                                   const potentials::EamSetfl<double>& setfl,
-                                  const core::ConveyorOptions& o, bool cull = true) {
-  return potentials::run_eam_ring(a, box, pot, o, tdcu::GpuEamWindowForce(setfl, box, cull));
+                                  const core::ConveyorOptions& o, bool cull = true,
+                                  int cell_div = 1) {
+  return potentials::run_eam_ring(a, box, pot, o, tdcu::GpuEamWindowForce(setfl, box, cull, cell_div));
 }
 
 // PBC slab: an exact lattice period in z ⇒ seamless cyclic nn. reach_mult=2 needs
@@ -508,6 +509,40 @@ TEST(CudaEamGpuRing, CulledRingMatchesAllWindowRingBitwise) {
         EXPECT_EQ(raw.stats[h].pe, rc.stats[h].pe) << "pe pass " << h;
       EXPECT_GT(wf.cells_passes(), 0u) << "cells never ran in-ring (vacuous)";
       // min_r2 NOT compared across paths — min-over-examined differs by candidate set.
+    }
+  }
+}
+
+// C-k — sub-rcut culled ring (cell_div∈{2,3}) ≡ all-window ring BITWISE. The streaming
+// z>1 ring inherits cells(k)==all-window (test_cuda_eam_cells A-k) by construction; this
+// asserts the new cell_div plumbing through the live ring (free + PBC, 1-vs-z, per-pass PE).
+TEST(CudaEamGpuRing, SubRcutRingMatchesAllWindowRingBitwise) {
+  const auto setfl = make_setfl();
+  const SetflPot pot(setfl);
+  const double dt = 0.001;
+  const long steps = 12;
+  for (int cell_div : {0, 2, 3}) {  // 0 = AUTO (resolves to a proven-bitwise k)
+    for (bool pbc : {false, true}) {
+      core::Box box;
+      core::AtomSoA<double> init = pbc ? make_fcc_pbc_wide(box) : make_fcc(2, 2, 6, 4.05, box);
+      const int n_zones = pbc ? 5 : 4;
+      for (int z : {2, 3}) {
+        const auto o = ring_opts(steps, n_zones, z, dt);
+        core::AtomSoA<double> aw = init;
+        const auto raw = potentials::run_eam_ring(aw, box, pot, o,
+                                                  tdcu::GpuEamWindowForce(setfl, box, false));
+        core::AtomSoA<double> cw = init;
+        tdcu::GpuEamWindowForce wf(setfl, box, true, cell_div);
+        const auto rc = potentials::run_eam_ring(cw, box, pot, o, wf);
+        ASSERT_EQ(int(raw.halt), int(core::Halt::None)) << raw.halt_msg;
+        ASSERT_EQ(int(rc.halt), int(core::Halt::None)) << rc.halt_msg;
+        EXPECT_TRUE(bitwise_eq(aw, cw))
+            << "sub-rcut culled ≠ all-window ring (cell_div=" << cell_div
+            << (pbc ? " pbc" : " free") << " z=" << z << ")";
+        for (std::size_t h = 0; h < raw.stats.size(); ++h)
+          EXPECT_EQ(raw.stats[h].pe, rc.stats[h].pe) << "pe pass " << h;
+        EXPECT_GT(wf.cells_passes(), 0u);
+      }
     }
   }
 }

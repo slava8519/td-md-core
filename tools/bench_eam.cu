@@ -76,6 +76,7 @@ int main(int argc, char** argv) {
   std::string backend = "allwindow";  // E5c bake-off: allwindow | cells | verlet | newton3 | sorted
   std::string setfl_path;  // like-for-like: a real setfl (e.g. Al_zhou.eam.alloy)
   bool free_z = false;     // --free: periodic x,y, free z (match bench_eam_ring Axis A)
+  int cell_div = 1;        // --cellk: sub-rcut binning (cells ~rcut/cell_div, ±cell_div)
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--cells") nc = std::stoi(argv[++i]);
@@ -85,6 +86,7 @@ int main(int argc, char** argv) {
     else if (a == "--setfl") setfl_path = argv[++i];
     else if (a == "--skin") skin = std::stod(argv[++i]);
     else if (a == "--free") free_z = true;
+    else if (a == "--cellk") cell_div = std::stoi(argv[++i]);
   }
   if (backend != "allwindow" && backend != "cells" && backend != "verlet" &&
       backend != "newton3" && backend != "sorted" && backend != "mixed") {
@@ -173,7 +175,7 @@ int main(int argc, char** argv) {
   auto build_struct = [&] {
     if (use_cells) {
       if (cg.d_order) tdcu::eam_cells_free(cg);
-      cg = tdcu::eam_build_window_grid(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut);
+      cg = tdcu::eam_build_window_grid(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut, cell_div);
     } else if (use_verlet || use_newton3 || use_mixed) {  // all walk a per-atom verlet CSR
       if (vl.d_off) tdcu::eam_verlet_free(vl);
       vl = tdcu::eam_build_verlet_list(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut, skin);
@@ -400,7 +402,9 @@ int main(int argc, char** argv) {
   // cells examined/atom: replicate the 27-cell rcut-grid neighbourhood count on CPU.
   long long cells_exam = 0;
   {
-    tdcu::CellGrid g = tdcu::make_zone_grid(box_lo, box_len, per, setfl.rcut, 1, 0);
+    // CPU replica of the cells stencil — uses cell_div + the realized ±g.s* (matches
+    // the kernel) so the over-fetch reflects the ACTUAL sub-rcut grid, not a fixed 27.
+    tdcu::CellGrid g = tdcu::make_zone_grid(box_lo, box_len, per, setfl.rcut, 1, 0, cell_div);
     std::vector<int> cell_of(m);
     std::vector<std::vector<int>> cells_atoms(g.ncells());
     for (int i = 0; i < m; ++i) {
@@ -409,15 +413,15 @@ int main(int argc, char** argv) {
     }
     for (int i = 0; i < m; ++i) {
       int cxi, cyi, czi; g.coords(wx[i], wy[i], wz[i], cxi, cyi, czi);
-      const int dzlo = (g.nz == 1) ? 0 : -1, dzhi = (g.nz == 1) ? 0 : 1;
-      const int dylo = (g.ny == 1) ? 0 : -1, dyhi = (g.ny == 1) ? 0 : 1;
-      const int dxlo = (g.nx == 1) ? 0 : -1, dxhi = (g.nx == 1) ? 0 : 1;
+      const int dzlo = (g.nz == 1) ? 0 : -g.sz, dzhi = (g.nz == 1) ? 0 : g.sz;
+      const int dylo = (g.ny == 1) ? 0 : -g.sy, dyhi = (g.ny == 1) ? 0 : g.sy;
+      const int dxlo = (g.nx == 1) ? 0 : -g.sx, dxhi = (g.nx == 1) ? 0 : g.sx;
       for (int dz = dzlo; dz <= dzhi; ++dz) {
-        int zc = czi + dz; if (g.wrapz) zc = (zc + g.nz) % g.nz; else if (zc < 0 || zc >= g.nz) continue;
+        int zc = czi + dz; if (g.wrapz) zc = ((zc%g.nz)+g.nz)%g.nz; else if (zc < 0 || zc >= g.nz) continue;
         for (int dy = dylo; dy <= dyhi; ++dy) {
-          int yc = cyi + dy; if (g.wrapy) yc = (yc + g.ny) % g.ny; else if (yc < 0 || yc >= g.ny) continue;
+          int yc = cyi + dy; if (g.wrapy) yc = ((yc%g.ny)+g.ny)%g.ny; else if (yc < 0 || yc >= g.ny) continue;
           for (int dx = dxlo; dx <= dxhi; ++dx) {
-            int xc = cxi + dx; if (g.wrapx) xc = (xc + g.nx) % g.nx; else if (xc < 0 || xc >= g.nx) continue;
+            int xc = cxi + dx; if (g.wrapx) xc = ((xc%g.nx)+g.nx)%g.nx; else if (xc < 0 || xc >= g.nx) continue;
             cells_exam += (long long)cells_atoms[g.idx(xc, yc, zc)].size();  // includes self in own cell
           }
         }

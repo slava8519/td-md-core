@@ -564,3 +564,27 @@ cells в живое кольцо — ВЫПОЛНЕНА (`4098ac0`) и ИЗМЕ�
 **Оговорки (не баги — провенанс):** **(C1)** 1.10e6 atom-steps/s — ВНУТРИКОЛЬЦЕВОЕ число (free-z, z=1, deterministic_fp64), **НЕ флагман**: ~19× ниже M5a 2.06e7 на той же 5080, рядом не ставить. **(C2)** TRANSLATES доказан для z=1 whole-system; z>1 на одной GPU concurrency-dead. **(C3)** cells — нетто-регрессия при N≲3000. **(C4)** η apples в геометрии (обе стороны free-z), но кросс-харнесное в методе тайминга — потому ±20%, не первичная метрика. Дефолтная сборка движка/тестов БЕЗ `TDMD_EAM_RING_TIMERS` ⇒ проверенный побитовый hot path байт-идентичен (`Test_CUDA_EAM_Ring` 11/11 зелёные с таймерами в коде).
 
 Воспроизведение: `./build-cuda/bench_eam_ring --steps 30 --reps 3` (R_kernel: `./build-cuda/bench_eam --setfl reference_data/eam_al/Al_zhou.eam.alloy --free --cells {10|12|16} --backend {allwindow|cells}`).
+
+### E5c-subrcut — суб-rcut биннинг: рычаг #1 РЕАЛИЗОВАН (2026-06-18, состяз. дизайн `wf_d4bdf675-970` + приёмка `wf_16a305ad-656` ACCEPT)
+
+§E5c-ring показал: кольцо 99% kernel-bound, а per-window ядро упёрто в 27-cell over-fetch (3×3×3 стенсил ⇒ search box 3·rcut ⇒ 6.4–7.6× over-fetch при rcut=10.1). **Суб-rcut биннинг:** ячейки ~rcut/k, стенсил ±s_d, где **s_d=ceil((rcut+pad)/c) по РЕАЛИЗОВАННОМУ c=L/n (НЕ из k)** ⇒ покрывает ≥rcut ⇒ тот же in-cutoff мультисет ⇒ сырой int64 **побитово == all-window для ЛЮБОГО k** (B1). Парный путь `zone_pair_cells_kernel` не тронут (default `cell_div=1`).
+
+**Гейты (все зелёные; `test_cuda_eam_cells` 32/32, `test_cuda_eam_ring` 12/12):** G0 (k=1 поля грида байт-идентичны legacy), A-k (cells(k)≡all-window сырой int64, k∈{2,3,4}, fb=44+40, free+PBC-seam), **B-k** (cells(k)≡`eam_direct_fp64` оракул — единственный независимый свидетель выпавшего донора), **P-k** (poison: стенсил ±1 над rcut/k-ячейками при k≥3 ОБЯЗАН провалить оракул — зубы доказаны), W-k (tight-PBC L подобран так, что n=2k+1 точно — граница degeneracy-guard), C-k (живое AUTO+k кольцо ≡ all-window, 1-vs-z). memcheck/racecheck чисто.
+
+**Бейкофф (RTX 5080, Al_zhou rcut=10.1025, fp64 --fmad=false, N=16384 free-z):**
+
+| k | over-fetch | изолир. dens+force ms | live-ring A_cull a-st/s (reps=8) |
+|---|---|---|---|
+| 1 | 7.57× | 15.87 | 1.088e6 (R_ring 4.25) |
+| 2 | 4.44× | 10.76 | 1.57e6 |
+| **3** | 3.23× | **9.64** | **1.860e6 (R_ring 7.41)** ← оптимум |
+| 4 | 3.04× | 11.46 | 1.55e6 (729-cell enum > marginal over-fetch) |
+| 6 | 2.60× | 17.72 | регрессия |
+
+**k=3 оптимум: ≈1.71× live-ring** (1.088e6→1.860e6 atom-steps/s) над k=1, побитово-идентично. over-fetch падает к полу ~1.9× (cube/sphere) с убывающей отдачей; k=4 регрессирует.
+
+**Default = AUTO (`cell_div=0`):** одноразовая host-side эвристика в `ensure_grid_geometry` — `k=clamp(round(cbrt((атомов/ячейку при k=1)/2.5)), 1, 4)` (цель ~2.5 атома/ячейку = измеренный sweet-spot). Резолвится в **k=3 для Al_zhou** (atoms/cell 75.9 ⇒ cbrt(30.4)=3.1), **k=1 для коротко-rcut/разрежённых** (≤1 атом/ячейку ⇒ byte-identical legacy, БЕЗ регрессии — снимает риск хардкода k=3). Гео box-static сохранена (резолв ОДИН раз, host-int `m_hint`+`ncells_k1`, ноль device-работы/sync). Определяющий инвариант: cells(любой k)≡all-window ⇒ AUTO не возмущает траекторию (C-k гейт это и проверяет на `cell_div=0`).
+
+**Оговорки:** 1.71× — число **z=1, этот setfl/плотность**; переносится на флагман по density-инвариантности (~2.3 атома/ячейку при k=3 держится 16k→1e7); z>1-cull ВЫВОДИТСЯ (пер-оконные ядра идентичны, кольцо 98–99% kernel-bound), не таймится напрямую. Память k=3@1e7 ≈ 52 МБ, CUB-скан ≈0.05 мс (оба ≪ ядер). `bench_eam_ring` абсолют шумит при reps=3 (±~30%; ранжирование стабильно при reps≥8 — заголовок измерен reps=8).
+
+Воспроизведение: `./build-cuda/bench_eam_ring --cellk {0=auto|1|2|3|4} --steps 30 --reps 8` (изолир.: `bench_eam ... --cellk K`).

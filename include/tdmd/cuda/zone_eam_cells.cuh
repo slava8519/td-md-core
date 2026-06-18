@@ -56,20 +56,22 @@ __global__ void eam_density_cells_kernel(const double* wx, const double* wy,
   const double xi = wx[aa], yi = wy[aa], zi = wz[aa];
   int cxi, cyi, czi;
   g.coords(xi, yi, zi, cxi, cyi, czi);
-  const int dzlo = (g.nz == 1) ? 0 : -1, dzhi = (g.nz == 1) ? 0 : 1;
-  const int dylo = (g.ny == 1) ? 0 : -1, dyhi = (g.ny == 1) ? 0 : 1;
-  const int dxlo = (g.nx == 1) ? 0 : -1, dxhi = (g.nx == 1) ? 0 : 1;
+  // ±s_d stencil (sub-rcut: cells ~rcut/cell_div ⇒ s_d=cell_div; legacy s=1). s_d is
+  // ceil((rcut+pad)/c) over the realized cell ⇒ spans >=rcut ⇒ superset ⇒ bitwise.
+  const int dzlo = (g.nz == 1) ? 0 : -g.sz, dzhi = (g.nz == 1) ? 0 : g.sz;
+  const int dylo = (g.ny == 1) ? 0 : -g.sy, dyhi = (g.ny == 1) ? 0 : g.sy;
+  const int dxlo = (g.nx == 1) ? 0 : -g.sx, dxhi = (g.nx == 1) ? 0 : g.sx;
   for (int dz = dzlo; dz <= dzhi; ++dz) {
     int zc = czi + dz;
-    if (g.wrapz) zc = (zc + g.nz) % g.nz;
+    if (g.wrapz) zc = ((zc % g.nz) + g.nz) % g.nz;  // |dz|>1-safe (g.nz>=2s+1 guaranteed)
     else if (zc < 0 || zc >= g.nz) continue;
     for (int dy = dylo; dy <= dyhi; ++dy) {
       int yc = cyi + dy;
-      if (g.wrapy) yc = (yc + g.ny) % g.ny;
+      if (g.wrapy) yc = ((yc % g.ny) + g.ny) % g.ny;
       else if (yc < 0 || yc >= g.ny) continue;
       for (int dx = dxlo; dx <= dxhi; ++dx) {
         int xc = cxi + dx;
-        if (g.wrapx) xc = (xc + g.nx) % g.nx;
+        if (g.wrapx) xc = ((xc % g.nx) + g.nx) % g.nx;
         else if (xc < 0 || xc >= g.nx) continue;
         const int c = g.idx(xc, yc, zc);
         const int beg = b_starts[c], cnt = b_counts[c];
@@ -115,20 +117,21 @@ __global__ void eam_force_cells_kernel(
     const long ki = key[ii];
     int cxi, cyi, czi;
     g.coords(xi, yi, zi, cxi, cyi, czi);
-    const int dzlo = (g.nz == 1) ? 0 : -1, dzhi = (g.nz == 1) ? 0 : 1;
-    const int dylo = (g.ny == 1) ? 0 : -1, dyhi = (g.ny == 1) ? 0 : 1;
-    const int dxlo = (g.nx == 1) ? 0 : -1, dxhi = (g.nx == 1) ? 0 : 1;
+    // ±s_d stencil (sub-rcut; see eam_density_cells_kernel). Superset ⇒ bitwise.
+    const int dzlo = (g.nz == 1) ? 0 : -g.sz, dzhi = (g.nz == 1) ? 0 : g.sz;
+    const int dylo = (g.ny == 1) ? 0 : -g.sy, dyhi = (g.ny == 1) ? 0 : g.sy;
+    const int dxlo = (g.nx == 1) ? 0 : -g.sx, dxhi = (g.nx == 1) ? 0 : g.sx;
     for (int dz = dzlo; dz <= dzhi; ++dz) {
       int zc = czi + dz;
-      if (g.wrapz) zc = (zc + g.nz) % g.nz;
+      if (g.wrapz) zc = ((zc % g.nz) + g.nz) % g.nz;  // |dz|>1-safe
       else if (zc < 0 || zc >= g.nz) continue;
       for (int dy = dylo; dy <= dyhi; ++dy) {
         int yc = cyi + dy;
-        if (g.wrapy) yc = (yc + g.ny) % g.ny;
+        if (g.wrapy) yc = ((yc % g.ny) + g.ny) % g.ny;
         else if (yc < 0 || yc >= g.ny) continue;
         for (int dx = dxlo; dx <= dxhi; ++dx) {
           int xc = cxi + dx;
-          if (g.wrapx) xc = (xc + g.nx) % g.nx;
+          if (g.wrapx) xc = ((xc % g.nx) + g.nx) % g.nx;
           else if (xc < 0 || xc >= g.nx) continue;
           const int c = g.idx(xc, yc, zc);
           const int beg = b_starts[c], cnt = b_counts[c];
@@ -201,10 +204,11 @@ inline EamCellGrid eam_build_window_grid(const double* d_wx, const double* d_wy,
                                          const double* d_wz, int m,
                                          const double box_lo[3],
                                          const double box_len[3],
-                                         const bool periodic[3], double rcut) {
+                                         const bool periodic[3], double rcut,
+                                         int cell_div = 1) {
   EamCellGrid c;
   c.m = m;
-  c.g = make_zone_grid(box_lo, box_len, periodic, rcut, /*n_zones=*/1, /*zone_id=*/0);
+  c.g = make_zone_grid(box_lo, box_len, periodic, rcut, /*n_zones=*/1, /*zone_id=*/0, cell_div);
   c.ncells = c.g.ncells();
   cudaMalloc(&c.d_cell_of, size_t(m) * sizeof(int));
   cudaMalloc(&c.d_counts, size_t(c.ncells) * sizeof(int));

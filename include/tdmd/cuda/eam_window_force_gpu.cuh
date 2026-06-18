@@ -1,6 +1,7 @@
 #pragma once
 #include <cuda_runtime.h>
 
+#include <cmath>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -95,13 +96,17 @@ struct GpuEamWindowState {
   bool periodic[3] = {false, false, false};
   double rcut = 0.0;
   bool cull = true;
+  int cell_div = 0;  // sub-rcut binning (E5c-subrcut): cells ~rcut/cell_div, ±cell_div
+                     // stencil. 0 = AUTO (target ~2.5 atoms/cell, resolved in
+                     // ensure_grid_geometry — the production default, 1.71× on Al_zhou).
+                     // 1 = legacy ~rcut cells / ±1. Any k is bitwise == all-window (A-k).
   unsigned long long cells_passes = 0;
   EamCellGrid grid_{};       // persistent — geometry built once, refreshed per pass
   bool grid_built_ = false;
 
   GpuEamWindowState(const potentials::EamSetfl<double>& setfl, const core::Box& box,
-                    bool cull_)
-      : cull(cull_) {
+                    bool cull_, int cell_div_ = 0)  // 0 = AUTO (see cell_div field)
+      : cull(cull_), cell_div(cell_div_) {
     box_lo[0] = box.lo[0]; box_lo[1] = box.lo[1]; box_lo[2] = box.lo[2];
     box_len[0] = box.len(0); box_len[1] = box.len(1); box_len[2] = box.len(2);
     periodic[0] = box.periodic[0]; periodic[1] = box.periodic[1]; periodic[2] = box.periodic[2];
@@ -162,9 +167,22 @@ struct GpuEamWindowState {
   // counts/order are refreshed (in compute). Whole-box, periodic-z grid (F3) —
   // the SAME full-Lz min-image fold geom.reduce uses, so it is a sound superset
   // filter for the gathered cyclic subset (a z-AABB slab would miss seam pairs).
-  void ensure_grid_geometry() {
+  void ensure_grid_geometry(int m_hint) {
     if (grid_built_) return;
-    grid_.g = make_zone_grid(box_lo, box_len, periodic, rcut, /*n_zones=*/1, /*zone_id=*/0);
+    // AUTO (cell_div==0): target ~2.5 atoms per cell — the MEASURED-optimal cell
+    // occupancy (E5c-subrcut bake-off: k=3 at Al_zhou rcut=10.1 ⇒ 62/27≈2.3 atoms/cell).
+    // It is a hardware-calibrated sweet spot (cell-enumeration overhead vs over-fetch
+    // saving), ~rcut/density-INDEPENDENT, so derive k from the realized k=1 occupancy
+    // m/ncells_k1. Adaptive: Al_zhou ⇒ k=3 (1.71× ring); short-rcut/sparse ⇒ k=1 (no
+    // regression). Bitwise-safe for ANY k (test_cuda_eam_cells A-k). Clamped [1,4].
+    if (cell_div <= 0) {
+      const auto g1 = make_zone_grid(box_lo, box_len, periodic, rcut, 1, 0, 1);
+      const int nc1 = g1.ncells();
+      const double atoms_per = nc1 > 0 ? double(m_hint) / double(nc1) : 1.0;
+      int k = int(std::lround(std::cbrt(atoms_per / 2.5)));
+      cell_div = k < 1 ? 1 : (k > 4 ? 4 : k);
+    }
+    grid_.g = make_zone_grid(box_lo, box_len, periodic, rcut, /*n_zones=*/1, /*zone_id=*/0, cell_div);
     grid_.ncells = grid_.g.ncells();
     grid_.d_counts = eam_wf_malloc<int>(std::size_t(grid_.ncells));
     grid_.d_starts = eam_wf_malloc<int>(std::size_t(grid_.ncells));
@@ -211,8 +229,8 @@ struct GpuEamWindowForce {
   // PairGeom. cull=true ⇒ cell-list culling (cells ≡ all-window bitwise, B1);
   // cull=false ⇒ the O(m²) all-window path (the in-process bitwise reference).
   GpuEamWindowForce(const potentials::EamSetfl<double>& setfl, const core::Box& box,
-                    bool cull = true)
-      : st(std::make_shared<GpuEamWindowState>(setfl, box, cull)) {}
+                    bool cull = true, int cell_div = 0)  // 0 = AUTO (production default)
+      : st(std::make_shared<GpuEamWindowState>(setfl, box, cull, cell_div)) {}
 
   // non-vacuity witness: how many compute() calls took the culled path.
   unsigned long long cells_passes() const { return st->cells_passes; }
@@ -271,7 +289,7 @@ struct GpuEamWindowForce {
       // → scatter; geometry built once). cells ≡ all-window int64 BITWISE (B1:
       // 27-cell candidates are a SUPERSET; geom.reduce r²<rc² re-test + quantize +
       // order-free int64 sum unchanged) ⇒ the ring trajectory stays bitwise.
-      s.ensure_grid_geometry();
+      s.ensure_grid_geometry(m);
       EamCellGrid& g = s.grid_;
       cudaMemsetAsync(g.d_counts, 0, std::size_t(g.ncells) * sizeof(int));
       cell_count_kernel<<<ng(m), kB>>>(s.wx, s.wy, s.wz, m, g.g, g.d_cell_of, g.d_counts);

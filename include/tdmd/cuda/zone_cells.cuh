@@ -42,6 +42,10 @@ struct CellGrid {
   double Lx, Ly, Lz;       // box lengths (coordinate folding)
   double zc;               // grid z-center (nearest-image query fold)
   bool perz_box;           // box periodic in z (fold queries across the seam)
+  int sx = 1, sy = 1, sz = 1;  // per-dim stencil radius = ceil((rcut+pad)/c_d); cells
+                               // sized ~rcut/cell_div ⇒ s_d=cell_div. k=1 ⇒ 1 (the
+                               // legacy ±1 neighbourhood). The EAM cull kernels walk
+                               // ±s_d; the pair kernel ignores these (hardcoded ±1).
 
   TDMD_HOST_DEVICE int ncells() const { return nx * ny * nz; }
   TDMD_HOST_DEVICE int idx(int ix, int iy, int iz) const {
@@ -63,20 +67,36 @@ struct CellGrid {
 // Grid geometry for zone `zone_id` of an n_zones decomposition (host).
 inline CellGrid make_zone_grid(const double box_lo[3], const double box_len[3],
                                const bool periodic[3], double rcut,
-                               int n_zones, int zone_id) {
+                               int n_zones, int zone_id, int cell_div = 1) {
   // ulp-skin (the M3 loose-grid qpad lesson, re-confirmed by review: with
   // cell == L/n a pair at r = rcut - 2e-15 can straddle TWO bin boundaries
   // when fl(L/rcut) rounds up or the origin is non-commensurate): size cells
-  // against rcut + pad so FP boundary drift can never push an accepted pair
-  // beyond the +-1-cell neighborhood. The pad also budgets the coordinate
-  // fold of UNWRAPPED positions (drift never folds x): safe while
+  // against (rcut/cell_div) + pad so FP boundary drift can never push an
+  // accepted pair beyond the +-s_d-cell neighborhood. The pad also budgets the
+  // coordinate fold of UNWRAPPED positions (drift never folds x): safe while
   // 0.5*ulp(|x_raw|) < pad, i.e. |x_raw| up to ~1e7 box lengths.
+  //
+  // cell_div=k (sub-rcut binning): target cell ~rcut/k (the legacy k=1 ⇒ cell
+  // ~rcut, the ±1 neighbourhood, byte-identical). The stencil radius s_d below
+  // is derived from the REALIZED cell size c_d=L/n (NEVER from k) ⇒ ceil rounds
+  // UP to whatever covers rcut — a too-small s would silently drop donors.
+  const double cell_target = rcut / cell_div;
   auto ncell = [&](double L, bool per) {
-    const double pad = 1e-9 * (L + rcut);
-    int n = int(L / (rcut + pad));
+    const double pad = 1e-9 * (L + cell_target);
+    int n = int(L / (cell_target + pad));
     if (n < 1) n = 1;
-    if (per && n < 3) n = 1;  // avoid double-visiting images
+    // generalizes the legacy `if(per&&n<3)n=1`: with a ±s window and wrap, n <
+    // 2*s+1 would visit a donor through two images (s<=cell_div always by the
+    // realized-c margin, so 2*cell_div+1 is a conservative-safe bound).
+    if (per && n < 2 * cell_div + 1) n = 1;
     return n;
+  };
+  // per-dim stencil radius from the REALIZED cell size c (dropped-donor-proof).
+  auto srad = [&](int n, double c) {
+    if (n == 1) return 0;
+    const double pad = 1e-9 * (rcut + c);
+    int s = int(std::ceil((rcut + pad) / c));
+    return s < 1 ? 1 : s;
   };
   CellGrid g{};
   g.Lx = box_len[0];
@@ -88,22 +108,29 @@ inline CellGrid make_zone_grid(const double box_lo[3], const double box_len[3],
   g.ny = ncell(g.Ly, periodic[1]);
   g.cx = g.Lx / g.nx;
   g.cy = g.Ly / g.ny;
-  g.wrapx = periodic[0] && g.nx >= 3;
-  g.wrapy = periodic[1] && g.ny >= 3;
+  g.sx = srad(g.nx, g.cx);
+  g.sy = srad(g.ny, g.cy);
+  // wrap iff non-degenerate (s_d>=1) AND the ring is wide enough for ±s_d without a
+  // double-visit. s_d>=1 keeps the n=1 case (s=0) at wrap=false (legacy byte-identity).
+  g.wrapx = periodic[0] && g.sx >= 1 && g.nx >= 2 * g.sx + 1;
+  g.wrapy = periodic[1] && g.sy >= 1 && g.ny >= 2 * g.sy + 1;
   g.perz_box = periodic[2];
   if (periodic[2] && n_zones == 1) {  // the zone IS the box: periodic z grid
     g.loz = box_lo[2];
     g.nz = ncell(g.Lz, true);
     g.cz = g.Lz / g.nz;
-    g.wrapz = g.nz >= 3;
+    g.sz = srad(g.nz, g.cz);
+    g.wrapz = g.sz >= 1 && g.nz >= 2 * g.sz + 1;
     g.zc = box_lo[2] + 0.5 * g.Lz;
   } else {                            // slab grid, padded by rcut, no wrap
     const double width = g.Lz / n_zones;
     const double range = width + 2.0 * rcut;
     g.loz = box_lo[2] + zone_id * width - rcut;
-    g.nz = int(range / (rcut + 1e-9 * (range + rcut)));  // ulp-skin (above)
+    const double pad = 1e-9 * (range + cell_target);
+    g.nz = int(range / (cell_target + pad));  // ulp-skin (above)
     if (g.nz < 1) g.nz = 1;
     g.cz = range / g.nz;
+    g.sz = srad(g.nz, g.cz);
     g.wrapz = false;
     g.zc = g.loz + 0.5 * range;
   }

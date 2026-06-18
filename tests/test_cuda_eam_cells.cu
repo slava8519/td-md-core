@@ -114,6 +114,31 @@ Window make_window_pbc(unsigned seed) {
   return w;
 }
 
+// Tunable-L periodic window (2×2×2 jittered lattice scaled to L) — for the W-k
+// degeneracy-boundary test where L is chosen so n_k = 2k+1 EXACTLY (the smallest
+// wrap grid). L >= 2·rcut keeps min-image unambiguous.
+Window make_window_pbc_L(unsigned seed, double L) {
+  Window w;
+  const double a0 = L / 2;  // 2×2×2 cells = exact period
+  const double b[4][3] = {{0, 0, 0}, {0.5, 0.5, 0}, {0.5, 0, 0.5}, {0, 0.5, 0.5}};
+  std::mt19937 rng(seed);
+  std::uniform_real_distribution<double> jit(-0.05, 0.05);
+  auto wrap = [&](double x) { return x - L * std::floor(x / L); };
+  for (int ix = 0; ix < 2; ++ix)
+    for (int iy = 0; iy < 2; ++iy)
+      for (int iz = 0; iz < 2; ++iz)
+        for (auto& bb : b) {
+          w.wx.push_back(wrap((ix + bb[0]) * a0 + jit(rng)));
+          w.wy.push_back(wrap((iy + bb[1]) * a0 + jit(rng)));
+          w.wz.push_back(wrap((iz + bb[2]) * a0 + jit(rng)));
+        }
+  w.m = int(w.wx.size());
+  w.key.resize(w.m); w.owned.resize(w.m);
+  for (int i = 0; i < w.m; ++i) { w.key[i] = i; w.owned[i] = i; }
+  w.box.lo = {0, 0, 0}; w.box.hi = {L, L, L}; w.box.periodic = {true, true, true};
+  return w;
+}
+
 struct DevSetfl { tdcu::EamSetflView view; double *F, *ra, *rp; };
 DevSetfl upload_setfl(const potentials::EamSetfl<double>& s) {
   DevSetfl d;
@@ -135,7 +160,8 @@ struct GpuOut {
 enum class Backend { AllWindow, Cells, Verlet, Newton3, Sorted };
 
 GpuOut run_gpu(const Window& w, const potentials::EamSetfl<double>& setfl,
-               double dens_scale, double rho_cap, Backend be, double skin = 1.0) {
+               double dens_scale, double rho_cap, Backend be, double skin = 1.0,
+               int cell_div = 1, int poison_s = 0) {
   const int m = w.m;
   DevSetfl ds = upload_setfl(setfl);
   double* dx = upload(w.wx); double* dy = upload(w.wy); double* dz = upload(w.wz);
@@ -159,8 +185,12 @@ GpuOut run_gpu(const Window& w, const potentials::EamSetfl<double>& setfl,
   tdcu::EamCellGrid cg;
   tdcu::EamVerletList vl;
   tdcu::EamSortedWindow sw;
-  if (be == Backend::Cells)
-    cg = tdcu::eam_build_window_grid(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut);
+  if (be == Backend::Cells) {
+    cg = tdcu::eam_build_window_grid(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut, cell_div);
+    // P-k poison knob (test-only): force a stencil one cell too small to PROVE the
+    // dropped-donor oracle has teeth. NEVER a kernel default (no silent cap).
+    if (poison_s > 0) { cg.g.sx = cg.g.sy = cg.g.sz = poison_s; }
+  }
   else if (be == Backend::Verlet || be == Backend::Newton3)
     vl = tdcu::eam_build_verlet_list(dx, dy, dz, m, box_lo, box_len, per, setfl.rcut, skin);
   else if (be == Backend::Sorted)
@@ -274,7 +304,7 @@ double force_of(long long raw) { return double(raw) / core::fixed::ForceAccum::k
 // the Verlet build (ignored by Cells).
 template <int FB>
 void check_self_equiv(double beta, unsigned seed, Backend culled = Backend::Cells,
-                      bool pbc = false, double skin = 1.0) {
+                      bool pbc = false, double skin = 1.0, int cell_div = 1) {
   const auto setfl = analytic_setfl(beta);
   ASSERT_EQ(setfl.density_fracbits(), FB);
   const double dens_scale = core::fixed::FixedAccum<FB>::kScale;
@@ -282,7 +312,7 @@ void check_self_equiv(double beta, unsigned seed, Backend culled = Backend::Cell
   const auto w = pbc ? make_window_pbc(seed) : make_window(seed);
 
   const auto a = run_gpu(w, setfl, dens_scale, rho_cap, Backend::AllWindow);
-  const auto c = run_gpu(w, setfl, dens_scale, rho_cap, culled, skin);
+  const auto c = run_gpu(w, setfl, dens_scale, rho_cap, culled, skin, cell_div);
 
   EXPECT_EQ(a.overflow, 0);
   EXPECT_EQ(c.overflow, a.overflow) << "overflow flags must match";
@@ -321,13 +351,14 @@ TEST(CudaEamCells, SelfEquivQ2340) {  // steep β=3.3 (fracbits==40)
 
 namespace {
 void check_vs_oracle(double beta, unsigned seed, int fb, bool pbc = false,
-                     Backend culled = Backend::Cells, double skin = 1.0) {
+                     Backend culled = Backend::Cells, double skin = 1.0,
+                     int cell_div = 1, int poison_s = 0, const Window* wovr = nullptr) {
   const auto setfl = analytic_setfl(beta);
   ASSERT_EQ(setfl.density_fracbits(), fb);
   const double dens_scale = (fb == 44) ? core::fixed::FixedAccum<44>::kScale
                                        : core::fixed::FixedAccum<40>::kScale;
   const double rho_cap = setfl.density_grid_max();
-  const auto w = pbc ? make_window_pbc(seed) : make_window(seed);
+  const auto w = wovr ? *wovr : (pbc ? make_window_pbc(seed) : make_window(seed));
 
   // FP64 oracle: all-pairs density + force, no grid, no quantize. The SAME
   // EamSetfl spline math feeds it (Math = EamSetfl<double>).
@@ -339,28 +370,35 @@ void check_vs_oracle(double beta, unsigned seed, int fb, bool pbc = false,
   const auto acc = potentials::eam_direct_fp64<double, potentials::EamSetfl<double>>(
       at, w.box, setfl, /*with_forces=*/true, &rho_oracle);
 
-  // culled GPU run
-  const auto c = run_gpu(w, setfl, dens_scale, rho_cap, culled, skin);
-  EXPECT_EQ(c.overflow, 0);
+  // culled GPU run (cell_div = sub-rcut k; poison_s>0 forces a too-small stencil)
+  const auto c = run_gpu(w, setfl, dens_scale, rho_cap, culled, skin, cell_div, poison_s);
 
-  // per-atom density: the fixed-point ρ vs the FP64 oracle ρ (~quantization +
-  // spline-eval agreement). A DROPPED DONOR shows here as a too-small ρ.
-  for (int i = 0; i < w.m; ++i) {
-    const double rho_gpu = double(c.rho[i]) / dens_scale;
-    EXPECT_NEAR(rho_gpu, rho_oracle[i], 1e-9)
-        << "rho atom " << i << " (cells=" << rho_gpu << " oracle=" << rho_oracle[i]
-        << ") — a gap this large means a DROPPED DENSITY DONOR";
+  if (poison_s == 0) {  // CORRECTNESS: the cull (any valid k) ≡ the FP64 oracle
+    EXPECT_EQ(c.overflow, 0);
+    for (int i = 0; i < w.m; ++i) {
+      const double rho_gpu = double(c.rho[i]) / dens_scale;
+      EXPECT_NEAR(rho_gpu, rho_oracle[i], 1e-9)
+          << "rho atom " << i << " (cells=" << rho_gpu << " oracle=" << rho_oracle[i]
+          << ") — a gap this large means a DROPPED DENSITY DONOR (cell_div=" << cell_div << ")";
+    }
+    for (int i = 0; i < w.m; ++i) {
+      EXPECT_NEAR(force_of(c.fx[i]), at.fx[i], 1e-9) << "fx atom " << i;
+      EXPECT_NEAR(force_of(c.fy[i]), at.fy[i], 1e-9) << "fy atom " << i;
+      EXPECT_NEAR(force_of(c.fz[i]), at.fz[i], 1e-9) << "fz atom " << i;
+    }
+    const double pe_gpu = double(c.pe) / core::fixed::EnergyAccum::kScale;
+    EXPECT_NEAR(pe_gpu, acc.pe, 1e-7) << "total PE (cells vs FP64 oracle)";
+  } else {  // TEETH (P-k poison): a stencil one cell too small MUST drop donors ⇒
+            // the oracle must see a LARGE gap. If this does NOT fail, the gate is blind.
+    double max_rho_gap = 0, max_f_gap = 0;
+    for (int i = 0; i < w.m; ++i) {
+      max_rho_gap = std::max(max_rho_gap, std::fabs(double(c.rho[i]) / dens_scale - rho_oracle[i]));
+      max_f_gap = std::max(max_f_gap, std::fabs(force_of(c.fx[i]) - at.fx[i]));
+    }
+    EXPECT_GT(max_rho_gap, 1e-3) << "poison s=" << poison_s << ": oracle did NOT catch the "
+                                    "dropped donor — the gate has no teeth";
+    EXPECT_GT(max_f_gap, 1e-2) << "poison s=" << poison_s << ": force gap too small";
   }
-  // per-atom force: the culled force vs the oracle (a truncated ρ ⇒ wrong F'(ρ)
-  // ⇒ wrong embedding force here even if the φ-pair part matched).
-  for (int i = 0; i < w.m; ++i) {
-    EXPECT_NEAR(force_of(c.fx[i]), at.fx[i], 1e-9) << "fx atom " << i;
-    EXPECT_NEAR(force_of(c.fy[i]), at.fy[i], 1e-9) << "fy atom " << i;
-    EXPECT_NEAR(force_of(c.fz[i]), at.fz[i], 1e-9) << "fz atom " << i;
-  }
-  // total PE (Σ F(ρ) + Σ_{i<j} φ): the oracle's pe vs the culled fixed-point pe.
-  const double pe_gpu = double(c.pe) / core::fixed::EnergyAccum::kScale;
-  EXPECT_NEAR(pe_gpu, acc.pe, 1e-7) << "total PE (cells vs FP64 oracle)";
 }
 }  // namespace
 
@@ -372,6 +410,79 @@ TEST(CudaEamCells, VsOracleQ2340) {  // dropped-donor gate, steep β=3.3
 }
 TEST(CudaEamCells, VsOraclePbc) {  // dropped-donor gate across the PERIODIC seam
   check_vs_oracle(1.5, 13, 44, /*pbc=*/true);  // exercises grid wrap + min-image
+}
+
+// ===================== Sub-rcut binning (E5c-subrcut) ====================
+// Cells sized ~rcut/cell_div with a ±cell_div stencil. The superset/B1 argument
+// is cell_div-INVARIANT: s_d=ceil((rcut+pad)/c) over the REALIZED cell spans >=rcut
+// ⇒ same in-cutoff multiset ⇒ raw int64 bit-equal to all-window for every k.
+
+// G0 — k=1 byte-identity of the grid (the SHARED pair path must not move).
+TEST(CudaEamCells, SubRcutK1FieldIdentity) {
+  const double lo[3] = {0, 0, 0}, len[3] = {12.15, 12.15, 12.15};
+  const bool per[3] = {true, true, true};
+  const auto g0 = tdcu::make_zone_grid(lo, len, per, 3.0, 1, 0);      // legacy default arg
+  const auto g1 = tdcu::make_zone_grid(lo, len, per, 3.0, 1, 0, /*cell_div=*/1);
+  EXPECT_EQ(g1.nx, g0.nx); EXPECT_EQ(g1.ny, g0.ny); EXPECT_EQ(g1.nz, g0.nz);
+  EXPECT_EQ(g1.cx, g0.cx); EXPECT_EQ(g1.cy, g0.cy); EXPECT_EQ(g1.cz, g0.cz);
+  EXPECT_EQ(g1.wrapx, g0.wrapx); EXPECT_EQ(g1.wrapz, g0.wrapz);
+  EXPECT_EQ(g1.sx, 1); EXPECT_EQ(g1.sy, 1); EXPECT_EQ(g1.sz, 1);  // legacy ±1
+  // wrap-invariant: g.wrapz ⇒ nz >= 2*sz+1 (no double-visit), every dim
+  EXPECT_TRUE(!g1.wrapx || g1.nx >= 2 * g1.sx + 1);
+  EXPECT_TRUE(!g1.wrapz || g1.nz >= 2 * g1.sz + 1);
+}
+
+// A-k — cells(k) ≡ all-window, RAW int64, ∀k∈{2,3,4}, fb=44 + fb=40, free + PBC-seam.
+TEST(CudaEamCells, SubRcutSelfEquiv) {
+  for (int k : {2, 3, 4}) {
+    check_self_equiv<44>(1.5, 7, Backend::Cells, /*pbc=*/false, 1.0, k);
+    check_self_equiv<40>(3.3, 11, Backend::Cells, /*pbc=*/false, 1.0, k);
+    check_self_equiv<44>(1.5, 13, Backend::Cells, /*pbc=*/true, 1.0, k);   // wrap + min-image
+    check_self_equiv<40>(3.3, 17, Backend::Cells, /*pbc=*/true, 1.0, k);
+  }
+}
+
+// B-k — INDEPENDENT dropped-donor gate vs eam_direct_fp64, ∀k∈{2,3,4} (A-k shares the
+// cull grid and is blind to a uniformly-dropped donor; only the all-pairs oracle catches it).
+TEST(CudaEamCells, SubRcutVsOracle) {
+  for (int k : {2, 3, 4}) {
+    check_vs_oracle(1.5, 7, 44, /*pbc=*/false, Backend::Cells, 1.0, k);
+    check_vs_oracle(3.3, 11, 40, /*pbc=*/false, Backend::Cells, 1.0, k);  // steep
+    check_vs_oracle(1.5, 13, 44, /*pbc=*/true, Backend::Cells, 1.0, k);   // PBC seam
+  }
+}
+
+// P-k — POISON (teeth): force the stencil to ±1 while cells are sized rcut/k (k>=3 ⇒
+// the FCC nn becomes cell-gap 2, so ±1 DROPS it). The oracle MUST then see a large gap.
+// If this did NOT fail, the B-k gate would be blind to a dropped donor. (poison_s=k−1 is
+// NOT used: the conservative s=ceil(rcut/c)=k covers a worst-case cell-edge alignment the
+// jittered lattice doesn't exhibit, so k−1 is coincidentally still complete there — only
+// ±1 over the small cells reliably bites.) free-z + PBC-seam.
+TEST(CudaEamCells, SubRcutPoisonHasTeeth) {
+  for (int k : {3, 4}) {
+    check_vs_oracle(3.3, 11, 40, /*pbc=*/false, Backend::Cells, 1.0, k, /*poison_s=*/1);
+    check_vs_oracle(1.5, 13, 44, /*pbc=*/true, Backend::Cells, 1.0, k, /*poison_s=*/1);
+  }
+}
+
+// W-k — tight-PBC degeneracy boundary: L tuned so n_k = 2k+1 EXACTLY (the smallest
+// wrap grid). Pins the `n < 2k+1 ⇒ n=1` guard's off-by-one: at n=2k+1 the ±k stencil
+// must cover all 2k+1 cells ONCE (no drop, no double-visit). The standard PBC window
+// (n=8/12/16) never approaches this boundary. Verified by the independent oracle.
+TEST(CudaEamCells, SubRcutTightPbcBoundary) {
+  const double rcut = 3.0;
+  for (int k : {2, 3, 4}) {
+    const double L = (2 * k + 1.5) * rcut / k;  // ⇒ int(L/(rcut/k)) = 2k+1; L>=2·rcut
+    const auto w = make_window_pbc_L(20 + k, L);
+    // sanity: this L actually realizes the n=2k+1 boundary with wrap on
+    const double lo[3] = {0, 0, 0}, len[3] = {L, L, L};
+    const bool per[3] = {true, true, true};
+    const auto g = tdcu::make_zone_grid(lo, len, per, rcut, 1, 0, k);
+    EXPECT_EQ(g.nz, 2 * k + 1) << "k=" << k << " L=" << L << " did not hit the boundary";
+    EXPECT_TRUE(g.wrapz) << "k=" << k << " boundary must wrap";
+    EXPECT_EQ(g.sz, k);
+    check_vs_oracle(1.5, 0, 44, /*pbc=*/false, Backend::Cells, 1.0, k, 0, &w);  // wovr
+  }
 }
 
 // ========================== Test A' (verlet) ============================
