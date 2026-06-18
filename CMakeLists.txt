@@ -237,6 +237,10 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_eam_spline PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_EAM_Spline COMMAND test_eam_spline)
 
+  add_executable(test_sw tests/test_sw.cpp)               # SW PR-1: angular φ₃ + FD + oracle
+  target_link_libraries(test_sw PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_SW COMMAND test_sw)
+
   add_executable(test_eam_zone tests/test_eam_zone.cpp)    # M6 PR-E3: zone EAM (3-zone residence)
   target_link_libraries(test_eam_zone PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_EAM_Zone COMMAND test_eam_zone)

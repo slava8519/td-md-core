@@ -62,6 +62,7 @@ struct EffectiveRange {
 // EAM is {2,true}. Centralised so the CLI/conveyor wiring (PR-E3) has one map.
 inline EffectiveRange effective_range_for(const std::string& pot_type) {
   if (pot_type == "eam") return {2, /*symmetric_reach=*/true};
+  if (pot_type == "sw") return {2, /*symmetric_reach=*/true};  // SW φ₃ wing reaches 2·rcut
   return {1, false};  // morse | lj — pair
 }
 
