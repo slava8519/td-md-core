@@ -1,0 +1,46 @@
+# M6(c) T_m bracket: short freeze-melt + NPH + short NVE at a single prep T (${Tp}),
+# writes a distinct config (coex_${tag}.data) so we can read S(z) and classify
+# all-liquid (T_m<Tp) / all-solid (T_m>Tp) / two-phase (Tp~T_m). Run:
+#   lmp -in coex_bracket.in -var Tp 850 -var tag t850
+variable     Tp  index 850
+variable     tag index t850
+units        metal
+atom_style   atomic
+boundary     p p p
+lattice      fcc 4.10
+region       box  block 0 8 0 8 0 24
+region       liq  block 0 8 0 8 0 12
+create_box   1 box
+create_atoms 1 box
+mass         1 26.982
+pair_style   eam/alloy
+pair_coeff   * * /home/slava8519/td-md-core/reference_data/eam_al/Al_zhou.eam.alloy Al
+group        liq region liq
+group        sol subtract all liq
+thermo       2000
+thermo_style custom step temp pe press lx ly lz
+timestep     0.001
+
+velocity     all create ${Tp} 90187 mom yes rot yes dist gaussian
+velocity     sol set 0.0 0.0 0.0
+fix          fsol sol nve
+fix          hold sol setforce 0.0 0.0 0.0
+fix          fliq liq nvt temp 1800.0 1800.0 0.1
+run          12000
+unfix        fliq
+fix          fliq liq nvt temp ${Tp} ${Tp} 0.1
+run          8000
+unfix        fliq
+unfix        hold
+unfix        fsol
+velocity     sol create ${Tp} 5511 mom no rot no dist gaussian
+velocity     all zero linear
+fix          nph0 all nph x 0.0 0.0 1.0 y 0.0 0.0 1.0 couple xy z 0.0 0.0 1.0
+run          20000
+unfix        nph0
+velocity     all zero linear
+reset_timestep 0
+fix          prod all nve
+fix          tav all ave/time 10 30 300 c_thermo_temp file /home/slava8519/td-md-core/reference_data/eam_al/Tm_${tag}.txt
+run          30000
+write_data   /home/slava8519/td-md-core/reference_data/eam_al/coex_${tag}.data nocoeff

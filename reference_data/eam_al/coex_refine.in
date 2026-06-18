@@ -1,0 +1,33 @@
+# M6(c) refine: take the GENUINE two-phase config (coex_t900.data, bimodal S(z)) and
+# let NPH find the true coexistence T_m. For a two-phase system at constant P, NPH
+# (T floats, enthalpy conserved) self-regulates T -> T_m independent of the prep
+# artifact that suppressed the NVE T. Then freeze the box and NVE-produce the reference.
+units        metal
+atom_style   atomic
+boundary     p p p
+read_data    /home/slava8519/td-md-core/reference_data/eam_al/coex_t900.data
+mass         1 26.982
+pair_style   eam/alloy
+pair_coeff   * * /home/slava8519/td-md-core/reference_data/eam_al/Al_zhou.eam.alloy Al
+thermo       500
+thermo_style custom step temp pe etotal press pxx pyy pzz lx ly lz
+timestep     0.001
+
+# --- equilibrate to coexistence at P~=0: NPH, T floats to T_m (couple xy) ---
+fix          nph0 all nph x 0.0 0.0 1.0 y 0.0 0.0 1.0 couple xy z 0.0 0.0 1.0
+run          80000
+unfix        nph0
+velocity     all zero linear
+
+# --- NVE production at the relaxed P~=0 box; T plateaus at T_m ---
+reset_timestep 0
+fix          prod all nve
+compute      cc  all chunk/atom bin/1d z lower 4.10 units box
+compute      pea all pe/atom
+fix          prof all ave/chunk 50 100 10000 cc density/number c_pea &
+             file /home/slava8519/td-md-core/reference_data/eam_al/coex_lammps_zprofile.txt
+fix          tav all ave/time 10 50 500 c_thermo_temp &
+             file /home/slava8519/td-md-core/reference_data/eam_al/Tm_lammps.txt
+thermo       200
+run          120000
+write_data   /home/slava8519/td-md-core/reference_data/eam_al/coex_al_6144.data nocoeff

@@ -118,6 +118,24 @@ if(TDMD_WITH_CUDA)
   # the CPU↔GPU bitwise contract is given up. Measures the determinism tax on EAM.
   add_executable(bench_eam_fma tools/bench_eam.cu)
   target_link_libraries(bench_eam_fma PRIVATE tdmd_core)
+
+  # M6 physics (a): NVE energy+momentum drift on a system set (kT/(ns·dof)).
+  add_executable(eam_drift tools/eam_drift.cu)
+  target_link_libraries(eam_drift PRIVATE tdmd_core)
+  target_compile_options(eam_drift PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+
+  # M6 physics (b): statistical RDF cosine overlap vs frozen LAMMPS g(r).
+  add_executable(eam_rdf_stat tools/eam_rdf_stat.cu)
+  target_link_libraries(eam_rdf_stat PRIVATE tdmd_core)
+  target_compile_options(eam_rdf_stat PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+
+  # M6 physics (c): two-phase melt-coexistence T_m (NVE) vs LAMMPS reference.
+  add_executable(eam_coexist tools/eam_coexist.cu)
+  target_link_libraries(eam_coexist PRIVATE tdmd_core)
+  target_compile_options(eam_coexist PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 endif()
 
 # --- M3 timing evidence: direct vs clustered (manual tool, not a CI gate) ---
@@ -293,6 +311,15 @@ if(TDMD_BUILD_TESTS)
       $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
     add_test(NAME Test_CUDA_EAM_Cells COMMAND test_cuda_eam_cells)
     set_tests_properties(Test_CUDA_EAM_Cells PROPERTIES LABELS cuda)
+
+    # M6 physics (b): statistical RDF — time-averaged g(r) over an NVE trajectory
+    # started from the LAMMPS-equilibrated config, cosine overlap vs frozen LAMMPS.
+    add_executable(test_cuda_eam_rdf tests/test_cuda_eam_rdf.cu)
+    target_link_libraries(test_cuda_eam_rdf PRIVATE tdmd_core GTest::gtest_main
+                          tdmd_eam_cuda_flags)
+    target_compile_definitions(test_cuda_eam_rdf PRIVATE TDMD_PROJECT_ROOT="${CMAKE_SOURCE_DIR}")
+    add_test(NAME Test_CUDA_EAM_RDF COMMAND test_cuda_eam_rdf)
+    set_tests_properties(Test_CUDA_EAM_RDF PROPERTIES LABELS cuda)
 
     if(TDMD_WITH_MPI)                                            # M5a: MPI ring
       find_package(MPI REQUIRED COMPONENTS CXX)
