@@ -59,11 +59,11 @@ void sw_window_force(const double* wx, const double* wy, const double* wz,
     const int o = owned[oi];
     const auto& no = nbr[o];
 
-    // (i) φ₂: o sums its own pair force; the LOWER GLOBAL KEY owns the energy. On the
-    //     SERIAL path zone_eam_window sorts the window by global id ⇒ key is monotonic in
-    //     local index ⇒ here this equals a local-index gate (no teeth — acceptance Gap-A).
-    //     It is DEFENSIVE for T3b: the ring gathers the window UNSORTED (slot order), where
-    //     only the global key keeps φ₂ attributed once and PE bitwise ≡ serial.
+    // (i) φ₂: o sums its own pair force; the LOWER GLOBAL KEY owns the energy. The key is a
+    //     DEFENSIVE choice (correct for ANY window order). On the serial path the window is
+    //     sorted ⇒ a local index would also work; and — MEASURED in T3b (test_sw_ring) — even
+    //     the UNSORTED ring gather is count-once-invariant (a φ₂ pair spans only adjacent
+    //     zones, the slot order is zone-consistent) ⇒ the global key is ROBUST, not load-bearing.
     for (const auto& e : no) {
       double phi, dphi;
       sw_phi2(sp, e.r, phi, dphi);

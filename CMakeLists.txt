@@ -245,6 +245,10 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_sw_zone PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_SW_Zone COMMAND test_sw_zone)
 
+  add_executable(test_sw_ring tests/test_sw_ring.cpp)     # SW T3b: threaded ring + global-key witness
+  target_link_libraries(test_sw_ring PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_SW_Ring COMMAND test_sw_ring)
+
   add_executable(test_eam_zone tests/test_eam_zone.cpp)    # M6 PR-E3: zone EAM (3-zone residence)
   target_link_libraries(test_eam_zone PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_EAM_Zone COMMAND test_eam_zone)

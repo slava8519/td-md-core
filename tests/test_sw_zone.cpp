@@ -177,11 +177,11 @@ TEST(ZoneSW, ForwardOnlyPoisonDivergesFromOracle) {
   EXPECT_LT(rb.n_triplets, ro.n_triplets) << "forward-only dropped no triplets";
 }
 
-// G5b — PE bitwise z-invariant. NOTE (acceptance Gap-A): on the SERIAL path the φ₂
-// global-key gate has NO teeth — zone_eam_window sorts the window by global id, so
-// key[o]<key[e.b] ≡ local o<e.b, and a local-index bug would still pass here. The global
-// key is DEFENSIVE for T3b, where the ring gathers the window UNSORTED (slot order) and
-// the key becomes load-bearing; the witness there is the T3b ring-vs-serial PE bitwise gate.
+// G5b — PE bitwise z-invariant. NOTE: the φ₂ global-key gate is DEFENSIVE (correct for any
+// window order), not load-bearing here — zone_eam_window sorts the window, so key order ≡
+// local order. T3b MEASURED (test_sw_ring) that even the UNSORTED ring gather is count-once-
+// invariant, so a local-index bug would pass on BOTH paths; the global key is kept for
+// robustness, not teeth. (This overturned the T3-acceptance Gap-A "becomes load-bearing" claim.)
 TEST(ZoneSW, EnergyBitwiseZInvariant) {
   pot::SwParams sp;
   core::Box box;
