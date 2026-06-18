@@ -137,6 +137,12 @@ if(TDMD_WITH_CUDA)
   target_compile_options(eam_coexist PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 
+  # E5c device-resident PROBE: does z>1 EAM kernel concurrency help on one GPU?
+  add_executable(probe_eam_concurrency tools/probe_eam_concurrency.cu)
+  target_link_libraries(probe_eam_concurrency PRIVATE tdmd_core)
+  target_compile_options(probe_eam_concurrency PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+
   # E5c-ring: throughput of the LIVE streaming GPU EAM ring (does culling translate?).
   # Links Threads — run_eam_ring spawns one std::jthread per node. TDMD_EAM_RING_TIMERS
   # turns on the compile-gated per-phase timers in GpuEamWindowForce::compute() (the

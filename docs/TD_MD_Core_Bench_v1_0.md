@@ -588,3 +588,18 @@ cells в живое кольцо — ВЫПОЛНЕНА (`4098ac0`) и ИЗМЕ�
 **Оговорки:** 1.71× — число **z=1, этот setfl/плотность**; переносится на флагман по density-инвариантности (~2.3 атома/ячейку при k=3 держится 16k→1e7); z>1-cull ВЫВОДИТСЯ (пер-оконные ядра идентичны, кольцо 98–99% kernel-bound), не таймится напрямую. Память k=3@1e7 ≈ 52 МБ, CUB-скан ≈0.05 мс (оба ≪ ядер). `bench_eam_ring` абсолют шумит при reps=3 (±~30%; ранжирование стабильно при reps≥8 — заголовок измерен reps=8).
 
 Воспроизведение: `./build-cuda/bench_eam_ring --cellk {0=auto|1|2|3|4} --steps 30 --reps 8` (изолир.: `bench_eam ... --cellk K`).
+
+### E5c-concurrency — рычаг #2 (device-resident / per-node-stream): ПРОБА = GO (2026-06-18, состяз. дизайн `wf_d75b4a72-21c`)
+
+§E5c-ring: z>1 concurrency-dead (`SPEEDUP_z=0.99`) — `compute()` mutex-сериализован на null-stream. Рычаг #2 = снять mutex + дать каждому узлу свой stream+scratch. Это ~1000-строчная архитектурная правка с НЕОПРЕДЕЛЁННым single-GPU выигрышем ⇒ measure-first: дешёвая проба ДО постройки.
+
+**ncu pre-check (бесплатно, нулевой код) — окно-размер (nc=12, k=3, grid=54):** `eam_density_cells` SM-throughput **37.7%**, FP64-pipe 64% когда активен но лишь **38% elapsed** (~24% абс.), warps_active **7.2%**, DRAM 0.1%. ⇒ ядра **latency-bound** (низкая occupancy, не FP64-issue-bound, не memory-bound), НЕ >80% ⇒ instant-NO-GO НЕ срабатывает, headroom ЕСТЬ. (Опровергает аналитический прогноз дизайна «85% SM-fill» из block-count'а — измерение даёт 38%.)
+
+**Проба (`tools/probe_eam_concurrency.cu`, ~110 строк): N независимых EAM-цепочек (density→embedding→force, k=3, окно m=8788) на N stream'ах+disjoint scratch vs serial, потолок (один global sync):**
+
+| nstream | serial ms | concurrent ms | **SPEEDUP_conc** | вердикт |
+|---|---|---|---|---|
+| 2 | 8.64 | 5.80 | **1.49×** | PARTIAL |
+| 3 | 13.07 | 7.65 | **1.71×** | GO |
+
+**ВЕРДИКТ: GO** (потолок 1.49–1.71×; latency-bound ядра ⇒ concurrent цепочки заполняют простаивающие циклы). Это ПОТОЛОК (один global sync; живое кольцо с пер-узловыми syncs + host-gather может быть только хуже). Предрег. полосы: <1.20 NO-GO / 1.20–1.5 PARTIAL / ≥1.5 GO. **Дальше: построить #1 (per-node scratch+streams, снять mutex), замерить живой Axis-B `SPEEDUP_z`; SHIP если ≥1.3×, иначе document-partial.** #2 (async-транспорт) + #3 (full device-resident, positions-on-device) — **отложены в M5b** (на одной GPU кольцо f=0.99 kernel-bound ⇒ прятать ~1% транспорта не за чем; их ценность — cross-GPU edge). Воспроизведение: `./build-cuda/probe_eam_concurrency`.
