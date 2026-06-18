@@ -75,6 +75,7 @@ int main(int argc, char** argv) {
   int nc = 8; long steps = 50; double rcut = 4.0; double skin = 1.0;
   std::string backend = "allwindow";  // E5c bake-off: allwindow | cells | verlet | newton3 | sorted
   std::string setfl_path;  // like-for-like: a real setfl (e.g. Al_zhou.eam.alloy)
+  bool free_z = false;     // --free: periodic x,y, free z (match bench_eam_ring Axis A)
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
     if (a == "--cells") nc = std::stoi(argv[++i]);
@@ -83,6 +84,7 @@ int main(int argc, char** argv) {
     else if (a == "--backend") backend = argv[++i];
     else if (a == "--setfl") setfl_path = argv[++i];
     else if (a == "--skin") skin = std::stod(argv[++i]);
+    else if (a == "--free") free_z = true;
   }
   if (backend != "allwindow" && backend != "cells" && backend != "verlet" &&
       backend != "newton3" && backend != "sorted" && backend != "mixed") {
@@ -103,6 +105,7 @@ int main(int argc, char** argv) {
 
   core::Box box;
   auto at = make_fcc(box, nc, 4.05);
+  if (free_z) box.periodic[2] = false;  // match bench_eam_ring Axis A (z=1 free-z window)
   const int m = at.n;
   // potential: a real setfl (--setfl, identical pair math to LAMMPS) OR the
   // analytic-tabulated EAM (default). from_setfl carries its own rcut.

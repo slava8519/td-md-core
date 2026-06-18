@@ -136,6 +136,16 @@ if(TDMD_WITH_CUDA)
   target_link_libraries(eam_coexist PRIVATE tdmd_core)
   target_compile_options(eam_coexist PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+
+  # E5c-ring: throughput of the LIVE streaming GPU EAM ring (does culling translate?).
+  # Links Threads — run_eam_ring spawns one std::jthread per node. TDMD_EAM_RING_TIMERS
+  # turns on the compile-gated per-phase timers in GpuEamWindowForce::compute() (the
+  # DEFAULT engine/test build leaves them OFF ⇒ the proven bitwise hot path is byte-identical).
+  add_executable(bench_eam_ring tools/bench_eam_ring.cu)
+  target_link_libraries(bench_eam_ring PRIVATE tdmd_core Threads::Threads)
+  target_compile_definitions(bench_eam_ring PRIVATE TDMD_EAM_RING_TIMERS)
+  target_compile_options(bench_eam_ring PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 endif()
 
 # --- M3 timing evidence: direct vs clustered (manual tool, not a CI gate) ---

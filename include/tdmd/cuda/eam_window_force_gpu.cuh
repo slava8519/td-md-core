@@ -6,6 +6,9 @@
 #include <mutex>
 #include <stdexcept>
 #include <vector>
+#ifdef TDMD_EAM_RING_TIMERS
+#include <chrono>
+#endif
 
 #include "tdmd/core/fixed_accum.hpp"
 #include "tdmd/core/soa.hpp"   // Box (the cell grid needs box.lo — F1)
@@ -71,6 +74,17 @@ struct GpuEamWindowState {
   unsigned long long sentinel = 0;  // pos_double_bits(1e300) — empty-window seed
   std::mutex mu;
 
+#ifdef TDMD_EAM_RING_TIMERS
+  // per-phase attribution (bench-only, compile-gated ⇒ the proven bitwise hot path
+  // is byte-identical in default builds). Piggybacks on compute()'s existing
+  // end-of-pass cudaDeviceSynchronize — adds NO extra sync, so it does not perturb
+  // the wall-time. compute_wall ≈ t_h2d_s + t_rest_s; t_kernel_ms is the PURE GPU
+  // kernel time (hidden inside the blocking D2H wait of t_rest_s). f=kernel/wall.
+  cudaEvent_t ev_ks_ = nullptr, ev_ke_ = nullptr;
+  double t_h2d_s = 0, t_rest_s = 0, t_kernel_ms = 0;
+  unsigned long long n_calls = 0;
+#endif
+
   // E5c-integration — cell-list culling of the per-window density+force (cells ≡
   // all-window BITWISE by B1, proven in test_cuda_eam_cells). The box is captured
   // at construction (static membership/box for the run) — compute() only gets a
@@ -116,6 +130,9 @@ struct GpuEamWindowState {
     d_mr = eam_wf_malloc<unsigned long long>(1);
     d_of = eam_wf_malloc<int>(1);
     grow(64);  // initial scratch
+#ifdef TDMD_EAM_RING_TIMERS
+    cudaEventCreate(&ev_ks_); cudaEventCreate(&ev_ke_);
+#endif
   }
 
   void grow(int m) {
@@ -177,6 +194,10 @@ struct GpuEamWindowState {
       if (p) cudaFree(p);
     for (void* p : {(void*)dF, (void*)dra, (void*)drp, (void*)d_pe, (void*)d_mr, (void*)d_of})
       if (p) cudaFree(p);
+#ifdef TDMD_EAM_RING_TIMERS
+    if (ev_ks_) cudaEventDestroy(ev_ks_);
+    if (ev_ke_) cudaEventDestroy(ev_ke_);
+#endif
   }
 };
 
@@ -196,6 +217,15 @@ struct GpuEamWindowForce {
   // non-vacuity witness: how many compute() calls took the culled path.
   unsigned long long cells_passes() const { return st->cells_passes; }
 
+#ifdef TDMD_EAM_RING_TIMERS
+  // per-phase attribution accessors (bench-only). compute_wall ≈ h2d+rest; the pure
+  // GPU kernel time is t_kernel_ms (ms). f = (t_kernel_ms/1000)/compute_wall.
+  double timer_h2d_s() const { return st->t_h2d_s; }
+  double timer_rest_s() const { return st->t_rest_s; }
+  double timer_kernel_s() const { return st->t_kernel_ms / 1000.0; }
+  unsigned long long timer_calls() const { return st->n_calls; }
+#endif
+
   void compute(const double* wx, const double* wy, const double* wz, const long* key,
                int m, const int* owned, int n_owned, const core::PairGeom& geom,
                double /*rho_cap_unused*/, std::vector<core::fixed::ForceAccum>& wFx,
@@ -208,6 +238,9 @@ struct GpuEamWindowForce {
     if (m <= 0) return;  // empty window: no owned forces, pe/min_r2 unchanged
     s.grow(m);
 
+#ifdef TDMD_EAM_RING_TIMERS
+    const auto _t_h2d0 = std::chrono::steady_clock::now();
+#endif
     // upload the gathered window (key = the actual atom ids — the φ-once order,
     // IDENTICAL to the CPU eam_window_force call; NOT window-local indices).
     cudaMemcpy(s.wx, wx, m * sizeof(double), cudaMemcpyHostToDevice);
@@ -223,6 +256,11 @@ struct GpuEamWindowForce {
     cudaMemcpy(s.d_mr, &s.sentinel, 8, cudaMemcpyHostToDevice);
     cudaMemcpy(s.d_of, &zof, 4, cudaMemcpyHostToDevice);
 
+#ifdef TDMD_EAM_RING_TIMERS
+    const auto _t_rest0 = std::chrono::steady_clock::now();
+    s.t_h2d_s += std::chrono::duration<double>(_t_rest0 - _t_h2d0).count();
+    cudaEventRecord(s.ev_ks_);  // null-stream ⇒ orders after the H2D, before the kernels
+#endif
     // ρ → F'(ρ) → force. embedding (O(m)) is identical on both paths; density and
     // force are the heavy passes, culled when s.cull. ALL on the null stream (same
     // as the force kernels) ⇒ grid → density → force ordered within one compute();
@@ -264,6 +302,9 @@ struct GpuEamWindowForce {
                                               s.d_rho, s.d_fp, s.d_fx, s.d_fy, s.d_fz,
                                               s.d_pe, s.d_mr, s.d_of);
     }
+#ifdef TDMD_EAM_RING_TIMERS
+    cudaEventRecord(s.ev_ke_);  // after the force kernel, before the D2H
+#endif
 
     // download the int64 raws + scalars
     int of = 0;
@@ -282,6 +323,13 @@ struct GpuEamWindowForce {
     const cudaError_t err = cudaDeviceSynchronize();
     if (err != cudaSuccess)
       throw std::runtime_error(std::string("GpuEamWindowForce: ") + cudaGetErrorString(err));
+#ifdef TDMD_EAM_RING_TIMERS
+    // the sync above completed the kernel events ⇒ read with NO extra sync. t_rest_s
+    // = kernel-launch + (blocking D2H that waits on the kernels) + this sync.
+    s.t_rest_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - _t_rest0).count();
+    float _kms = 0; cudaEventElapsedTime(&_kms, s.ev_ks_, s.ev_ke_);
+    s.t_kernel_ms += _kms; ++s.n_calls;
+#endif
 
     // HALT symmetry: the CPU eam_window_force THROWS on ρ>rho_cap; the kernel
     // sets overflow bit 2 (rho-cap) / bit 1 (quantize). Throw ⇒ node_main maps

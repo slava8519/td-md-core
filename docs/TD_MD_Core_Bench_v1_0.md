@@ -531,8 +531,36 @@ EAM культит только 2 (density+force; embedding локален), reu
 TileMask оправдан при 5–6 проходах ReaxFF — туда и отложен. **Тот же вывод, что M4-B
 на LJ/Morse, теперь ИЗМЕРЕН на EAM.** Исходный вопрос пользователя закрыт данными.
 
-**Отложено (E5c+):** TileMask (до ReaxFF), суб-rcut биннинг (cell-size лёвер для
-over-fetch), интеграция cells-ядер в живое GPU-кольцо `EamGpuConveyor` (standalone-окно
-сначала, как E5 до E5b), PersistentVerlet-EAM (memory-gated), MEAM/Tersoff/ReaxFF.
+**Отложено (E5c+):** TileMask (до ReaxFF), **суб-rcut биннинг (cell-size лёвер для
+over-fetch — ПОДТВЕРЖДЁН §E5c-ring как per-window рычаг #1: кольцо 99% kernel-bound)**,
+**device-resident D2D транспорт / снятие compute()-mutex (per-window рычаг #2 для z>1 —
+SPEEDUP_z=0.99)**, PersistentVerlet-EAM (memory-gated), MEAM/Tersoff/ReaxFF. Интеграция
+cells в живое кольцо — ВЫПОЛНЕНА (`4098ac0`) и ИЗМЕРЕНА (§E5c-ring: TRANSLATES, R_ring=4.30).
 
 Воспроизведение: `./build-cuda/bench_eam --backend {allwindow|cells} --cells {6|10|16} --steps 30`.
+
+### E5c-ring — переносится ли куллинг на ЖИВОЕ GPU-кольцо? (2026-06-18, состяз. дизайн `wf_701417ea-979` + приёмка `wf_03da14fd-3d8`)
+
+Интеграция cells-ядер в живое кольцо была сделана раньше (коммит `4098ac0`, `GpuEamWindowForce(cull=true)`, default ON, побитово-прозрачно, `CulledRingMatchesAllWindowRingBitwise`). Открытый вопрос: **переносится ли** изолированный куллинг-выигрыш на ЖИВОЕ host-оркестрованное, mutex-сериализованное кольцо (`run_eam_ring` + `GpuEamWindowForce`), или кольцо transport-bound? `tools/bench_eam_ring.cu` (deterministic_fp64, --fmad=false, warmup-diff `min(t_{W+S})−min(t_W)`, reps=3).
+
+**Axis A (z=1 whole-system window, free-z; обе ноги cull on/off ОДНИМ харнесом):**
+
+| N | A_cull a-st/s | A_nocull | **R_ring** | R_kernel (bench_eam --free) | η |
+|---|---|---|---|---|---|
+| 864 | 2.36e5 | 2.47e5 | 0.95 | n/a | — |
+| 2048 | 2.66e5 | 3.40e5 | 0.78 | n/a | — |
+| 4000 | 5.50e5 | 3.91e5 | 1.41 | 1.46 | 0.96 |
+| 6912 | 6.35e5 | 4.28e5 | 1.49 | 1.73 | 0.86 |
+| **16384** | **1.10e6** | 2.57e5 | **4.30** | 4.16 | **1.03** |
+
+**ВЕРДИКТ: TRANSLATES.** Нагруженное число — **R_ring=4.30 @ N=16384** (внутрихарнесное отношение cull/all-window: обе ноги через идентичный путь, общий шум — wall-clock, gather/scatter/VV/sync — сокращается; флаг `cull` переключает ровно одну ветку `compute()`). Куллинг-выигрыш переносится почти полностью; cells ПРОИГРЫВАЮТ при N≲3000 (grid-build + 27-cell over-fetch > дешёвого малого O(N²)).
+
+**Атрибуция (ring-internal per-phase, `#ifdef TDMD_EAM_RING_TIMERS`, БЕЗ кросс-харнеса):** при z=1 N=16384 **[h2d 1% | kernel 99% | d2h+sync 0%], f=0.99, Amdahl 1/(1−f)≈96** ⇒ кольцо на 99% **KERNEL-BOUND**, транспорт пренебрежим. Это снимает провизорность «kernel-bound» (η — лишь ±~20% кросс-харнесное подтверждение: R_ring steady_clock warmup-diff vs R_kernel cudaEvent single-loop; η>1 в первом прогоне 1.18 был артефактом смещённого `min(Δ)`-оценщика, исправлено SI2 → η=1.03).
+
+**Axis B (N=14976, periodic, n_zones=5, cull):** `A(nodes=1)=2.60e5`, `A(nodes=5)=2.59e5`, **SPEEDUP_z=0.99** — z>1 НЕ ускоряет: `compute()` mutex-сериализован на null-stream, нулевая device-concurrency; z>1 перекрывает только хост-оркестрацию.
+
+**ДВА живых рычага (бенч измерил ОБА bottleneck'а):** (1) per-window ядро упёрто в 27-cell over-fetch (~6.4×) ⇒ R_kernel лишь ~4× при rcut=10.1 ⇒ рычаг = **суб-rcut биннинг / cell-size**, НЕ «ещё куллинга» тем же cell-list (он и задаёт потолок); (2) z>1-пропускная упёрта в mutex ⇒ рычаг = **снятие mutex / per-stream events / device-resident D2D транспорт** (на одной GPU кольцо и так сериально насыщает device; реальный multi-zone payoff — multi-GPU, M5b). Тезис: каждый `compute()` кончается блокирующим D2H + `cudaDeviceSynchronize` ⇒ host-кольцо не может перекрыть kernel(h) с gather(h+1); device-resident — может.
+
+**Оговорки (не баги — провенанс):** **(C1)** 1.10e6 atom-steps/s — ВНУТРИКОЛЬЦЕВОЕ число (free-z, z=1, deterministic_fp64), **НЕ флагман**: ~19× ниже M5a 2.06e7 на той же 5080, рядом не ставить. **(C2)** TRANSLATES доказан для z=1 whole-system; z>1 на одной GPU concurrency-dead. **(C3)** cells — нетто-регрессия при N≲3000. **(C4)** η apples в геометрии (обе стороны free-z), но кросс-харнесное в методе тайминга — потому ±20%, не первичная метрика. Дефолтная сборка движка/тестов БЕЗ `TDMD_EAM_RING_TIMERS` ⇒ проверенный побитовый hot path байт-идентичен (`Test_CUDA_EAM_Ring` 11/11 зелёные с таймерами в коде).
+
+Воспроизведение: `./build-cuda/bench_eam_ring --steps 30 --reps 3` (R_kernel: `./build-cuda/bench_eam --setfl reference_data/eam_al/Al_zhou.eam.alloy --free --cells {10|12|16} --backend {allwindow|cells}`).
