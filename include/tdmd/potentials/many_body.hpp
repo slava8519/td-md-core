@@ -64,6 +64,7 @@ inline EffectiveRange effective_range_for(const std::string& pot_type) {
   if (pot_type == "eam") return {2, /*symmetric_reach=*/true};
   if (pot_type == "sw") return {2, /*symmetric_reach=*/true};  // SW φ₃ wing reaches 2·rcut
   if (pot_type == "tersoff") return {2, true};  // Tersoff k-atom of bond (i,j) reaches 2·rcut
+  if (pot_type == "meam") return {2, true};  // MEAM screening k-atom + 2·rcut density reach
   return {1, false};  // morse | lj — pair
 }
 

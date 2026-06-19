@@ -285,6 +285,14 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_tersoff_rdf PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_Tersoff_RDF COMMAND test_tersoff_rdf)
 
+  add_executable(test_meam tests/test_meam.cpp)                  # Me1: MEAM energy (screening + densities)
+  target_link_libraries(test_meam PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_MEAM COMMAND test_meam)
+
+  add_executable(test_meam_lammps tests/test_meam_lammps.cpp)    # Me1: frozen LAMMPS meam run-0 energy golden
+  target_link_libraries(test_meam_lammps PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_MEAM_LAMMPS COMMAND test_meam_lammps)
+
   add_executable(test_eam_zone tests/test_eam_zone.cpp)    # M6 PR-E3: zone EAM (3-zone residence)
   target_link_libraries(test_eam_zone PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_EAM_Zone COMMAND test_eam_zone)

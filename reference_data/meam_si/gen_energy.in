@@ -1,0 +1,12 @@
+units metal
+atom_style atomic
+boundary p p p
+read_data meam_si_64.data
+pair_style meam
+pair_coeff * * library.meam Si Si.meam Si
+run 0
+variable pe equal pe
+print "MEAM_PE ${pe}"
+dump d all custom 1 meam_si_64.dump id fx fy fz
+dump_modify d format float %.16e sort id
+run 0

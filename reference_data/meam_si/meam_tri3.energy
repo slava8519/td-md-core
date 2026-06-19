@@ -1,0 +1,2 @@
+# LAMMPS pair_style meam run 0 — 3-atom cluster, the i-j pair PARTIALLY screened by k (0<S<1, ~0.50)
+PE -0.935624255785264
