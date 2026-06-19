@@ -277,6 +277,10 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_tersoff_ring PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_Tersoff_Ring COMMAND test_tersoff_ring)
 
+  add_executable(test_tersoff_nve tests/test_tersoff_nve.cpp)    # Te4: NVE energy/momentum conservation
+  target_link_libraries(test_tersoff_nve PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_Tersoff_NVE COMMAND test_tersoff_nve)
+
   add_executable(test_eam_zone tests/test_eam_zone.cpp)    # M6 PR-E3: zone EAM (3-zone residence)
   target_link_libraries(test_eam_zone PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_EAM_Zone COMMAND test_eam_zone)
