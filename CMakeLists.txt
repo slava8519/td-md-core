@@ -249,6 +249,10 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_sw_ring PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_SW_Ring COMMAND test_sw_ring)
 
+  add_executable(test_sw_nve tests/test_sw_nve.cpp)       # SW T4: NVE energy/momentum conservation
+  target_link_libraries(test_sw_nve PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_SW_NVE COMMAND test_sw_nve)
+
   add_executable(test_eam_zone tests/test_eam_zone.cpp)    # M6 PR-E3: zone EAM (3-zone residence)
   target_link_libraries(test_eam_zone PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_EAM_Zone COMMAND test_eam_zone)
