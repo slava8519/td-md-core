@@ -86,6 +86,75 @@ TDMD_HOST_DEVICE inline double G_gam(double gamma, int ibar, double gsmooth_fact
   return 0.0;
 }
 
+// LAMMPS meam_funcs.cpp::dG_gam — G(γ) AND dG/dγ; ibar=1 reachable (G = exp(γ/2), dG = G/2).
+// Me2 force needs the derivative; Me1 G_gam (value-only) is left untouched. Replicate the full
+// switch (a Si fixture cannot distinguish a wrong default branch — the deferred-branch discipline).
+TDMD_HOST_DEVICE inline double dG_gam(double gamma, int ibar, double gsmooth_factor, double& dG) {
+  switch (ibar) {
+    case 0:
+    case 4: {
+      double sp = -gsmooth_factor / (gsmooth_factor + 1.0);
+      if (gamma < sp) {
+        double G = 1.0 / (gsmooth_factor + 1.0) * std::pow(sp / gamma, gsmooth_factor);
+        G = std::sqrt(G);
+        dG = -gsmooth_factor * G / (2.0 * gamma);
+        return G;
+      }
+      double G = std::sqrt(1.0 + gamma);
+      dG = 1.0 / (2.0 * G);
+      return G;
+    }
+    case 1: {
+      double G = std::exp(gamma / 2.0);
+      dG = G / 2.0;
+      return G;
+    }
+    case 3: {
+      double G = 2.0 / (1.0 + std::exp(-gamma));
+      dG = G * (2.0 - G) / 2.0;
+      return G;
+    }
+    case -5:
+      if ((1.0 + gamma) >= 0.0) {
+        double G = std::sqrt(1.0 + gamma);
+        dG = 1.0 / (2.0 * G);
+        return G;
+      } else {
+        double G = -std::sqrt(-1.0 - gamma);
+        dG = -1.0 / (2.0 * G);
+        return G;
+      }
+  }
+  dG = 1.0;
+  return 0.0;
+}
+
+// LAMMPS meam.h::dCfunc — ∂C_ikj/∂(rij²). Used by getscreen's dscrfcn (the RADIAL screening
+// derivative). DISTINCT from dCfunc2 (the rik²/rjk² derivatives in the force k-loop).
+TDMD_HOST_DEVICE inline double dCfunc(double rij2, double rik2, double rjk2) {
+  const double rij4 = rij2 * rij2;
+  const double a = rik2 - rjk2;
+  const double b = rik2 + rjk2;
+  const double asq = a * a;
+  double denom = rij4 - asq;
+  denom = denom * denom;
+  return -4.0 * (-2.0 * rij2 * asq + rij4 * b + asq * b) / denom;
+}
+
+// LAMMPS meam.h::dCfunc2 — ∂C_ikj/∂(rik²) and ∂C_ikj/∂(rjk²). The force k-loop's screening
+// 3rd-atom derivative (the dsij1/dsij2 weights that scatter to f_i/f_j/f_k).
+TDMD_HOST_DEVICE inline void dCfunc2(double rij2, double rik2, double rjk2, double& dCikj1,
+                                     double& dCikj2) {
+  const double rij4 = rij2 * rij2;
+  const double rik4 = rik2 * rik2;
+  const double rjk4 = rjk2 * rjk2;
+  const double a = rik2 - rjk2;
+  double denom = rij4 - a * a;
+  denom = denom * denom;
+  dCikj1 = 4.0 * rij2 * (rij4 + rik4 + 2.0 * rik2 * rjk2 - 3.0 * rjk4 - 2.0 * rij2 * a) / denom;
+  dCikj2 = 4.0 * rij2 * (rij4 - 3.0 * rik4 + 2.0 * rik2 * rjk2 + rjk4 + 2.0 * rij2 * a) / denom;
+}
+
 // LAMMPS meam_funcs.cpp::embedding — F = A·Ec·ρ̄·ln(ρ̄); emb_lin_neg=0 ⇒ ρ̄≤0 returns 0.
 TDMD_HOST_DEVICE inline double embedding(double A, double Ec, double rhobar, int emb_lin_neg,
                                          double& dF) {
@@ -174,6 +243,11 @@ struct MeamParams {
   // v2D/v3D multiplicities (LAMMPS meam_setup_done.cpp)
   std::array<int, 6> v2D{1, 2, 2, 1, 2, 1};
   std::array<int, 10> v3D{1, 3, 3, 3, 6, 3, 1, 3, 3, 1};
+  // vind2D[3][3] / vind3D[3][3][3] — symmetric Voigt index tables (the angular-direction force
+  // derivatives drho{2,3}drm read them). Built character-for-character in recompute() from
+  // meam_setup_done.cpp:43-60 (the same nested m≤n≤p loop that emits v2D/v3D).
+  int vind2D[3][3] = {{0, 0, 0}, {0, 0, 0}, {0, 0, 0}};
+  int vind3D[3][3][3] = {};
   // φ spline (interpolate_meam over phi_meam grid) — MUST-FIX-1
   int nr = 1000;
   double dr = 0.0, rdrar = 0.0;
@@ -263,6 +337,18 @@ struct MeamParams {
     return ((phirar3[kk] * pp + phirar2[kk]) * pp + phirar1[kk]) * pp + phirar[kk];
   }
 
+  // LAMMPS meam_force.cpp:112 — read φ'(rij) from the SAME spline grid. phirar4/5/6 are the
+  // /drar-scaled coefficients (interpolate() already built them; Me1 never read them). Me2 force.
+  double phip_spline(double rij) const {
+    const int nrar = nr;
+    double pp = rij * rdrar;
+    int kk = static_cast<int>(pp);
+    kk = std::min(kk, nrar - 2);
+    pp = pp - kk;
+    pp = std::min(pp, 1.0);
+    return (phirar6[kk] * pp + phirar5[kk]) * pp + phirar4[kk];
+  }
+
   void recompute() {
     if (Cmax <= 1.0) throw std::runtime_error("MeamParams: Cmax must be > 1");
     if (nn2 != 0) throw std::runtime_error("MeamParams: nn2!=0 deferred to a later rung");
@@ -275,6 +361,26 @@ struct MeamParams {
     if (ibar != 1) throw std::runtime_error("MeamParams: only ibar=1 (Si) is validated");
     if (emb_lin_neg != 0) throw std::runtime_error("MeamParams: emb_lin_neg!=0 branch unvalidated");
     if (erose_form != 0) throw std::runtime_error("MeamParams: erose_form!=0 branch unvalidated");
+
+    // Voigt symmetric index tables (meam_setup_done.cpp:43-60) — used by the Me2 force only.
+    {
+      int nv2 = 0, nv3 = 0;
+      for (int m = 0; m < 3; ++m)
+        for (int n = m; n < 3; ++n) {
+          vind2D[m][n] = nv2;
+          vind2D[n][m] = nv2;
+          ++nv2;
+          for (int pp = n; pp < 3; ++pp) {
+            vind3D[m][n][pp] = nv3;
+            vind3D[m][pp][n] = nv3;
+            vind3D[n][m][pp] = nv3;
+            vind3D[n][pp][m] = nv3;
+            vind3D[pp][m][n] = nv3;
+            vind3D[pp][n][m] = nv3;
+            ++nv3;
+          }
+        }
+    }
 
     re = alat * std::sqrt(3.0) / 4.0;                  // DIA
     t1_eff = t1 + augt1 * (3.0 / 5.0) * t3;            // augt1 trap (= 2.82 for Si)
@@ -344,6 +450,84 @@ inline std::vector<std::vector<MeamNbr>> meam_build_nbr(const AtomSoA<Real>& a,
 // CHARACTER-FOR-CHARACTER from meam_dens_init.cpp:154-290 (dscrfcn k-derivative dropped).
 // ----------------------------------------------------------------------------------------
 struct MeamScreen { double scrfcn, fcpair; };
+
+// Me2 — getscreen WITH the dscrfcn radial screening derivative. Returns scrfcn/fcpair (same as
+// the value path) PLUS dscrfcn = ∂(sij)/∂(rij) (partial-only — zero on the diamond's binary S).
+// CHARACTER-FOR-CHARACTER from meam_dens_init.cpp:154-289 (the second k-loop + the −coef2 taper).
+struct MeamScreenD { double scrfcn, fcpair, dscrfcn; };
+inline MeamScreenD meam_getscreen_d(const MeamNbr& ej, const std::vector<MeamNbr>& nbr_i,
+                                    const MeamParams& p) {
+  const double cutforce = p.rc;
+  const double drinv = 1.0 / p.delr;
+  const double rij2 = ej.r2;
+  const double rij = ej.r;
+  const double rbound = p.ebound * rij2;
+  const double rnorm = (cutforce - rij) * drinv;
+  double sij = 1.0;
+
+  // First pass — the screening product itself (== meam_getscreen).
+  for (const auto& ek : nbr_i) {
+    if (ek.j == ej.j) continue;
+    const double dxjk = ek.dx - ej.dx, dyjk = ek.dy - ej.dy, dzjk = ek.dz - ej.dz;
+    const double rjk2 = dxjk * dxjk + dyjk * dyjk + dzjk * dzjk;
+    if (rjk2 > rbound) continue;
+    const double rik2 = ek.r2;
+    if (rik2 > rbound) continue;
+    const double xik = rik2 / rij2;
+    const double xjk = rjk2 / rij2;
+    const double a = 1.0 - (xik - xjk) * (xik - xjk);
+    if (a <= 0.0) continue;
+    double cikj = (2.0 * (xik + xjk) + a - 2.0) / a;
+    if (cikj >= p.Cmax) continue;
+    else if (cikj <= p.Cmin) { sij = 0.0; break; }
+    else {
+      const double delc = p.Cmax - p.Cmin;
+      cikj = (cikj - p.Cmin) / delc;
+      sij *= meam_detail::fcut(cikj);
+    }
+  }
+
+  double dfc;
+  const double fc = meam_detail::dfcut(rnorm, dfc);
+  const double fcij = fc;
+  const double dfcij = dfc * drinv;
+
+  // Second pass — dscrfcn (the radial screening derivative; partial-only).
+  double dscrfcn = 0.0;
+  const double sfcij = sij * fcij;
+  if (std::fabs(sfcij) > 1e-20 && std::fabs(sfcij - 1.0) > 1e-20) {  // !iszero && !isone
+    for (const auto& ek : nbr_i) {
+      if (ek.j == ej.j) continue;
+      const double dxjk = ek.dx - ej.dx, dyjk = ek.dy - ej.dy, dzjk = ek.dz - ej.dz;
+      const double rjk2 = dxjk * dxjk + dyjk * dyjk + dzjk * dzjk;
+      if (rjk2 > rbound) continue;
+      const double rik2 = ek.r2;
+      if (rik2 > rbound) continue;
+      const double xik = rik2 / rij2;
+      const double xjk = rjk2 / rij2;
+      const double a = 1.0 - (xik - xjk) * (xik - xjk);
+      if (a <= 0.0) continue;
+      double cikj = (2.0 * (xik + xjk) + a - 2.0) / a;
+      if (cikj >= p.Cmax) {
+        continue;  // (0<cikj<Cmin impossible here — sij would already be 0)
+      } else {
+        const double delc = p.Cmax - p.Cmin;
+        cikj = (cikj - p.Cmin) / delc;
+        double dfikj;
+        const double sikj = meam_detail::dfcut(cikj, dfikj);
+        const double coef1 = dfikj / (delc * sikj);
+        const double dCikj = meam_detail::dCfunc(rij2, rik2, rjk2);
+        dscrfcn += coef1 * dCikj;
+      }
+    }
+    const double coef1 = sfcij;
+    const double coef2 = sij * dfcij / rij;
+    dscrfcn = dscrfcn * coef1 - coef2;  // ⭐ the MINUS on coef2 (radial taper); a + is silent on diamond
+  }
+
+  return {sij, fcij, dscrfcn};
+}
+
 inline MeamScreen meam_getscreen(const MeamNbr& ej, const std::vector<MeamNbr>& nbr_i,
                                  const MeamParams& p) {
   const double cutforce = p.rc;
@@ -469,6 +653,68 @@ inline double meam_dens_final(const MeamDensity& d, const MeamParams& p) {
 }
 
 // ----------------------------------------------------------------------------------------
+// Me2 — the per-atom prerequisites the FORCE pass reads (meam_dens_final.cpp:135-247 stores
+// these into rho0/1/2/3/frhop/gamma/dgamma1/2/3/t_ave; Me1's meam_dens_final discarded them).
+// F (the embedding energy) is identical to meam_dens_final's return ⇒ meam_energy stays exact.
+// ----------------------------------------------------------------------------------------
+struct MeamEmbedDeriv {
+  double F = 0.0;         // embedding energy F(ρ̄)  (== meam_dens_final return)
+  double frhop = 0.0;     // dF/dρ̄
+  double gamma = 0.0;
+  double dgamma1 = 0.0;
+  double dgamma2 = 0.0;
+  double dgamma3 = 0.0;   // mix_ref_t=0 ⇒ always 0 for Si (G-DGAMMA3-DEAD)
+  double rho0 = 0.0;      // bare ρ⁰ accumulator
+  double rho1 = 0.0;      // Σ arho1²
+  double rho2 = 0.0;      // −⅓arho2b² + Σ v2D·arho2²
+  double rho3 = 0.0;      // Σ v3D·arho3² − ⅗Σ arho3b²
+  double t_ave[3] = {0, 0, 0};
+};
+
+inline MeamEmbedDeriv meam_dens_final_deriv(const MeamDensity& d, const MeamParams& p) {
+  int errorflag = 0;
+  MeamEmbedDeriv e;
+  double rho1 = 0.0, rho2 = -1.0 / 3.0 * d.arho2b * d.arho2b, rho3 = 0.0;
+  double t_ave[3] = {d.t_ave[0], d.t_ave[1], d.t_ave[2]};
+  for (int m = 0; m < 3; ++m) {
+    rho1 += d.arho1[m] * d.arho1[m];
+    rho3 -= 3.0 / 5.0 * d.arho3b[m] * d.arho3b[m];
+  }
+  for (int m = 0; m < 6; ++m) rho2 += p.v2D[m] * d.arho2[m] * d.arho2[m];
+  for (int m = 0; m < 10; ++m) rho3 += p.v3D[m] * d.arho3[m] * d.arho3[m];
+
+  if (d.rho0 > 0.0) {  // ialloy=0 branch
+    t_ave[0] /= d.rho0;
+    t_ave[1] /= d.rho0;
+    t_ave[2] /= d.rho0;
+  }
+  double gamma = t_ave[0] * rho1 + t_ave[1] * rho2 + t_ave[2] * rho3;
+  if (d.rho0 > 0.0) gamma /= (d.rho0 * d.rho0);
+
+  const double rho = d.rho0 * meam_detail::G_gam(gamma, p.ibar, p.gsmooth, errorflag);
+  const double rho_bkgd = p.rho_ref;  // bkgd_dyn=0, mix_ref_t=0
+  const double rhob = rho / rho_bkgd;
+  const double denom = 1.0 / rho_bkgd;
+
+  double dG;
+  const double G = meam_detail::dG_gam(gamma, p.ibar, p.gsmooth, dG);
+  e.dgamma1 = (G - 2.0 * dG * gamma) * denom;
+  e.dgamma2 = (d.rho0 != 0.0) ? (dG / d.rho0) * denom : 0.0;
+  e.dgamma3 = 0.0;  // mix_ref_t=0
+
+  e.F = meam_detail::embedding(p.A, p.Ec, rhob, p.emb_lin_neg, e.frhop);
+  e.gamma = gamma;
+  e.rho0 = d.rho0;
+  e.rho1 = rho1;
+  e.rho2 = rho2;
+  e.rho3 = rho3;
+  e.t_ave[0] = t_ave[0];
+  e.t_ave[1] = t_ave[1];
+  e.t_ave[2] = t_ave[2];
+  return e;
+}
+
+// ----------------------------------------------------------------------------------------
 // The energy driver: E = Σ_i F(ρ̄_i) + Σ_{pairs} φ(r_ij)·S_ij  (LAMMPS adds φ·sij once per
 // directed half-list neighbour ⇒ once per undirected pair; the per-atom ½ is internal).
 // ----------------------------------------------------------------------------------------
@@ -547,6 +793,308 @@ inline MeamAccum meam_energy(const AtomSoA<Real>& a, const PairGeom& geom, const
   if (std::sqrt(acc.min_r2) <= r_zbl)
     throw std::runtime_error("meam_energy: a pair is inside the ZBL blend region — deferred");
 
+  acc.pe = acc.pe_embed + acc.pe_pair;
+  return acc;
+}
+
+// ----------------------------------------------------------------------------------------
+// Me2 — THE ANALYTIC FORCE (FP64 SCATTER oracle). Mirrors meam_force.cpp over all centers i:
+//   • per directed half-list bond i→j (owner i<j): the embedding+pair force, symmetric write
+//     f[i]+=forcem, f[j]-=forcem (q(j)=−q(i)).
+//   • the screening k-loop (FULL list, fires only for partial 0<sij<1 — dead on the diamond):
+//     the dscrfcn/dCfunc2/k-scatter to f[i],f[j],f[k] (the needs_transpose non-symmetric write).
+// Reads per-atom prereqs from a preceding dens pass (densities + MeamEmbedDeriv). The returned
+// MeamAccum.pe == meam_energy (the FD-of-energy comparand). drop_class>0 = POISON (skip the
+// screening k-term whose center-straddle matches — the MB2 teeth). CONTRACT: tolerance <1e-9.
+// ----------------------------------------------------------------------------------------
+template <typename Real>
+inline MeamAccum meam_direct_fp64(AtomSoA<Real>& a, const PairGeom& geom, const MeamParams& p,
+                                  bool with_forces = true, int drop_class = 0) {
+  const auto nbr = meam_build_nbr(a, geom);
+  std::vector<MeamDensity> dens(a.n);
+  MeamAccum acc;
+
+  // -------- Pass 1: screening + partial densities (gather per owner over the full list) -------
+  // Cache the i-owned screening (scrfcn,fcpair,dscrfcn) for every directed bond i→j; the force
+  // pass + the k-loop read scrfcn[i][jn] = the i-centred radial screening derivative.
+  std::vector<std::vector<MeamScreenD>> scr(a.n);
+  for (int i = 0; i < a.n; ++i) {
+    scr[i].resize(nbr[i].size());
+    for (size_t jn = 0; jn < nbr[i].size(); ++jn) {
+      const auto& ej = nbr[i][jn];
+      acc.min_r2 = std::min(acc.min_r2, ej.r2);
+      const MeamScreenD s = meam_getscreen_d(ej, nbr[i], p);
+      scr[i][jn] = s;
+      const double sij = s.scrfcn * s.fcpair;
+      if (i < ej.j) {
+        if (s.scrfcn == 0.0) ++acc.n_screened_zero;
+        else if (s.scrfcn > 0.0 && s.scrfcn < 1.0) ++acc.n_screened_partial;
+      }
+      if (std::fabs(sij) < 1e-20) continue;
+      meam_calc_rho1(dens[i], ej, sij, p);
+    }
+  }
+
+  // -------- Pass 2: per-atom embedding F + the stored derivatives ------------------------------
+  std::vector<MeamEmbedDeriv> ed(a.n);
+  for (int i = 0; i < a.n; ++i) {
+    ed[i] = meam_dens_final_deriv(dens[i], p);
+    acc.pe_embed += ed[i].F;
+  }
+
+  // -------- Pass 3: the FORCE (per directed half-list bond, owner i<j) -------------------------
+  for (int i = 0; i < a.n; ++i) {
+    for (size_t jn = 0; jn < nbr[i].size(); ++jn) {
+      const auto& ej = nbr[i][jn];
+      const int j = ej.j;
+      const double scrfcn_ij = scr[i][jn].scrfcn;
+      const double dscrfcn_ij = scr[i][jn].dscrfcn;
+      if (std::fabs(scrfcn_ij) < 1e-20) continue;          // iszero(scrfcn) ⇒ skip bond
+      const double sij0 = scrfcn_ij * scr[i][jn].fcpair;   // sij == scrfcn·fcpair
+      const double rij2 = ej.r2, rij = ej.r;
+      const double recip = 1.0 / rij;
+      const double rij3 = rij * rij2;
+      // delij[m] = x_j − x_i (LAMMPS convention; == ej.dx/dy/dz min-imaged)
+      const double delij[3] = {ej.dx, ej.dy, ej.dz};
+
+      // The pair energy contribution belongs to this bond once (LAMMPS adds φ·sij once per
+      // directed neighbour ⇒ once per undirected pair; we own it at i<j).
+      const double phi = p.phi_spline(rij);
+      const double phip = p.phip_spline(rij);
+      if (i < j) acc.pe_pair += phi * sij0;
+
+      // Only the owner (i<j) writes the symmetric pair force + runs the k-loop (each pair once).
+      if (i >= j) continue;
+      if (!with_forces) continue;
+
+      // ---- pair densities + radial derivatives (single Si: elti==eltj ⇒ j-copy = i-form) ----
+      const double invre = 1.0 / p.re;
+      const double ai = rij * invre - 1.0;
+      const double ro0 = p.rho0;
+      const double rhoa0j = ro0 * std::exp(-p.beta0 * ai), drhoa0j = -p.beta0 * invre * rhoa0j;
+      const double rhoa1j = ro0 * std::exp(-p.beta1 * ai), drhoa1j = -p.beta1 * invre * rhoa1j;
+      const double rhoa2j = ro0 * std::exp(-p.beta2 * ai), drhoa2j = -p.beta2 * invre * rhoa2j;
+      const double rhoa3j = ro0 * std::exp(-p.beta3 * ai), drhoa3j = -p.beta3 * invre * rhoa3j;
+      const double rhoa0i = rhoa0j, drhoa0i = drhoa0j;     // elti==eltj
+      const double rhoa1i = rhoa1j, drhoa1i = drhoa1j;
+      const double rhoa2i = rhoa2j, drhoa2i = drhoa2j;
+      const double rhoa3i = rhoa3j, drhoa3i = drhoa3j;
+      // (ialloy=0 ⇒ NO rhoa*·=t* multiply)
+
+      const double t1mi = p.t1_eff, t2mi = p.t2, t3mi = p.t3;  // augmented t1 (=2.82), NOT 3.30
+      const double t1mj = p.t1_eff, t2mj = p.t2, t3mj = p.t3;
+
+      const MeamDensity& di = dens[i];
+      const MeamDensity& dj = dens[j];
+
+      // directional contractions (meam_force.cpp:227-244)
+      double arg1i1 = 0, arg1j1 = 0, arg1i2 = 0, arg1j2 = 0;
+      double arg1i3 = 0, arg1j3 = 0, arg3i3 = 0, arg3j3 = 0;
+      {
+        int nv2 = 0, nv3 = 0;
+        for (int n = 0; n < 3; ++n) {
+          for (int pp = n; pp < 3; ++pp) {
+            for (int q = pp; q < 3; ++q) {
+              const double arg = delij[n] * delij[pp] * delij[q] * p.v3D[nv3];
+              arg1i3 += di.arho3[nv3] * arg;
+              arg1j3 -= dj.arho3[nv3] * arg;
+              ++nv3;
+            }
+            const double arg = delij[n] * delij[pp] * p.v2D[nv2];
+            arg1i2 += di.arho2[nv2] * arg;
+            arg1j2 += dj.arho2[nv2] * arg;
+            ++nv2;
+          }
+          arg1i1 += di.arho1[n] * delij[n];
+          arg1j1 -= dj.arho1[n] * delij[n];
+          arg3i3 += di.arho3b[n] * delij[n];
+          arg3j3 -= dj.arho3b[n] * delij[n];
+        }
+      }
+
+      // rho0 (meam_force.cpp:280)
+      const double drho0dr1 = drhoa0j * sij0;
+      const double drho0dr2 = drhoa0i * sij0;
+
+      // rho1 (:284-291)
+      double a1 = 2.0 * sij0 / rij;
+      const double drho1dr1 = a1 * (drhoa1j - rhoa1j / rij) * arg1i1;
+      const double drho1dr2 = a1 * (drhoa1i - rhoa1i / rij) * arg1j1;
+      a1 = 2.0 * sij0 / rij;
+      double drho1drm1[3], drho1drm2[3];
+      for (int m = 0; m < 3; ++m) {
+        drho1drm1[m] = a1 * rhoa1j * di.arho1[m];
+        drho1drm2[m] = -a1 * rhoa1i * dj.arho1[m];
+      }
+
+      // rho2 (:294-307)
+      double a2 = 2.0 * sij0 / rij2;
+      const double drho2dr1 =
+          a2 * (drhoa2j - 2.0 * rhoa2j / rij) * arg1i2 - 2.0 / 3.0 * di.arho2b * drhoa2j * sij0;
+      const double drho2dr2 =
+          a2 * (drhoa2i - 2.0 * rhoa2i / rij) * arg1j2 - 2.0 / 3.0 * dj.arho2b * drhoa2i * sij0;
+      a2 = 4.0 * sij0 / rij2;
+      double drho2drm1[3], drho2drm2[3];
+      for (int m = 0; m < 3; ++m) {
+        double s1 = 0.0, s2 = 0.0;
+        for (int n = 0; n < 3; ++n) {
+          s1 += di.arho2[p.vind2D[m][n]] * delij[n];
+          s2 -= dj.arho2[p.vind2D[m][n]] * delij[n];
+        }
+        drho2drm1[m] = a2 * rhoa2j * s1;
+        drho2drm2[m] = -a2 * rhoa2i * s2;
+      }
+
+      // rho3 (:310-331)
+      double a3 = 2.0 * sij0 / rij3;
+      double a3a = 6.0 / 5.0 * sij0 / rij;
+      const double drho3dr1 =
+          a3 * (drhoa3j - 3.0 * rhoa3j / rij) * arg1i3 - a3a * (drhoa3j - rhoa3j / rij) * arg3i3;
+      const double drho3dr2 =
+          a3 * (drhoa3i - 3.0 * rhoa3i / rij) * arg1j3 - a3a * (drhoa3i - rhoa3i / rij) * arg3j3;
+      a3 = 6.0 * sij0 / rij3;
+      a3a = 6.0 * sij0 / (5.0 * rij);
+      double drho3drm1[3], drho3drm2[3];
+      for (int m = 0; m < 3; ++m) {
+        double s1 = 0.0, s2 = 0.0;
+        int nv2 = 0;
+        for (int n = 0; n < 3; ++n)
+          for (int pp = n; pp < 3; ++pp) {
+            const double arg = delij[n] * delij[pp] * p.v2D[nv2];
+            s1 += di.arho3[p.vind3D[m][n][pp]] * arg;
+            s2 += dj.arho3[p.vind3D[m][n][pp]] * arg;
+            ++nv2;
+          }
+        drho3drm1[m] = (a3 * s1 - a3a * di.arho3b[m]) * rhoa3j;
+        drho3drm2[m] = (-a3 * s2 + a3a * dj.arho3b[m]) * rhoa3i;
+      }
+
+      // t-average derivatives (ialloy=0 else branch, :451-466) — BARE subtraction
+      const double t1i = ed[i].t_ave[0], t2i = ed[i].t_ave[1], t3i = ed[i].t_ave[2];
+      const double t1j = ed[j].t_ave[0], t2j = ed[j].t_ave[1], t3j = ed[j].t_ave[2];
+      const double aif = (ed[i].rho0 != 0.0) ? drhoa0j * sij0 / ed[i].rho0 : 0.0;
+      const double ajf = (ed[j].rho0 != 0.0) ? drhoa0i * sij0 / ed[j].rho0 : 0.0;
+      const double dt1dr1 = aif * (t1mj - t1i), dt1dr2 = ajf * (t1mi - t1j);
+      const double dt2dr1 = aif * (t2mj - t2i), dt2dr2 = ajf * (t2mi - t2j);
+      const double dt3dr1 = aif * (t3mj - t3i), dt3dr2 = ajf * (t3mi - t3j);
+
+      // shape factors (single Si DIA) — shpi==shpj==p.shp
+      const double* shpi = p.shp;
+      const double* shpj = p.shp;
+
+      // total density radial derivative (:497-510) — dgamma3 term DEAD (=0), replicated verbatim
+      const double drhodr1 =
+          ed[i].dgamma1 * drho0dr1 +
+          ed[i].dgamma2 * (dt1dr1 * ed[i].rho1 + t1i * drho1dr1 + dt2dr1 * ed[i].rho2 +
+                           t2i * drho2dr1 + dt3dr1 * ed[i].rho3 + t3i * drho3dr1) -
+          ed[i].dgamma3 * (shpi[0] * dt1dr1 + shpi[1] * dt2dr1 + shpi[2] * dt3dr1);
+      const double drhodr2 =
+          ed[j].dgamma1 * drho0dr2 +
+          ed[j].dgamma2 * (dt1dr2 * ed[j].rho1 + t1j * drho1dr2 + dt2dr2 * ed[j].rho2 +
+                           t2j * drho2dr2 + dt3dr2 * ed[j].rho3 + t3j * drho3dr2) -
+          ed[j].dgamma3 * (shpj[0] * dt1dr2 + shpj[1] * dt2dr2 + shpj[2] * dt3dr2);
+      double drhodrm1[3], drhodrm2[3];
+      for (int m = 0; m < 3; ++m) {
+        drhodrm1[m] = ed[i].dgamma2 *
+                      (t1i * drho1drm1[m] + t2i * drho2drm1[m] + t3i * drho3drm1[m]);
+        drhodrm2[m] = ed[j].dgamma2 *
+                      (t1j * drho1drm2[m] + t2j * drho2drm2[m] + t3j * drho3drm2[m]);
+      }
+
+      // sij derivatives (drhods1/2) — only if dscrfcn != 0 (partial; dead on the diamond)
+      double drhods1 = 0.0, drhods2 = 0.0;
+      const bool screen_active = std::fabs(dscrfcn_ij) > 1e-20;
+      if (screen_active) {
+        const double drho0ds1 = rhoa0j, drho0ds2 = rhoa0i;
+        const double b1 = 2.0 / rij, b2 = 2.0 / rij2, b3 = 2.0 / rij3, b3a = 6.0 / (5.0 * rij);
+        const double drho1ds1 = b1 * rhoa1j * arg1i1;
+        const double drho1ds2 = b1 * rhoa1i * arg1j1;
+        const double drho2ds1 = b2 * rhoa2j * arg1i2 - 2.0 / 3.0 * di.arho2b * rhoa2j;
+        const double drho2ds2 = b2 * rhoa2i * arg1j2 - 2.0 / 3.0 * dj.arho2b * rhoa2i;
+        const double drho3ds1 = b3 * rhoa3j * arg1i3 - b3a * rhoa3j * arg3i3;
+        const double drho3ds2 = b3 * rhoa3i * arg1j3 - b3a * rhoa3i * arg3j3;
+        // ai/aj for sij derivatives use rhoa0j/rho0[i] (NO sij factor, :586-589)
+        const double ais = (ed[i].rho0 != 0.0) ? rhoa0j / ed[i].rho0 : 0.0;
+        const double ajs = (ed[j].rho0 != 0.0) ? rhoa0i / ed[j].rho0 : 0.0;
+        const double dt1ds1b = ais * (t1mj - t1i), dt1ds2b = ajs * (t1mi - t1j);
+        const double dt2ds1b = ais * (t2mj - t2i), dt2ds2b = ajs * (t2mi - t2j);
+        const double dt3ds1b = ais * (t3mj - t3i), dt3ds2b = ajs * (t3mi - t3j);
+        drhods1 =
+            ed[i].dgamma1 * drho0ds1 +
+            ed[i].dgamma2 * (dt1ds1b * ed[i].rho1 + t1i * drho1ds1 + dt2ds1b * ed[i].rho2 +
+                             t2i * drho2ds1 + dt3ds1b * ed[i].rho3 + t3i * drho3ds1) -
+            ed[i].dgamma3 * (shpi[0] * dt1ds1b + shpi[1] * dt2ds1b + shpi[2] * dt3ds1b);
+        drhods2 =
+            ed[j].dgamma1 * drho0ds2 +
+            ed[j].dgamma2 * (dt1ds2b * ed[j].rho1 + t1j * drho1ds2 + dt2ds2b * ed[j].rho2 +
+                             t2j * drho2ds2 + dt3ds2b * ed[j].rho3 + t3j * drho3ds2) -
+            ed[j].dgamma3 * (shpj[0] * dt1ds2b + shpj[1] * dt2ds2b + shpj[2] * dt3ds2b);
+      }
+
+      // energy derivatives (:613-637)
+      const double dUdrij = phip * sij0 + ed[i].frhop * drhodr1 + ed[j].frhop * drhodr2;
+      double dUdsij = 0.0;
+      if (screen_active) dUdsij = phi + ed[i].frhop * drhods1 + ed[j].frhop * drhods2;
+      double dUdrijm[3];
+      for (int m = 0; m < 3; ++m)
+        dUdrijm[m] = ed[i].frhop * drhodrm1[m] + ed[j].frhop * drhodrm2[m];
+      // scaleij == 1 (single element) ⇒ no scale multiply
+
+      const double force = dUdrij * recip + dUdsij * dscrfcn_ij;
+      for (int m = 0; m < 3; ++m) {
+        const double forcem = delij[m] * force + dUdrijm[m];
+        if (m == 0) { a.fx[i] += forcem; a.fx[j] -= forcem; }
+        else if (m == 1) { a.fy[i] += forcem; a.fy[j] -= forcem; }
+        else { a.fz[i] += forcem; a.fz[j] -= forcem; }
+      }
+
+      // ---- the screening 3rd-atom k-loop (FULL list; fires only for partial 0<sij<1) ----
+      if (std::fabs(sij0) < 1e-20 || std::fabs(sij0 - 1.0) < 1e-20) continue;  // binary-S re-gate
+      // POISON (drop_class>0): drop the screening k-scatter entirely — the MB2 enumeration teeth.
+      // atom-k's force collapses to ~0 ⇒ diverges from the golden, proving this loop is load-bearing.
+      if (drop_class > 0) continue;
+      const double delc = p.Cmax - p.Cmin;
+      const double rbound = rij2 * p.ebound;
+      for (size_t kn = 0; kn < nbr[i].size(); ++kn) {
+        const auto& ek = nbr[i][kn];
+        const int k = ek.j;
+        if (k == j) continue;
+        // k-relative vectors (meam_force.cpp:689-696): d_jk = x_k − x_j, d_ik = x_k − x_i.
+        // From i's frame: ek.d* = x_k − x_i (== d_ik); d_jk = (x_k−x_i) − (x_j−x_i) = ek.d − ej.d.
+        const double dxik = ek.dx, dyik = ek.dy, dzik = ek.dz;
+        const double dxjk = ek.dx - ej.dx, dyjk = ek.dy - ej.dy, dzjk = ek.dz - ej.dz;
+        const double rjk2 = dxjk * dxjk + dyjk * dyjk + dzjk * dzjk;
+        if (rjk2 > rbound) continue;
+        const double rik2 = dxik * dxik + dyik * dyik + dzik * dzik;
+        if (rik2 > rbound) continue;
+        const double xik = rik2 / rij2, xjk = rjk2 / rij2;
+        const double aa = 1.0 - (xik - xjk) * (xik - xjk);
+        if (std::fabs(aa) < 1e-20) continue;  // iszero(a)
+        double cikj = (2.0 * (xik + xjk) + aa - 2.0) / aa;
+        if (!(cikj >= p.Cmin && cikj <= p.Cmax)) continue;
+        cikj = (cikj - p.Cmin) / delc;
+        double dfc;
+        const double sikj = meam_detail::dfcut(cikj, dfc);
+        double dCikj1, dCikj2;
+        meam_detail::dCfunc2(rij2, rik2, rjk2, dCikj1, dCikj2);
+        const double aw = sij0 / delc * dfc / sikj;
+        const double dsij1 = aw * dCikj1;
+        const double dsij2 = aw * dCikj2;
+        if (std::fabs(dsij1) < 1e-20 && std::fabs(dsij2) < 1e-20) continue;
+        const double force1 = dUdsij * dsij1;
+        const double force2 = dUdsij * dsij2;
+        a.fx[i] += force1 * dxik; a.fy[i] += force1 * dyik; a.fz[i] += force1 * dzik;
+        a.fx[j] += force2 * dxjk; a.fy[j] += force2 * dyjk; a.fz[j] += force2 * dzjk;
+        a.fx[k] -= force1 * dxik + force2 * dxjk;
+        a.fy[k] -= force1 * dyik + force2 * dyjk;
+        a.fz[k] -= force1 * dzik + force2 * dzjk;
+      }
+    }
+  }
+
+  const double r_zbl = p.re * (1.0 - 1.0 / p.alpha);
+  if (std::sqrt(acc.min_r2) <= r_zbl)
+    throw std::runtime_error("meam_direct_fp64: a pair is inside the ZBL blend region — deferred");
   acc.pe = acc.pe_embed + acc.pe_pair;
   return acc;
 }
@@ -635,6 +1183,297 @@ inline MeamAccum meam_run_fixed(const AtomSoA<Real>& a, const PairGeom& geom, co
   acc.pe_embed = pe_embed.value();
   acc.pe_pair = pe_pair.value();
   acc.pe = acc.pe_embed + acc.pe_pair;
+  return acc;
+}
+
+// ----------------------------------------------------------------------------------------
+// Me2 — the int64 Q24.40 FORCE (G-B1 witness, order-free under atom relabeling). Same analytic
+// chain as meam_direct_fp64, but every f_i/f_j/f_k component is QUANTIZED + integer-summed
+// (core::fixed::ForceAccum) ⇒ the per-atom force is bitwise-invariant to the j/k accumulation
+// order (B1/INV-9). The densities + embedding derivatives are FP64 functions of the order-free
+// int64 densities (exactly as meam_run_fixed's energy). This is the LAMMPS-golden comparand
+// (the value-algebra witness). drop_class>0 = POISON (the screening k-loop dropped).
+// ----------------------------------------------------------------------------------------
+template <typename Real>
+inline MeamAccum meam_run_fixed_force(AtomSoA<Real>& a, const PairGeom& geom, const MeamParams& p,
+                                      int drop_class = 0) {
+  const auto nbr = meam_build_nbr(a, geom);
+  std::vector<MeamDensity> dens(a.n);
+  std::vector<std::vector<MeamScreenD>> scr(a.n);
+  MeamAccum acc;
+
+  // Pass 1 — int64 densities (order-free) + cached i-owned screening.
+  struct FixedDens {
+    core::fixed::ForceAccum rho0, arho2b;
+    core::fixed::ForceAccum arho1[3], arho2[6], arho3[10], arho3b[3], t_ave[3];
+  };
+  std::vector<FixedDens> fd(a.n);
+  for (int i = 0; i < a.n; ++i) {
+    scr[i].resize(nbr[i].size());
+    for (size_t jn = 0; jn < nbr[i].size(); ++jn) {
+      const auto& ej = nbr[i][jn];
+      acc.min_r2 = std::min(acc.min_r2, ej.r2);
+      const MeamScreenD s = meam_getscreen_d(ej, nbr[i], p);
+      scr[i][jn] = s;
+      const double sij = s.scrfcn * s.fcpair;
+      if (i < ej.j) {
+        if (s.scrfcn == 0.0) ++acc.n_screened_zero;
+        else if (s.scrfcn > 0.0 && s.scrfcn < 1.0) ++acc.n_screened_partial;
+      }
+      if (std::fabs(sij) < 1e-20) continue;
+      const double rij2 = ej.r2, rij = ej.r;
+      const double aj = rij / p.re - 1.0, ro0 = p.rho0;
+      const double rhoa0j = ro0 * std::exp(-p.beta0 * aj) * sij;
+      const double rhoa1j = ro0 * std::exp(-p.beta1 * aj) * sij;
+      const double rhoa2j = ro0 * std::exp(-p.beta2 * aj) * sij;
+      const double rhoa3j = ro0 * std::exp(-p.beta3 * aj) * sij;
+      fd[i].rho0.add(rhoa0j);
+      fd[i].t_ave[0].add(p.t1_eff * rhoa0j);
+      fd[i].t_ave[1].add(p.t2 * rhoa0j);
+      fd[i].t_ave[2].add(p.t3 * rhoa0j);
+      fd[i].arho2b.add(rhoa2j);
+      const double A1j = rhoa1j / rij, A2j = rhoa2j / rij2, A3j = rhoa3j / (rij2 * rij);
+      const double del[3] = {ej.dx, ej.dy, ej.dz};
+      int nv2 = 0, nv3 = 0;
+      for (int m = 0; m < 3; ++m) {
+        fd[i].arho1[m].add(A1j * del[m]);
+        fd[i].arho3b[m].add(rhoa3j * del[m] / rij);
+        for (int n = m; n < 3; ++n) {
+          fd[i].arho2[nv2].add(A2j * del[m] * del[n]);
+          ++nv2;
+          for (int pp = n; pp < 3; ++pp) {
+            fd[i].arho3[nv3].add(A3j * del[m] * del[n] * del[pp]);
+            ++nv3;
+          }
+        }
+      }
+    }
+  }
+
+  // Decode order-free densities + embedding derivatives.
+  std::vector<MeamEmbedDeriv> ed(a.n);
+  core::fixed::EnergyAccum pe_embed, pe_pair;
+  for (int i = 0; i < a.n; ++i) {
+    MeamDensity& d = dens[i];
+    d.rho0 = fd[i].rho0.value();
+    d.arho2b = fd[i].arho2b.value();
+    for (int m = 0; m < 3; ++m) {
+      d.arho1[m] = fd[i].arho1[m].value();
+      d.arho3b[m] = fd[i].arho3b[m].value();
+      d.t_ave[m] = fd[i].t_ave[m].value();
+    }
+    for (int m = 0; m < 6; ++m) d.arho2[m] = fd[i].arho2[m].value();
+    for (int m = 0; m < 10; ++m) d.arho3[m] = fd[i].arho3[m].value();
+    ed[i] = meam_dens_final_deriv(d, p);
+    pe_embed.add(ed[i].F);
+  }
+
+  // Pass 2 — the FORCE scatter into per-atom int64 accumulators (order-free, B1).
+  std::vector<core::fixed::ForceAccum> ffx(a.n), ffy(a.n), ffz(a.n);
+  for (int i = 0; i < a.n; ++i) {
+    for (size_t jn = 0; jn < nbr[i].size(); ++jn) {
+      const auto& ej = nbr[i][jn];
+      const int j = ej.j;
+      const double scrfcn_ij = scr[i][jn].scrfcn, dscrfcn_ij = scr[i][jn].dscrfcn;
+      if (std::fabs(scrfcn_ij) < 1e-20) continue;
+      const double sij0 = scrfcn_ij * scr[i][jn].fcpair;
+      const double rij2 = ej.r2, rij = ej.r, recip = 1.0 / rij, rij3 = rij * rij2;
+      const double delij[3] = {ej.dx, ej.dy, ej.dz};
+      const double phi = p.phi_spline(rij), phip = p.phip_spline(rij);
+      if (i < j) pe_pair.add(phi * sij0);
+      if (i >= j) continue;
+
+      const double invre = 1.0 / p.re, ai = rij * invre - 1.0, ro0 = p.rho0;
+      const double rhoa0j = ro0 * std::exp(-p.beta0 * ai), drhoa0j = -p.beta0 * invre * rhoa0j;
+      const double rhoa1j = ro0 * std::exp(-p.beta1 * ai), drhoa1j = -p.beta1 * invre * rhoa1j;
+      const double rhoa2j = ro0 * std::exp(-p.beta2 * ai), drhoa2j = -p.beta2 * invre * rhoa2j;
+      const double rhoa3j = ro0 * std::exp(-p.beta3 * ai), drhoa3j = -p.beta3 * invre * rhoa3j;
+      const double rhoa0i = rhoa0j, drhoa0i = drhoa0j, rhoa1i = rhoa1j, drhoa1i = drhoa1j;
+      const double rhoa2i = rhoa2j, drhoa2i = drhoa2j, rhoa3i = rhoa3j, drhoa3i = drhoa3j;
+      const double t1mi = p.t1_eff, t2mi = p.t2, t3mi = p.t3;
+      const double t1mj = p.t1_eff, t2mj = p.t2, t3mj = p.t3;
+      const MeamDensity &di = dens[i], &dj = dens[j];
+
+      double arg1i1 = 0, arg1j1 = 0, arg1i2 = 0, arg1j2 = 0;
+      double arg1i3 = 0, arg1j3 = 0, arg3i3 = 0, arg3j3 = 0;
+      {
+        int nv2 = 0, nv3 = 0;
+        for (int n = 0; n < 3; ++n) {
+          for (int pp = n; pp < 3; ++pp) {
+            for (int q = pp; q < 3; ++q) {
+              const double arg = delij[n] * delij[pp] * delij[q] * p.v3D[nv3];
+              arg1i3 += di.arho3[nv3] * arg; arg1j3 -= dj.arho3[nv3] * arg; ++nv3;
+            }
+            const double arg = delij[n] * delij[pp] * p.v2D[nv2];
+            arg1i2 += di.arho2[nv2] * arg; arg1j2 += dj.arho2[nv2] * arg; ++nv2;
+          }
+          arg1i1 += di.arho1[n] * delij[n]; arg1j1 -= dj.arho1[n] * delij[n];
+          arg3i3 += di.arho3b[n] * delij[n]; arg3j3 -= dj.arho3b[n] * delij[n];
+        }
+      }
+
+      const double drho0dr1 = drhoa0j * sij0, drho0dr2 = drhoa0i * sij0;
+      double a1 = 2.0 * sij0 / rij;
+      const double drho1dr1 = a1 * (drhoa1j - rhoa1j / rij) * arg1i1;
+      const double drho1dr2 = a1 * (drhoa1i - rhoa1i / rij) * arg1j1;
+      double drho1drm1[3], drho1drm2[3];
+      for (int m = 0; m < 3; ++m) {
+        drho1drm1[m] = a1 * rhoa1j * di.arho1[m];
+        drho1drm2[m] = -a1 * rhoa1i * dj.arho1[m];
+      }
+      double a2 = 2.0 * sij0 / rij2;
+      const double drho2dr1 =
+          a2 * (drhoa2j - 2.0 * rhoa2j / rij) * arg1i2 - 2.0 / 3.0 * di.arho2b * drhoa2j * sij0;
+      const double drho2dr2 =
+          a2 * (drhoa2i - 2.0 * rhoa2i / rij) * arg1j2 - 2.0 / 3.0 * dj.arho2b * drhoa2i * sij0;
+      a2 = 4.0 * sij0 / rij2;
+      double drho2drm1[3], drho2drm2[3];
+      for (int m = 0; m < 3; ++m) {
+        double s1 = 0.0, s2 = 0.0;
+        for (int n = 0; n < 3; ++n) {
+          s1 += di.arho2[p.vind2D[m][n]] * delij[n];
+          s2 -= dj.arho2[p.vind2D[m][n]] * delij[n];
+        }
+        drho2drm1[m] = a2 * rhoa2j * s1;
+        drho2drm2[m] = -a2 * rhoa2i * s2;
+      }
+      double a3 = 2.0 * sij0 / rij3, a3a = 6.0 / 5.0 * sij0 / rij;
+      const double drho3dr1 =
+          a3 * (drhoa3j - 3.0 * rhoa3j / rij) * arg1i3 - a3a * (drhoa3j - rhoa3j / rij) * arg3i3;
+      const double drho3dr2 =
+          a3 * (drhoa3i - 3.0 * rhoa3i / rij) * arg1j3 - a3a * (drhoa3i - rhoa3i / rij) * arg3j3;
+      a3 = 6.0 * sij0 / rij3;
+      a3a = 6.0 * sij0 / (5.0 * rij);
+      double drho3drm1[3], drho3drm2[3];
+      for (int m = 0; m < 3; ++m) {
+        double s1 = 0.0, s2 = 0.0;
+        int nv2 = 0;
+        for (int n = 0; n < 3; ++n)
+          for (int pp = n; pp < 3; ++pp) {
+            const double arg = delij[n] * delij[pp] * p.v2D[nv2];
+            s1 += di.arho3[p.vind3D[m][n][pp]] * arg;
+            s2 += dj.arho3[p.vind3D[m][n][pp]] * arg;
+            ++nv2;
+          }
+        drho3drm1[m] = (a3 * s1 - a3a * di.arho3b[m]) * rhoa3j;
+        drho3drm2[m] = (-a3 * s2 + a3a * dj.arho3b[m]) * rhoa3i;
+      }
+
+      const double t1i = ed[i].t_ave[0], t2i = ed[i].t_ave[1], t3i = ed[i].t_ave[2];
+      const double t1j = ed[j].t_ave[0], t2j = ed[j].t_ave[1], t3j = ed[j].t_ave[2];
+      const double aif = (ed[i].rho0 != 0.0) ? drhoa0j * sij0 / ed[i].rho0 : 0.0;
+      const double ajf = (ed[j].rho0 != 0.0) ? drhoa0i * sij0 / ed[j].rho0 : 0.0;
+      const double dt1dr1 = aif * (t1mj - t1i), dt1dr2 = ajf * (t1mi - t1j);
+      const double dt2dr1 = aif * (t2mj - t2i), dt2dr2 = ajf * (t2mi - t2j);
+      const double dt3dr1 = aif * (t3mj - t3i), dt3dr2 = ajf * (t3mi - t3j);
+      const double* shp = p.shp;
+
+      const double drhodr1 =
+          ed[i].dgamma1 * drho0dr1 +
+          ed[i].dgamma2 * (dt1dr1 * ed[i].rho1 + t1i * drho1dr1 + dt2dr1 * ed[i].rho2 +
+                           t2i * drho2dr1 + dt3dr1 * ed[i].rho3 + t3i * drho3dr1) -
+          ed[i].dgamma3 * (shp[0] * dt1dr1 + shp[1] * dt2dr1 + shp[2] * dt3dr1);
+      const double drhodr2 =
+          ed[j].dgamma1 * drho0dr2 +
+          ed[j].dgamma2 * (dt1dr2 * ed[j].rho1 + t1j * drho1dr2 + dt2dr2 * ed[j].rho2 +
+                           t2j * drho2dr2 + dt3dr2 * ed[j].rho3 + t3j * drho3dr2) -
+          ed[j].dgamma3 * (shp[0] * dt1dr2 + shp[1] * dt2dr2 + shp[2] * dt3dr2);
+      double drhodrm1[3], drhodrm2[3];
+      for (int m = 0; m < 3; ++m) {
+        drhodrm1[m] = ed[i].dgamma2 *
+                      (t1i * drho1drm1[m] + t2i * drho2drm1[m] + t3i * drho3drm1[m]);
+        drhodrm2[m] = ed[j].dgamma2 *
+                      (t1j * drho1drm2[m] + t2j * drho2drm2[m] + t3j * drho3drm2[m]);
+      }
+
+      double drhods1 = 0.0, drhods2 = 0.0;
+      const bool screen_active = std::fabs(dscrfcn_ij) > 1e-20;
+      if (screen_active) {
+        const double drho0ds1 = rhoa0j, drho0ds2 = rhoa0i;
+        const double b1 = 2.0 / rij, b2 = 2.0 / rij2, b3 = 2.0 / rij3, b3a = 6.0 / (5.0 * rij);
+        const double drho1ds1 = b1 * rhoa1j * arg1i1, drho1ds2 = b1 * rhoa1i * arg1j1;
+        const double drho2ds1 = b2 * rhoa2j * arg1i2 - 2.0 / 3.0 * di.arho2b * rhoa2j;
+        const double drho2ds2 = b2 * rhoa2i * arg1j2 - 2.0 / 3.0 * dj.arho2b * rhoa2i;
+        const double drho3ds1 = b3 * rhoa3j * arg1i3 - b3a * rhoa3j * arg3i3;
+        const double drho3ds2 = b3 * rhoa3i * arg1j3 - b3a * rhoa3i * arg3j3;
+        const double ais = (ed[i].rho0 != 0.0) ? rhoa0j / ed[i].rho0 : 0.0;
+        const double ajs = (ed[j].rho0 != 0.0) ? rhoa0i / ed[j].rho0 : 0.0;
+        const double dt1ds1b = ais * (t1mj - t1i), dt1ds2b = ajs * (t1mi - t1j);
+        const double dt2ds1b = ais * (t2mj - t2i), dt2ds2b = ajs * (t2mi - t2j);
+        const double dt3ds1b = ais * (t3mj - t3i), dt3ds2b = ajs * (t3mi - t3j);
+        drhods1 =
+            ed[i].dgamma1 * drho0ds1 +
+            ed[i].dgamma2 * (dt1ds1b * ed[i].rho1 + t1i * drho1ds1 + dt2ds1b * ed[i].rho2 +
+                             t2i * drho2ds1 + dt3ds1b * ed[i].rho3 + t3i * drho3ds1) -
+            ed[i].dgamma3 * (shp[0] * dt1ds1b + shp[1] * dt2ds1b + shp[2] * dt3ds1b);
+        drhods2 =
+            ed[j].dgamma1 * drho0ds2 +
+            ed[j].dgamma2 * (dt1ds2b * ed[j].rho1 + t1j * drho1ds2 + dt2ds2b * ed[j].rho2 +
+                             t2j * drho2ds2 + dt3ds2b * ed[j].rho3 + t3j * drho3ds2) -
+            ed[j].dgamma3 * (shp[0] * dt1ds2b + shp[1] * dt2ds2b + shp[2] * dt3ds2b);
+      }
+
+      const double dUdrij = phip * sij0 + ed[i].frhop * drhodr1 + ed[j].frhop * drhodr2;
+      double dUdsij = 0.0;
+      if (screen_active) dUdsij = phi + ed[i].frhop * drhods1 + ed[j].frhop * drhods2;
+      double dUdrijm[3];
+      for (int m = 0; m < 3; ++m)
+        dUdrijm[m] = ed[i].frhop * drhodrm1[m] + ed[j].frhop * drhodrm2[m];
+
+      const double force = dUdrij * recip + dUdsij * dscrfcn_ij;
+      const double fm0 = delij[0] * force + dUdrijm[0];
+      const double fm1 = delij[1] * force + dUdrijm[1];
+      const double fm2 = delij[2] * force + dUdrijm[2];
+      ffx[i].add(fm0); ffy[i].add(fm1); ffz[i].add(fm2);
+      ffx[j].add(-fm0); ffy[j].add(-fm1); ffz[j].add(-fm2);
+
+      if (std::fabs(sij0) < 1e-20 || std::fabs(sij0 - 1.0) < 1e-20) continue;
+      if (drop_class > 0) continue;
+      const double delc = p.Cmax - p.Cmin, rbound = rij2 * p.ebound;
+      for (size_t kn = 0; kn < nbr[i].size(); ++kn) {
+        const auto& ek = nbr[i][kn];
+        const int k = ek.j;
+        if (k == j) continue;
+        const double dxik = ek.dx, dyik = ek.dy, dzik = ek.dz;
+        const double dxjk = ek.dx - ej.dx, dyjk = ek.dy - ej.dy, dzjk = ek.dz - ej.dz;
+        const double rjk2 = dxjk * dxjk + dyjk * dyjk + dzjk * dzjk;
+        if (rjk2 > rbound) continue;
+        const double rik2 = dxik * dxik + dyik * dyik + dzik * dzik;
+        if (rik2 > rbound) continue;
+        const double xik = rik2 / rij2, xjk = rjk2 / rij2;
+        const double aa = 1.0 - (xik - xjk) * (xik - xjk);
+        if (std::fabs(aa) < 1e-20) continue;
+        double cikj = (2.0 * (xik + xjk) + aa - 2.0) / aa;
+        if (!(cikj >= p.Cmin && cikj <= p.Cmax)) continue;
+        cikj = (cikj - p.Cmin) / delc;
+        double dfc;
+        const double sikj = meam_detail::dfcut(cikj, dfc);
+        double dCikj1, dCikj2;
+        meam_detail::dCfunc2(rij2, rik2, rjk2, dCikj1, dCikj2);
+        const double aw = sij0 / delc * dfc / sikj;
+        const double dsij1 = aw * dCikj1, dsij2 = aw * dCikj2;
+        if (std::fabs(dsij1) < 1e-20 && std::fabs(dsij2) < 1e-20) continue;
+        const double force1 = dUdsij * dsij1, force2 = dUdsij * dsij2;
+        ffx[i].add(force1 * dxik); ffy[i].add(force1 * dyik); ffz[i].add(force1 * dzik);
+        ffx[j].add(force2 * dxjk); ffy[j].add(force2 * dyjk); ffz[j].add(force2 * dzjk);
+        ffx[k].add(-(force1 * dxik + force2 * dxjk));
+        ffy[k].add(-(force1 * dyik + force2 * dyjk));
+        ffz[k].add(-(force1 * dzik + force2 * dzjk));
+      }
+    }
+  }
+
+  for (int i = 0; i < a.n; ++i) {
+    a.fx[i] = ffx[i].value();
+    a.fy[i] = ffy[i].value();
+    a.fz[i] = ffz[i].value();
+  }
+  acc.pe_embed = pe_embed.value();
+  acc.pe_pair = pe_pair.value();
+  acc.pe = acc.pe_embed + acc.pe_pair;
+  const double r_zbl = p.re * (1.0 - 1.0 / p.alpha);
+  if (std::sqrt(acc.min_r2) <= r_zbl)
+    throw std::runtime_error("meam_run_fixed_force: a pair is inside the ZBL blend region — deferred");
   return acc;
 }
 

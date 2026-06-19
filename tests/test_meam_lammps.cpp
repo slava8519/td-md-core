@@ -7,10 +7,13 @@
 // LAMMPS fm_exp ~1 ulp/op), NOT bitwise — MEASURED here ~3e-13 (std::exp happened to agree).
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <array>
 #include <cmath>
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "tdmd/core/soa.hpp"
 #include "tdmd/core/zones.hpp"
@@ -38,6 +41,29 @@ double load_golden_pe(const std::string& path) {
   }
   return 0.0;
 }
+std::vector<std::array<double, 3>> load_golden_forces(const std::string& path, int n) {
+  std::ifstream in(path); std::string line;
+  std::vector<std::array<double, 3>> f(n + 1, {0, 0, 0});
+  while (std::getline(in, line)) {
+    if (line.empty() || line[0] == '#') continue;
+    std::istringstream ss(line); int id; double fx, fy, fz;
+    if (ss >> id >> fx >> fy >> fz && id >= 1 && id <= n) f[id] = {fx, fy, fz};
+  }
+  return f;
+}
+// the int64 production force path (transitively golden-validated) vs the frozen LAMMPS forces.
+double max_force_err(core::AtomSoA<double>& a, const core::Box& box, const pot::MeamParams& p,
+                     const std::string& fpath) {
+  core::zero_forces(a);
+  pot::meam_run_fixed_force(a, core::PairGeom(box, p.rc), p);
+  const auto g = load_golden_forces(fpath, a.n);
+  double m = 0;
+  for (int i = 0; i < a.n; ++i) {
+    const int id = a.id[i];
+    m = std::max({m, std::fabs(a.fx[i] - g[id][0]), std::fabs(a.fy[i] - g[id][1]), std::fabs(a.fz[i] - g[id][2])});
+  }
+  return m;
+}
 }  // namespace
 
 TEST(MeamLammps, RunZeroEnergyCrossCheck) {
@@ -55,6 +81,10 @@ TEST(MeamLammps, RunZeroEnergyCrossCheck) {
   EXPECT_NEAR(acc.pe, golden, 1e-4) << "MEAM total energy ours=" << acc.pe << " lammps=" << golden;
   // the golden genuinely exercises screening (non-vacuous) — the screened-zero pairs are real.
   EXPECT_GT(acc.n_screened_zero, 0) << "no screened pairs — the golden would not test screening";
+  // Me2 FORCE: the int64 production path vs the frozen LAMMPS forces (the embedding + pair +
+  // density-derivative chains; the screening DERIVATIVE is structurally dead here — binary S).
+  EXPECT_LT(max_force_err(a, box, p, meam_dir() + "meam_si_64.forces"), 1e-9)
+      << "MEAM forces (64-atom diamond) ≠ LAMMPS golden";
 }
 
 // G-SCREEN-PARTIAL ⭐ (acceptance MUST-FIX) — the PARTIAL screening band (0<S<1), the literal MEAM
@@ -76,4 +106,9 @@ TEST(MeamLammps, PartialScreeningClusterMatchesLammps) {
 
   EXPECT_GT(acc.n_screened_partial, 0) << "the 0<S<1 partial band never fired — gate vacuous";
   EXPECT_NEAR(acc.pe, golden, 1e-5) << "partial-screening energy ours=" << acc.pe << " lammps=" << golden;
+  // Me2 FORCE — the SOLE witness of the screening DERIVATIVE (dscrfcn/dCfunc/dCfunc2/the k-loop
+  // 3rd-atom write ∂S/∂x_k). The diamond golden is BLIND to it (binary S ⇒ ∂S=0); here atom-3's
+  // force is PURE ∂S/∂x_k (fy≈+56.16). A dCfunc/dscrfcn sign bug fails here but passes the diamond.
+  EXPECT_LT(max_force_err(a, box, p, meam_dir() + "meam_tri3.forces"), 1e-9)
+      << "MEAM screening-force (3-atom cluster) ≠ LAMMPS golden";
 }

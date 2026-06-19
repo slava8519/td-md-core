@@ -15,7 +15,15 @@ value-algebra witness in Me1.** CI is LAMMPS-free (`Test_MEAM_LAMMPS` reads thes
 - `library.meam` — the LAMMPS global MEAM library (the Si 'dia' entry is the source of the
   hardcoded params); `Si.meam` — the single-element parameter file (`rc=4.0, delr=0.1`; the rest
   default: Cmin=2.0, Cmax=2.8, augt1=1, ialloy=0, ibar=1).
-- `gen_energy.in` — the committed LAMMPS regeneration script.
+- `meam_si_64.forces` — per-atom forces (eV/Å) from `pair_style meam run 0` (Me2). On the diamond
+  the screening DERIVATIVE is structurally dead (binary S ⇒ ∂S=0) ⇒ this golden tests the
+  embedding + pair + density-derivative chains, NOT the screening force.
+- `meam_tri3.data` / `meam_tri3.energy` / `meam_tri3.forces` — a free 3-atom cluster (i–j screened
+  by k, S≈0.50). The SOLE witness of the partial screening (energy, Me1) AND the screening 3rd-atom
+  force ∂S/∂x_k (atom-3 fy = +56.159 eV/Å, fx ≈ 0 — Me2; the diamond golden is BLIND to a
+  dCfunc/dscrfcn sign bug, as a stale-binary acceptance MISS demonstrated).
+- `gen_energy.in` (64-atom energy+forces) / `gen_tri3.in` (cluster energy+forces) — the committed
+  LAMMPS regeneration scripts (place `library.meam` + `Si.meam` in the CWD).
 
 ## Provenance
 - LAMMPS stable 22Jul2025 (MEAM package), `pair_style meam`, `pair_coeff * * library.meam Si
@@ -24,6 +32,12 @@ value-algebra witness in Me1.** CI is LAMMPS-free (`Test_MEAM_LAMMPS` reads thes
   rozero=1.0, ibar=1.
 
 ## Measured agreement (the gate's basis, NOT pre-registered)
+- FORCES (Me2): the int64 production path vs the frozen LAMMPS forces — diamond max|ΔF| = 4e-11,
+  cluster max|ΔF| = 5e-10 (FP64 oracle 3e-13 / 4e-13; atom-3 fy = 56.159245 exact). Gate 1e-9,
+  tolerance not bitwise. The screening-derivative chain (dscrfcn/dCfunc/dCfunc2/the k-loop) is
+  witnessed ONLY by `meam_tri3` — a `dCfunc2` sign error passes the diamond + all other gates and
+  fails ONLY the cluster (the Me2 acceptance found exactly such a sign bug + a stale-binary that
+  masked the red cluster gate; both fixed — always clean-rebuild before a green claim).
 - total PE: ours **−243.388597227171** vs LAMMPS −243.388597227171 (Δ ≈ 3e-13 eV — on this config
   `std::exp`/`std::log` happened to agree with LAMMPS's Cephes `fm_exp` to round-off). The gate is
   kept at 1e-4 for the cross-geometry `std::exp`-vs-`fm_exp` tolerance — NOT a bitwise-to-LAMMPS
