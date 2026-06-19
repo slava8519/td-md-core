@@ -376,6 +376,17 @@ if(TDMD_BUILD_TESTS)
     add_test(NAME Test_CUDA_SW_Ring COMMAND test_cuda_sw_ring)
     set_tests_properties(Test_CUDA_SW_Ring PROPERTIES LABELS cuda)
 
+    add_executable(test_cuda_tersoff tests/test_cuda_tersoff.cu)   # Te5: per-window 4-role kernel
+    target_link_libraries(test_cuda_tersoff PRIVATE tdmd_core GTest::gtest_main tdmd_eam_cuda_flags)
+    add_test(NAME Test_CUDA_Tersoff COMMAND test_cuda_tersoff)
+    set_tests_properties(Test_CUDA_Tersoff PROPERTIES LABELS cuda)
+
+    add_executable(test_cuda_tersoff_ring tests/test_cuda_tersoff_ring.cu)  # Te5: live GPU Tersoff ring
+    target_link_libraries(test_cuda_tersoff_ring PRIVATE tdmd_core GTest::gtest_main
+                          tdmd_eam_cuda_flags Threads::Threads)
+    add_test(NAME Test_CUDA_Tersoff_Ring COMMAND test_cuda_tersoff_ring)
+    set_tests_properties(Test_CUDA_Tersoff_Ring PROPERTIES LABELS cuda)
+
     # M6 E5c: cell-list culled EAM kernels. Test A (bitwise cells == all-window)
     # + Test B (the BLOCKING dropped-donor gate vs eam_direct_fp64). --fmad=false
     # via tdmd_eam_cuda_flags (the f_over_r/Horner fuse would break 1 ULP).
