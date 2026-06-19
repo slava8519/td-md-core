@@ -52,7 +52,7 @@ struct SwAccum {
 };
 
 // --- two-body φ₂(r): value + dφ₂/dr (r < a·σ; caller gates on the cutoff). -------
-inline void sw_phi2(const SwParams& sp, double r, double& phi, double& dphi) {
+TDMD_HOST_DEVICE inline void sw_phi2(const SwParams& sp, double r, double& phi, double& dphi) {
   const double sr = sp.sigma / r;
   const double d = r - sp.a * sp.sigma;          // < 0 inside the cutoff
   const double env = std::exp(sp.sigma / d);     // → 0 as r → (a·σ)⁻
@@ -67,7 +67,7 @@ inline void sw_phi2(const SwParams& sp, double r, double& phi, double& dphi) {
 }
 
 // --- three-body envelope g(r)=exp(γσ/(r−aσ)) + g'(r). ---------------------------
-inline void sw_g(const SwParams& sp, double r, double& g, double& gp) {
+TDMD_HOST_DEVICE inline void sw_g(const SwParams& sp, double r, double& g, double& gp) {
   const double d = r - sp.a * sp.sigma;
   g = std::exp(sp.gamma * sp.sigma / d);
   gp = -sp.gamma * sp.sigma / (d * d) * g;
@@ -87,7 +87,7 @@ struct SwVec3 { double x, y, z; };
 //  G-FD exists to catch — the oracle shares this algebra and is blind to it.)
 // f_k is the contribution the symmetric (q(j)=−q(i)) accumulator has no slot for. No
 // acos anywhere (cosθ from the dot product) — accuracy + determinism asset.
-inline double sw_triplet(const SwParams& sp,
+TDMD_HOST_DEVICE inline double sw_triplet(const SwParams& sp,
                          double rijx, double rijy, double rijz, double rij,
                          double rikx, double riky, double rikz, double rik,
                          SwVec3& fi, SwVec3& fj, SwVec3& fk) {

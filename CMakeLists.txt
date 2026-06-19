@@ -333,6 +333,21 @@ if(TDMD_BUILD_TESTS)
     add_test(NAME Test_CUDA_EAM_Ring COMMAND test_cuda_eam_ring)
     set_tests_properties(Test_CUDA_EAM_Ring PROPERTIES LABELS cuda)
 
+    # SW T5: GPU Stillinger-Weber (the φ3 transpose accumulator). --fmad=false (via
+    # tdmd_eam_cuda_flags) is for GPU-INTERNAL structural determinism + the wing-canonical
+    # operand order — NOT CPU↔GPU bitwise (SW exp/pow diverge from libm; that relation is
+    # TOLERANCE, the Morse situation, not the EAM transcendental-free spline case).
+    add_executable(test_cuda_sw tests/test_cuda_sw.cu)             # per-window kernel
+    target_link_libraries(test_cuda_sw PRIVATE tdmd_core GTest::gtest_main tdmd_eam_cuda_flags)
+    add_test(NAME Test_CUDA_SW COMMAND test_cuda_sw)
+    set_tests_properties(Test_CUDA_SW PROPERTIES LABELS cuda)
+
+    add_executable(test_cuda_sw_ring tests/test_cuda_sw_ring.cu)   # live GPU SW ring (single + z>1)
+    target_link_libraries(test_cuda_sw_ring PRIVATE tdmd_core GTest::gtest_main
+                          tdmd_eam_cuda_flags Threads::Threads)
+    add_test(NAME Test_CUDA_SW_Ring COMMAND test_cuda_sw_ring)
+    set_tests_properties(Test_CUDA_SW_Ring PROPERTIES LABELS cuda)
+
     # M6 E5c: cell-list culled EAM kernels. Test A (bitwise cells == all-window)
     # + Test B (the BLOCKING dropped-donor gate vs eam_direct_fp64). --fmad=false
     # via tdmd_eam_cuda_flags (the f_over_r/Horner fuse would break 1 ULP).
