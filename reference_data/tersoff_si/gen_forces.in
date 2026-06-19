@@ -1,0 +1,12 @@
+units metal
+atom_style atomic
+boundary p p p
+read_data tersoff_si_64.data
+pair_style tersoff
+pair_coeff * * Si.tersoff Si
+run 0
+variable pe equal pe
+print "GOLDEN_PE ${pe}"
+dump d all custom 1 /tmp/ters_gold.dump id fx fy fz
+dump_modify d format float %.16e sort id
+run 0

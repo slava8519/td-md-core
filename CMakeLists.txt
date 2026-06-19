@@ -261,6 +261,14 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_sw_rdf PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_SW_RDF COMMAND test_sw_rdf)
 
+  add_executable(test_tersoff tests/test_tersoff.cpp)     # Te1: bond-order force + FD-of-energy
+  target_link_libraries(test_tersoff PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_Tersoff COMMAND test_tersoff)
+
+  add_executable(test_tersoff_lammps tests/test_tersoff_lammps.cpp)  # Te1: frozen LAMMPS golden
+  target_link_libraries(test_tersoff_lammps PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_Tersoff_LAMMPS COMMAND test_tersoff_lammps)
+
   add_executable(test_eam_zone tests/test_eam_zone.cpp)    # M6 PR-E3: zone EAM (3-zone residence)
   target_link_libraries(test_eam_zone PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_EAM_Zone COMMAND test_eam_zone)
