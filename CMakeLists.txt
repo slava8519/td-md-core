@@ -253,6 +253,14 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_sw_nve PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_SW_NVE COMMAND test_sw_nve)
 
+  add_executable(test_sw_lammps tests/test_sw_lammps.cpp) # SW T7: frozen LAMMPS sw run-0 golden
+  target_link_libraries(test_sw_lammps PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_SW_LAMMPS COMMAND test_sw_lammps)
+
+  add_executable(test_sw_rdf tests/test_sw_rdf.cpp)       # SW T7: statistical RDF vs frozen LAMMPS g(r)
+  target_link_libraries(test_sw_rdf PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_SW_RDF COMMAND test_sw_rdf)
+
   add_executable(test_eam_zone tests/test_eam_zone.cpp)    # M6 PR-E3: zone EAM (3-zone residence)
   target_link_libraries(test_eam_zone PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_EAM_Zone COMMAND test_eam_zone)

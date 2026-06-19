@@ -1,0 +1,25 @@
+# SW RDF golden — regenerate sw_rdf_216.data (equilibrated config + velocities) and
+# sw_rdf_lammps.gr (time-averaged g(r)). Self-contained (builds the lattice in LAMMPS).
+# Prereq (place in CWD): Si.sw (lammps/potentials/Si.sw).  Run: lmp -in gen_rdf.in
+units metal
+atom_style atomic
+boundary p p p
+lattice diamond 5.431                 # diamond-cubic Si, a0 = 5.431 Å
+region box block 0 3 0 3 0 3          # 3×3×3 conventional cells = 216 atoms, box 16.293 Å
+create_box 1 box
+create_atoms 1 box
+mass 1 28.0855
+pair_style sw
+pair_coeff * * Si.sw Si
+velocity all create 600.0 12345 mom yes rot yes
+fix 1 all nvt temp 600 600 0.1
+timestep 0.001
+run 3000                              # equilibrate at 600 K (SOLID Si; melts ~1700 K)
+unfix 1
+reset_timestep 0
+fix 2 all nve                         # NVE — the snapshot's instantaneous T fluctuates
+                                      #   around 600 K (≈676 K at step 1000; not thermostatted)
+compute myrdf all rdf 80 1 1          # 80 bins, type 1-1, cutoff = max pair cutoff = a·σ = 3.7712 Å
+fix 3 all ave/time 5 200 1000 c_myrdf[*] file sw_rdf_lammps.gr mode vector
+run 1000                              # NVE + time-averaged g(r) over 1000 steps
+write_data sw_rdf_216.data nocoeff    # final config WITH velocities (read back for our NVE)
