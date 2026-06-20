@@ -297,6 +297,10 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_meam_zone PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_MEAM_Zone COMMAND test_meam_zone)
 
+  add_executable(test_meam_ring tests/test_meam_ring.cpp)        # Me3b: threaded MeamRing fork + firewall
+  target_link_libraries(test_meam_ring PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_MEAM_Ring COMMAND test_meam_ring)
+
   add_executable(test_eam_zone tests/test_eam_zone.cpp)    # M6 PR-E3: zone EAM (3-zone residence)
   target_link_libraries(test_eam_zone PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_EAM_Zone COMMAND test_eam_zone)
