@@ -289,9 +289,13 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_meam PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_MEAM COMMAND test_meam)
 
-  add_executable(test_meam_lammps tests/test_meam_lammps.cpp)    # Me1: frozen LAMMPS meam run-0 energy golden
+  add_executable(test_meam_lammps tests/test_meam_lammps.cpp)    # Me1/Me2/Me3: frozen LAMMPS goldens (energy+forces)
   target_link_libraries(test_meam_lammps PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_MEAM_LAMMPS COMMAND test_meam_lammps)
+
+  add_executable(test_meam_zone tests/test_meam_zone.cpp)        # Me3: serial zone-MEAM, transpose-replay + screening completeness
+  target_link_libraries(test_meam_zone PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_MEAM_Zone COMMAND test_meam_zone)
 
   add_executable(test_eam_zone tests/test_eam_zone.cpp)    # M6 PR-E3: zone EAM (3-zone residence)
   target_link_libraries(test_eam_zone PRIVATE tdmd_core GTest::gtest_main)

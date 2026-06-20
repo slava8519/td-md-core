@@ -112,3 +112,17 @@ TEST(MeamLammps, PartialScreeningClusterMatchesLammps) {
   EXPECT_LT(max_force_err(a, box, p, meam_dir() + "meam_tri3.forces"), 1e-9)
       << "MEAM screening-force (3-atom cluster) ≠ LAMMPS golden";
 }
+
+// Me3 — the partial-screening SLAB (8 tiled partial-S triples, the zone-MEAM screening-force
+// fixture): the int64 scatter force vs the frozen LAMMPS golden. Transitively validates the zone
+// path (Test_MEAM_Zone proves zone ≡ this scatter bitwise, and ≡ the FP64 oracle).
+TEST(MeamLammps, PartialScreeningSlabForcesMatchLammps) {
+  core::Box box; box.periodic = {true, true, true};
+  core::AtomSoA<double> a;
+  ASSERT_TRUE(io::read_lammps_data(meam_dir() + "partial_slab.data", a, box));
+  pot::MeamParams p;
+  const double pe = pot::meam_energy(a, core::PairGeom(box, p.rc), p).pe;
+  EXPECT_NEAR(pe, load_golden_pe(meam_dir() + "partial_slab.energy"), 1e-4) << "slab PE";
+  EXPECT_LT(max_force_err(a, box, p, meam_dir() + "partial_slab.forces"), 1e-9)
+      << "MEAM partial-screening slab forces ≠ LAMMPS golden";
+}

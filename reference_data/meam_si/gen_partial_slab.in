@@ -1,0 +1,17 @@
+# Regenerate partial_slab.energy + partial_slab.forces — the Me3 screening-completeness fixture:
+# 8 isolated partial-screening (0<S<1) triples, each i→j bond along z straddling a zone boundary so
+# the screening-k lands in the adjacent zone. The SOLE witness that the 3-zone window holds every
+# screening-k of every owned bond (candidate-completeness). Place library.meam + Si.meam in CWD.
+# Run: lmp -in gen_partial_slab.in
+units metal
+atom_style atomic
+boundary p p p
+read_data partial_slab.data
+pair_style meam
+pair_coeff * * library.meam Si Si.meam Si
+run 0
+variable pe equal pe
+print "MEAM_SLAB_PE ${pe}"
+dump d all custom 1 partial_slab.dump id fx fy fz
+dump_modify d format float %.16e sort id
+run 0

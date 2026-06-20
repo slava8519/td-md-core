@@ -22,8 +22,15 @@ value-algebra witness in Me1.** CI is LAMMPS-free (`Test_MEAM_LAMMPS` reads thes
   by k, S≈0.50). The SOLE witness of the partial screening (energy, Me1) AND the screening 3rd-atom
   force ∂S/∂x_k (atom-3 fy = +56.159 eV/Å, fx ≈ 0 — Me2; the diamond golden is BLIND to a
   dCfunc/dscrfcn sign bug, as a stale-binary acceptance MISS demonstrated).
-- `gen_energy.in` (64-atom energy+forces) / `gen_tri3.in` (cluster energy+forces) — the committed
-  LAMMPS regeneration scripts (place `library.meam` + `Si.meam` in the CWD).
+- `partial_slab.data` / `partial_slab.energy` / `partial_slab.forces` — the **zone-MEAM
+  screening fixture** (Me3): 8 partial-screening triples (the `meam_tri3` motif, bond along z, k
+  zone-adjacent) tiled into a 16×16×64 Å periodic z-slab (n_screened_partial=8, no ZBL throw,
+  the top triple straddles the PBC z-seam). The diamond is binary-S ⇒ the screening machinery is
+  exercised ONLY by this slab; `Test_MEAM_Zone` proves zone ≡ the Me2 scatter ≡ the FP64 oracle on
+  it (the candidate-completeness witness — a dropped screening-k diverges). Emitted by
+  `include/tdmd/gen/partial_screen_slab.hpp`; the LAMMPS golden by `gen_partial_slab.in`.
+- `gen_energy.in` (64-atom energy+forces) / `gen_tri3.in` (cluster) / `gen_partial_slab.in` (slab)
+  — the committed LAMMPS regeneration scripts (place `library.meam` + `Si.meam` in the CWD).
 
 ## Provenance
 - LAMMPS stable 22Jul2025 (MEAM package), `pair_style meam`, `pair_coeff * * library.meam Si
