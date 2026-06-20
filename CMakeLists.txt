@@ -305,6 +305,10 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_meam_nve PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_MEAM_NVE COMMAND test_meam_nve)
 
+  add_executable(test_meam_rdf tests/test_meam_rdf.cpp)          # Me7: statistical RDF vs frozen LAMMPS g(r)
+  target_link_libraries(test_meam_rdf PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_MEAM_RDF COMMAND test_meam_rdf)
+
   add_executable(test_eam_zone tests/test_eam_zone.cpp)    # M6 PR-E3: zone EAM (3-zone residence)
   target_link_libraries(test_eam_zone PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_EAM_Zone COMMAND test_eam_zone)

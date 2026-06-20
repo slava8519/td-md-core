@@ -29,8 +29,15 @@ value-algebra witness in Me1.** CI is LAMMPS-free (`Test_MEAM_LAMMPS` reads thes
   exercised ONLY by this slab; `Test_MEAM_Zone` proves zone ≡ the Me2 scatter ≡ the FP64 oracle on
   it (the candidate-completeness witness — a dropped screening-k diverges). Emitted by
   `include/tdmd/gen/partial_screen_slab.hpp`; the LAMMPS golden by `gen_partial_slab.in`.
-- `gen_energy.in` (64-atom energy+forces) / `gen_tri3.in` (cluster) / `gen_partial_slab.in` (slab)
-  — the committed LAMMPS regeneration scripts (place `library.meam` + `Si.meam` in the CWD).
+- `meam_rdf_216.data` / `meam_rdf_lammps.gr` — the **structure (RDF) golden** (Me7): a 216-atom
+  diamond-Si (3×3×3), LAMMPS-equilibrated 600 K NVT then NVE-averaged g(r) over the MEAM cutoff
+  (80 bins, rmax=rc=4.0). `Test_MEAM_RDF` runs our NVE from this config (carrying LAMMPS's 600 K
+  velocities) and cosine-overlaps the time-averaged g(r): measured **0.99993** (nn-peak 7.97 vs
+  8.02). Closes the MEAM suite (forces = Me1/Me2 goldens; structure = here). Teeth: a flat-gas g(r)
+  overlaps < 0.95.
+- `gen_energy.in` (64-atom energy+forces) / `gen_tri3.in` (cluster) / `gen_partial_slab.in` (slab) /
+  `gen_rdf.in` (216-atom RDF) — the committed LAMMPS regeneration scripts (place `library.meam` +
+  `Si.meam` in the CWD).
 
 ## Provenance
 - LAMMPS stable 22Jul2025 (MEAM package), `pair_style meam`, `pair_coeff * * library.meam Si

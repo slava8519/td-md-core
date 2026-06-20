@@ -1,0 +1,23 @@
+# Me7: time-averaged g(r) for MEAM-Si — frozen LAMMPS reference (CI is LAMMPS-free).
+# 216-atom diamond Si (3×3×3), equilibrated 600 K NVT, then NVE-averaged g(r) over the MEAM cutoff.
+units metal
+atom_style atomic
+boundary p p p
+lattice diamond 5.431
+region box block 0 3 0 3 0 3
+create_box 1 box
+create_atoms 1 box
+mass 1 28.0855
+pair_style meam
+pair_coeff * * library.meam Si Si.meam Si
+velocity all create 600.0 12345 mom yes rot yes
+fix 1 all nvt temp 600 600 0.1
+timestep 0.001
+run 3000
+unfix 1
+reset_timestep 0
+fix 2 all nve
+compute myrdf all rdf 80 1 1
+fix 3 all ave/time 5 200 1000 c_myrdf[*] file meam_rdf_lammps.gr mode vector
+run 1000
+write_data meam_rdf_216.data nocoeff
