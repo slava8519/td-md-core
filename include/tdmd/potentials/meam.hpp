@@ -425,6 +425,40 @@ struct MeamParams {
 };
 
 // ----------------------------------------------------------------------------------------
+// Me5 — the POD φ-SPLINE VIEW (device pointers, no std::vector ⇒ NEVER slices). The Me5 kernel
+// reads φ(rij)/φ'(rij) via this view (the spline is transcendental-free — pure Horner + an int
+// knot — so phi_spline/phip_spline are even BITWISE under --fmad=false; the K3 tolerance is from
+// the exp/log/pow in the density/embedding chain, not here). The host uploads the 7 phirar arrays
+// to device pointers; this view carries those + nr + rdrar. Mirrors EamSetflView.
+struct MeamParamsView {
+  const double *phirar = nullptr, *phirar1 = nullptr, *phirar2 = nullptr, *phirar3 = nullptr;
+  const double *phirar4 = nullptr, *phirar5 = nullptr, *phirar6 = nullptr;
+  int nr = 0;
+  double rdrar = 0.0;
+
+  TDMD_HOST_DEVICE double phi_spline(double rij) const {
+    const int nrar = nr;
+    double pp = rij * rdrar;
+    int kk = static_cast<int>(pp);
+    kk = kk < nrar - 2 ? kk : nrar - 2;
+    pp = pp - kk;
+    pp = pp < 1.0 ? pp : 1.0;
+    return ((phirar3[kk] * pp + phirar2[kk]) * pp + phirar1[kk]) * pp + phirar[kk];
+  }
+  TDMD_HOST_DEVICE double phip_spline(double rij) const {
+    const int nrar = nr;
+    double pp = rij * rdrar;
+    int kk = static_cast<int>(pp);
+    kk = kk < nrar - 2 ? kk : nrar - 2;
+    pp = pp - kk;
+    pp = pp < 1.0 ? pp : 1.0;
+    return (phirar6[kk] * pp + phirar5[kk]) * pp + phirar4[kk];
+  }
+};
+static_assert(std::is_trivially_copyable_v<MeamParamsView>,
+              "MeamParamsView must be POD — passed by value into the Me5 kernel (no spline slice)");
+
+// ----------------------------------------------------------------------------------------
 // Neighbour list (per atom i): min-imaged dx = x_j − x_i (LAMMPS convention) + r. Both the
 // half-list (pair energy) and the full k-enumeration (screening) draw from this.
 // ----------------------------------------------------------------------------------------
@@ -523,6 +557,95 @@ inline MeamScreenD meam_getscreen_d(const MeamNbr& ej, const std::vector<MeamNbr
     const double coef1 = sfcij;
     const double coef2 = sij * dfcij / rij;
     dscrfcn = dscrfcn * coef1 - coef2;  // ⭐ the MINUS on coef2 (radial taper); a + is silent on diamond
+  }
+
+  return {sij, fcij, dscrfcn};
+}
+
+// ----------------------------------------------------------------------------------------
+// Me5 — the DEVICE screening core (window arrays, no std::vector). Replicates meam_getscreen_d
+// CHARACTER-FOR-CHARACTER over the gathered window: the inner `for(ek : nbr_i)` becomes a scan
+// `for(k=0;k<m;++k)` with an in-rc geom.reduce test (k is a screening candidate iff rik2<rc²),
+// in ASCENDING WINDOW-SLOT order (= ascending global on the host-sorted window) ⇒ the FP product
+// Π_k fcut(C) is summed in the SAME order the CPU vector path walks nbr[c] (also ascending). The
+// bond (c,jl) geometry is passed by value (delij = wx[jl]−wx[c], already min-imaged by the caller).
+// TWO TRAPS replicated verbatim (Risk #1): (1) `if (a <= 0.0) continue;` is the ONLY negative-C
+// reject (a cikj<0 early-reject would silently drop screening-k); (2) `dscrfcn = dscrfcn*coef1 −
+// coef2` — the MINUS on the radial taper (a + is silent on the diamond's binary S).
+struct MeamScreenCParams {
+  double rc, delr, ebound, Cmin, Cmax;
+};
+TDMD_HOST_DEVICE inline MeamScreenD meam_getscreen_d_device(
+    const double* wx, const double* wy, const double* wz, int m, int c, int jl, double djx,
+    double djy, double djz, double rij2, double rij, const core::PairGeom& geom,
+    const MeamScreenCParams& p) {
+  const double cutforce = p.rc;
+  const double drinv = 1.0 / p.delr;
+  const double rbound = p.ebound * rij2;
+  const double rnorm = (cutforce - rij) * drinv;
+  const double xc = wx[c], yc = wy[c], zc = wz[c];
+  double sij = 1.0;
+
+  // First pass — the screening product itself.
+  for (int k = 0; k < m; ++k) {
+    if (k == c || k == jl) continue;  // k != c (self) and k != j (the bond's other endpoint)
+    double dxik = wx[k] - xc, dyik = wy[k] - yc, dzik = wz[k] - zc, rik2;
+    if (!geom.reduce(dxik, dyik, dzik, rik2)) continue;  // k a window neighbour of c (rik2<rc²)
+    const double dxjk = dxik - djx, dyjk = dyik - djy, dzjk = dzik - djz;
+    const double rjk2 = dxjk * dxjk + dyjk * dyjk + dzjk * dzjk;
+    if (rjk2 > rbound) continue;
+    if (rik2 > rbound) continue;
+    const double xik = rik2 / rij2;
+    const double xjk = rjk2 / rij2;
+    const double a = 1.0 - (xik - xjk) * (xik - xjk);
+    if (a <= 0.0) continue;  // ⭐ TRAP 1: the ONLY negative-C rejection (ellipse)
+    double cikj = (2.0 * (xik + xjk) + a - 2.0) / a;
+    if (cikj >= p.Cmax) continue;
+    else if (cikj <= p.Cmin) { sij = 0.0; break; }
+    else {
+      const double delc = p.Cmax - p.Cmin;
+      cikj = (cikj - p.Cmin) / delc;
+      sij *= meam_detail::fcut(cikj);
+    }
+  }
+
+  double dfc;
+  const double fc = meam_detail::dfcut(rnorm, dfc);
+  const double fcij = fc;
+  const double dfcij = dfc * drinv;
+
+  // Second pass — dscrfcn (the radial screening derivative; partial-only).
+  double dscrfcn = 0.0;
+  const double sfcij = sij * fcij;
+  if (fabs(sfcij) > 1e-20 && fabs(sfcij - 1.0) > 1e-20) {  // !iszero && !isone
+    for (int k = 0; k < m; ++k) {
+      if (k == c || k == jl) continue;
+      double dxik = wx[k] - xc, dyik = wy[k] - yc, dzik = wz[k] - zc, rik2;
+      if (!geom.reduce(dxik, dyik, dzik, rik2)) continue;
+      const double dxjk = dxik - djx, dyjk = dyik - djy, dzjk = dzik - djz;
+      const double rjk2 = dxjk * dxjk + dyjk * dyjk + dzjk * dzjk;
+      if (rjk2 > rbound) continue;
+      if (rik2 > rbound) continue;
+      const double xik = rik2 / rij2;
+      const double xjk = rjk2 / rij2;
+      const double a = 1.0 - (xik - xjk) * (xik - xjk);
+      if (a <= 0.0) continue;
+      double cikj = (2.0 * (xik + xjk) + a - 2.0) / a;
+      if (cikj >= p.Cmax) {
+        continue;
+      } else {
+        const double delc = p.Cmax - p.Cmin;
+        cikj = (cikj - p.Cmin) / delc;
+        double dfikj;
+        const double sikj = meam_detail::dfcut(cikj, dfikj);
+        const double coef1 = dfikj / (delc * sikj);
+        const double dCikj = meam_detail::dCfunc(rij2, rik2, rjk2);
+        dscrfcn += coef1 * dCikj;
+      }
+    }
+    const double coef1 = sfcij;
+    const double coef2 = sij * dfcij / rij;
+    dscrfcn = dscrfcn * coef1 - coef2;  // ⭐ TRAP 2: the MINUS on coef2 (radial taper)
   }
 
   return {sij, fcij, dscrfcn};
@@ -671,7 +794,14 @@ struct MeamEmbedDeriv {
   double t_ave[3] = {0, 0, 0};
 };
 
-inline MeamEmbedDeriv meam_dens_final_deriv(const MeamDensity& d, const MeamParams& p) {
+// POD-only body (reads d.* + p scalars/Voigt tables, calls only HOST_DEVICE leaf helpers) ⇒
+// TDMD_HOST_DEVICE for the Me5 GPU embedding kernel (K2 calls it directly with a stack MeamDensity
+// decoded from the int64 lanes). MeamParams is passed by const-ref on the host; on the device the
+// kernel passes a POD MeamParamsView-equivalent of the scalars/Voigt (the spline vectors are NOT
+// read here). Replicating CHARACTER-FOR-CHARACTER the original — F-NOOP on the CPU.
+TDMD_HOST_DEVICE inline MeamEmbedDeriv meam_dens_final_deriv_pod(
+    const MeamDensity& d, const double* v2D, const double* v3D, double A, double Ec, int ibar,
+    double gsmooth, int emb_lin_neg, double rho_ref) {
   int errorflag = 0;
   MeamEmbedDeriv e;
   double rho1 = 0.0, rho2 = -1.0 / 3.0 * d.arho2b * d.arho2b, rho3 = 0.0;
@@ -680,8 +810,8 @@ inline MeamEmbedDeriv meam_dens_final_deriv(const MeamDensity& d, const MeamPara
     rho1 += d.arho1[m] * d.arho1[m];
     rho3 -= 3.0 / 5.0 * d.arho3b[m] * d.arho3b[m];
   }
-  for (int m = 0; m < 6; ++m) rho2 += p.v2D[m] * d.arho2[m] * d.arho2[m];
-  for (int m = 0; m < 10; ++m) rho3 += p.v3D[m] * d.arho3[m] * d.arho3[m];
+  for (int m = 0; m < 6; ++m) rho2 += v2D[m] * d.arho2[m] * d.arho2[m];
+  for (int m = 0; m < 10; ++m) rho3 += v3D[m] * d.arho3[m] * d.arho3[m];
 
   if (d.rho0 > 0.0) {  // ialloy=0 branch
     t_ave[0] /= d.rho0;
@@ -691,18 +821,18 @@ inline MeamEmbedDeriv meam_dens_final_deriv(const MeamDensity& d, const MeamPara
   double gamma = t_ave[0] * rho1 + t_ave[1] * rho2 + t_ave[2] * rho3;
   if (d.rho0 > 0.0) gamma /= (d.rho0 * d.rho0);
 
-  const double rho = d.rho0 * meam_detail::G_gam(gamma, p.ibar, p.gsmooth, errorflag);
-  const double rho_bkgd = p.rho_ref;  // bkgd_dyn=0, mix_ref_t=0
+  const double rho = d.rho0 * meam_detail::G_gam(gamma, ibar, gsmooth, errorflag);
+  const double rho_bkgd = rho_ref;  // bkgd_dyn=0, mix_ref_t=0
   const double rhob = rho / rho_bkgd;
   const double denom = 1.0 / rho_bkgd;
 
   double dG;
-  const double G = meam_detail::dG_gam(gamma, p.ibar, p.gsmooth, dG);
+  const double G = meam_detail::dG_gam(gamma, ibar, gsmooth, dG);
   e.dgamma1 = (G - 2.0 * dG * gamma) * denom;
   e.dgamma2 = (d.rho0 != 0.0) ? (dG / d.rho0) * denom : 0.0;
   e.dgamma3 = 0.0;  // mix_ref_t=0
 
-  e.F = meam_detail::embedding(p.A, p.Ec, rhob, p.emb_lin_neg, e.frhop);
+  e.F = meam_detail::embedding(A, Ec, rhob, emb_lin_neg, e.frhop);
   e.gamma = gamma;
   e.rho0 = d.rho0;
   e.rho1 = rho1;
@@ -713,6 +843,268 @@ inline MeamEmbedDeriv meam_dens_final_deriv(const MeamDensity& d, const MeamPara
   e.t_ave[2] = t_ave[2];
   return e;
 }
+
+inline MeamEmbedDeriv meam_dens_final_deriv(const MeamDensity& d, const MeamParams& p) {
+  // Delegate to the HOST_DEVICE POD body (F-NOOP: int v2D[m] → double is exact, the IEEE
+  // multiply v2D_d[m]·arho2[m]·arho2[m] is bit-identical to the original p.v2D[m]·… promotion).
+  double v2D[6], v3D[10];
+  for (int m = 0; m < 6; ++m) v2D[m] = double(p.v2D[m]);
+  for (int m = 0; m < 10; ++m) v3D[m] = double(p.v3D[m]);
+  return meam_dens_final_deriv_pod(d, v2D, v3D, p.A, p.Ec, p.ibar, p.gsmooth, p.emb_lin_neg,
+                                   p.rho_ref);
+}
+static_assert(std::is_trivially_copyable_v<MeamDensity>,
+              "MeamDensity must be POD — the Me5 GPU K2 decodes it from int64 lanes on a stack");
+static_assert(std::is_trivially_copyable_v<MeamEmbedDeriv>,
+              "MeamEmbedDeriv must be POD — the Me5 GPU writes/reads it per window atom");
+
+// ----------------------------------------------------------------------------------------
+// Me5 — the DEVICE bond-force core (POD-only, HOST_DEVICE). Factors the ~200-line Me2 bond body
+// (meam_direct_fp64 / meam_run_fixed_force / meam_window_force, all CHARACTER-FOR-CHARACTER the
+// same) into ONE single-source helper shared by the CPU force paths and the Me5 GPU K3 kernel.
+// Given a directed bond (i,j) with center-i densities/embedding (di,ed_i) and endpoint-j (dj,ed_j)
+// + the bond's screening (scrfcn_ij,fcpair,dscrfcn_ij), it returns fm[3] (the symmetric radial +
+// angular force the lower-key center writes to i and −1× to j) plus the screening prerequisites
+// (sij0, dUdsij, screen_active) the k-loop consumes. The screening 3rd-atom k-loop is a SEPARATE
+// helper (meam_screen_k_device) so each receiver role (i / j / k) can scatter its own piece.
+// ----------------------------------------------------------------------------------------
+struct MeamForceParams {
+  double re, rho0, beta0, beta1, beta2, beta3, Cmin, Cmax, ebound;
+  double t1_eff, t2, t3, shp[3];
+  double v2D[6], v3D[10];
+  int vind2D[3][3];
+  int vind3D[3][3][3];
+};
+
+struct MeamBondForce {
+  double fm[3];         // symmetric radial+angular force (write +fm to i, −fm to j)
+  double sij0;          // scrfcn·fcpair
+  double dUdsij;        // screening force scale (0 unless screen_active)
+  bool screen_active;   // |dscrfcn| > 1e-20  ⇒ the k-loop fires
+};
+
+// Reads di/dj/ed_i/ed_j + the bond geometry (delij = x_j − x_i, min-imaged) + the cached
+// screening (scrfcn_ij,fcpair,dscrfcn_ij). phi/phip are read from the deterministic φ spline by the
+// caller (the spline lives in MeamParams on the host / a MeamParamsView on the device). Returns the
+// symmetric fm[3] + the screening prerequisites. CHARACTER-FOR-CHARACTER from meam_direct_fp64.
+TDMD_HOST_DEVICE inline MeamBondForce meam_bond_force_device(
+    const MeamDensity& di, const MeamDensity& dj, const MeamEmbedDeriv& ed_i,
+    const MeamEmbedDeriv& ed_j, double dijx, double dijy, double dijz, double rij2, double rij,
+    double scrfcn_ij, double fcpair_ij, double dscrfcn_ij, double phi, double phip,
+    const MeamForceParams& p) {
+  MeamBondForce out;
+  const double recip = 1.0 / rij, rij3 = rij * rij2;
+  const double delij[3] = {dijx, dijy, dijz};
+  const double sij0 = scrfcn_ij * fcpair_ij;
+  out.sij0 = sij0;
+
+  const double invre = 1.0 / p.re, ai = rij * invre - 1.0, ro0 = p.rho0;
+  const double rhoa0j = ro0 * exp(-p.beta0 * ai), drhoa0j = -p.beta0 * invre * rhoa0j;
+  const double rhoa1j = ro0 * exp(-p.beta1 * ai), drhoa1j = -p.beta1 * invre * rhoa1j;
+  const double rhoa2j = ro0 * exp(-p.beta2 * ai), drhoa2j = -p.beta2 * invre * rhoa2j;
+  const double rhoa3j = ro0 * exp(-p.beta3 * ai), drhoa3j = -p.beta3 * invre * rhoa3j;
+  const double rhoa0i = rhoa0j, drhoa0i = drhoa0j, rhoa1i = rhoa1j, drhoa1i = drhoa1j;
+  const double rhoa2i = rhoa2j, drhoa2i = drhoa2j, rhoa3i = rhoa3j, drhoa3i = drhoa3j;
+  const double t1mi = p.t1_eff, t2mi = p.t2, t3mi = p.t3;
+  const double t1mj = p.t1_eff, t2mj = p.t2, t3mj = p.t3;
+
+  double arg1i1 = 0, arg1j1 = 0, arg1i2 = 0, arg1j2 = 0;
+  double arg1i3 = 0, arg1j3 = 0, arg3i3 = 0, arg3j3 = 0;
+  {
+    int nv2 = 0, nv3 = 0;
+    for (int n = 0; n < 3; ++n) {
+      for (int pp = n; pp < 3; ++pp) {
+        for (int q = pp; q < 3; ++q) {
+          const double arg = delij[n] * delij[pp] * delij[q] * p.v3D[nv3];
+          arg1i3 += di.arho3[nv3] * arg; arg1j3 -= dj.arho3[nv3] * arg; ++nv3;
+        }
+        const double arg = delij[n] * delij[pp] * p.v2D[nv2];
+        arg1i2 += di.arho2[nv2] * arg; arg1j2 += dj.arho2[nv2] * arg; ++nv2;
+      }
+      arg1i1 += di.arho1[n] * delij[n]; arg1j1 -= dj.arho1[n] * delij[n];
+      arg3i3 += di.arho3b[n] * delij[n]; arg3j3 -= dj.arho3b[n] * delij[n];
+    }
+  }
+
+  const double drho0dr1 = drhoa0j * sij0, drho0dr2 = drhoa0i * sij0;
+  double a1 = 2.0 * sij0 / rij;
+  const double drho1dr1 = a1 * (drhoa1j - rhoa1j / rij) * arg1i1;
+  const double drho1dr2 = a1 * (drhoa1i - rhoa1i / rij) * arg1j1;
+  double drho1drm1[3], drho1drm2[3];
+  for (int m = 0; m < 3; ++m) {
+    drho1drm1[m] = a1 * rhoa1j * di.arho1[m];
+    drho1drm2[m] = -a1 * rhoa1i * dj.arho1[m];
+  }
+  double a2 = 2.0 * sij0 / rij2;
+  const double drho2dr1 =
+      a2 * (drhoa2j - 2.0 * rhoa2j / rij) * arg1i2 - 2.0 / 3.0 * di.arho2b * drhoa2j * sij0;
+  const double drho2dr2 =
+      a2 * (drhoa2i - 2.0 * rhoa2i / rij) * arg1j2 - 2.0 / 3.0 * dj.arho2b * drhoa2i * sij0;
+  a2 = 4.0 * sij0 / rij2;
+  double drho2drm1[3], drho2drm2[3];
+  for (int m = 0; m < 3; ++m) {
+    double s1 = 0.0, s2 = 0.0;
+    for (int n = 0; n < 3; ++n) {
+      s1 += di.arho2[p.vind2D[m][n]] * delij[n];
+      s2 -= dj.arho2[p.vind2D[m][n]] * delij[n];
+    }
+    drho2drm1[m] = a2 * rhoa2j * s1;
+    drho2drm2[m] = -a2 * rhoa2i * s2;
+  }
+  double a3 = 2.0 * sij0 / rij3, a3a = 6.0 / 5.0 * sij0 / rij;
+  const double drho3dr1 =
+      a3 * (drhoa3j - 3.0 * rhoa3j / rij) * arg1i3 - a3a * (drhoa3j - rhoa3j / rij) * arg3i3;
+  const double drho3dr2 =
+      a3 * (drhoa3i - 3.0 * rhoa3i / rij) * arg1j3 - a3a * (drhoa3i - rhoa3i / rij) * arg3j3;
+  a3 = 6.0 * sij0 / rij3;
+  a3a = 6.0 * sij0 / (5.0 * rij);
+  double drho3drm1[3], drho3drm2[3];
+  for (int m = 0; m < 3; ++m) {
+    double s1 = 0.0, s2 = 0.0;
+    int nv2 = 0;
+    for (int n = 0; n < 3; ++n)
+      for (int pp = n; pp < 3; ++pp) {
+        const double arg = delij[n] * delij[pp] * p.v2D[nv2];
+        s1 += di.arho3[p.vind3D[m][n][pp]] * arg;
+        s2 += dj.arho3[p.vind3D[m][n][pp]] * arg;
+        ++nv2;
+      }
+    drho3drm1[m] = (a3 * s1 - a3a * di.arho3b[m]) * rhoa3j;
+    drho3drm2[m] = (-a3 * s2 + a3a * dj.arho3b[m]) * rhoa3i;
+  }
+
+  const double t1i = ed_i.t_ave[0], t2i = ed_i.t_ave[1], t3i = ed_i.t_ave[2];
+  const double t1j = ed_j.t_ave[0], t2j = ed_j.t_ave[1], t3j = ed_j.t_ave[2];
+  const double aif = (ed_i.rho0 != 0.0) ? drhoa0j * sij0 / ed_i.rho0 : 0.0;
+  const double ajf = (ed_j.rho0 != 0.0) ? drhoa0i * sij0 / ed_j.rho0 : 0.0;
+  const double dt1dr1 = aif * (t1mj - t1i), dt1dr2 = ajf * (t1mi - t1j);
+  const double dt2dr1 = aif * (t2mj - t2i), dt2dr2 = ajf * (t2mi - t2j);
+  const double dt3dr1 = aif * (t3mj - t3i), dt3dr2 = ajf * (t3mi - t3j);
+  const double* shp = p.shp;
+
+  const double drhodr1 =
+      ed_i.dgamma1 * drho0dr1 +
+      ed_i.dgamma2 * (dt1dr1 * ed_i.rho1 + t1i * drho1dr1 + dt2dr1 * ed_i.rho2 +
+                      t2i * drho2dr1 + dt3dr1 * ed_i.rho3 + t3i * drho3dr1) -
+      ed_i.dgamma3 * (shp[0] * dt1dr1 + shp[1] * dt2dr1 + shp[2] * dt3dr1);
+  const double drhodr2 =
+      ed_j.dgamma1 * drho0dr2 +
+      ed_j.dgamma2 * (dt1dr2 * ed_j.rho1 + t1j * drho1dr2 + dt2dr2 * ed_j.rho2 +
+                      t2j * drho2dr2 + dt3dr2 * ed_j.rho3 + t3j * drho3dr2) -
+      ed_j.dgamma3 * (shp[0] * dt1dr2 + shp[1] * dt2dr2 + shp[2] * dt3dr2);
+  double drhodrm1[3], drhodrm2[3];
+  for (int m = 0; m < 3; ++m) {
+    drhodrm1[m] = ed_i.dgamma2 *
+                  (t1i * drho1drm1[m] + t2i * drho2drm1[m] + t3i * drho3drm1[m]);
+    drhodrm2[m] = ed_j.dgamma2 *
+                  (t1j * drho1drm2[m] + t2j * drho2drm2[m] + t3j * drho3drm2[m]);
+  }
+
+  double drhods1 = 0.0, drhods2 = 0.0;
+  const bool screen_active = fabs(dscrfcn_ij) > 1e-20;
+  if (screen_active) {
+    const double drho0ds1 = rhoa0j, drho0ds2 = rhoa0i;
+    const double b1 = 2.0 / rij, b2 = 2.0 / rij2, b3 = 2.0 / rij3, b3a = 6.0 / (5.0 * rij);
+    const double drho1ds1 = b1 * rhoa1j * arg1i1, drho1ds2 = b1 * rhoa1i * arg1j1;
+    const double drho2ds1 = b2 * rhoa2j * arg1i2 - 2.0 / 3.0 * di.arho2b * rhoa2j;
+    const double drho2ds2 = b2 * rhoa2i * arg1j2 - 2.0 / 3.0 * dj.arho2b * rhoa2i;
+    const double drho3ds1 = b3 * rhoa3j * arg1i3 - b3a * rhoa3j * arg3i3;
+    const double drho3ds2 = b3 * rhoa3i * arg1j3 - b3a * rhoa3i * arg3j3;
+    const double ais = (ed_i.rho0 != 0.0) ? rhoa0j / ed_i.rho0 : 0.0;
+    const double ajs = (ed_j.rho0 != 0.0) ? rhoa0i / ed_j.rho0 : 0.0;
+    const double dt1ds1b = ais * (t1mj - t1i), dt1ds2b = ajs * (t1mi - t1j);
+    const double dt2ds1b = ais * (t2mj - t2i), dt2ds2b = ajs * (t2mi - t2j);
+    const double dt3ds1b = ais * (t3mj - t3i), dt3ds2b = ajs * (t3mi - t3j);
+    drhods1 =
+        ed_i.dgamma1 * drho0ds1 +
+        ed_i.dgamma2 * (dt1ds1b * ed_i.rho1 + t1i * drho1ds1 + dt2ds1b * ed_i.rho2 +
+                        t2i * drho2ds1 + dt3ds1b * ed_i.rho3 + t3i * drho3ds1) -
+        ed_i.dgamma3 * (shp[0] * dt1ds1b + shp[1] * dt2ds1b + shp[2] * dt3ds1b);
+    drhods2 =
+        ed_j.dgamma1 * drho0ds2 +
+        ed_j.dgamma2 * (dt1ds2b * ed_j.rho1 + t1j * drho1ds2 + dt2ds2b * ed_j.rho2 +
+                        t2j * drho2ds2 + dt3ds2b * ed_j.rho3 + t3j * drho3ds2) -
+        ed_j.dgamma3 * (shp[0] * dt1ds2b + shp[1] * dt2ds2b + shp[2] * dt3ds2b);
+  }
+
+  const double dUdrij = phip * sij0 + ed_i.frhop * drhodr1 + ed_j.frhop * drhodr2;
+  double dUdsij = 0.0;
+  if (screen_active) dUdsij = phi + ed_i.frhop * drhods1 + ed_j.frhop * drhods2;
+  double dUdrijm[3];
+  for (int m = 0; m < 3; ++m)
+    dUdrijm[m] = ed_i.frhop * drhodrm1[m] + ed_j.frhop * drhodrm2[m];
+
+  const double force = dUdrij * recip + dUdsij * dscrfcn_ij;
+  out.fm[0] = delij[0] * force + dUdrijm[0];
+  out.fm[1] = delij[1] * force + dUdrijm[1];
+  out.fm[2] = delij[2] * force + dUdrijm[2];
+  out.dUdsij = dUdsij;
+  out.screen_active = screen_active;
+  return out;
+}
+
+// The screening 3rd-atom k-contribution for ONE candidate k (relative to center i): given the
+// bond (i,j) context (sij0, dUdsij) + the i-frame vectors d_ik (= x_k − x_i) and d_ij, returns
+// whether k screens this bond (active) and, if so, force1·d_ik (→ i / −k) and force2·d_jk (→ j /
+// −k). CHARACTER-FOR-CHARACTER from meam_run_fixed_force's k-loop body. The caller supplies d_ik
+// (the i-frame k vector) + rik2; d_jk = d_ik − d_ij. drop_class>0 is the POISON (caller drops the
+// whole k-loop).
+struct MeamScreenK {
+  bool active;
+  double force1;        // → f_i += force1·d_ik ; → f_k −= force1·d_ik
+  double force2;        // → f_j += force2·d_jk ; → f_k −= force2·d_jk
+  double dik[3], djk[3];
+};
+TDMD_HOST_DEVICE inline MeamScreenK meam_screen_k_device(
+    double dikx, double diky, double dikz, double rik2, double dijx, double dijy, double dijz,
+    double rij2, double sij0, double dUdsij, const MeamForceParams& p) {
+  MeamScreenK r;
+  r.active = false;
+  const double delc = p.Cmax - p.Cmin, rbound = rij2 * p.ebound;
+  const double dxjk = dikx - dijx, dyjk = diky - dijy, dzjk = dikz - dijz;
+  const double rjk2 = dxjk * dxjk + dyjk * dyjk + dzjk * dzjk;
+  if (rjk2 > rbound) return r;
+  if (rik2 > rbound) return r;
+  const double xik = rik2 / rij2, xjk = rjk2 / rij2;
+  const double aa = 1.0 - (xik - xjk) * (xik - xjk);
+  if (fabs(aa) < 1e-20) return r;  // iszero(a)
+  double cikj = (2.0 * (xik + xjk) + aa - 2.0) / aa;
+  if (!(cikj >= p.Cmin && cikj <= p.Cmax)) return r;
+  cikj = (cikj - p.Cmin) / delc;
+  double dfc;
+  const double sikj = meam_detail::dfcut(cikj, dfc);
+  double dCikj1, dCikj2;
+  meam_detail::dCfunc2(rij2, rik2, rjk2, dCikj1, dCikj2);
+  const double aw = sij0 / delc * dfc / sikj;
+  const double dsij1 = aw * dCikj1, dsij2 = aw * dCikj2;
+  if (fabs(dsij1) < 1e-20 && fabs(dsij2) < 1e-20) return r;
+  r.active = true;
+  r.force1 = dUdsij * dsij1;
+  r.force2 = dUdsij * dsij2;
+  r.dik[0] = dikx; r.dik[1] = diky; r.dik[2] = dikz;
+  r.djk[0] = dxjk; r.djk[1] = dyjk; r.djk[2] = dzjk;
+  return r;
+}
+
+// Build the POD MeamForceParams from a MeamParams (the int Voigt mults → double, exact).
+inline MeamForceParams meam_force_params(const MeamParams& p) {
+  MeamForceParams fp;
+  fp.re = p.re; fp.rho0 = p.rho0;
+  fp.beta0 = p.beta0; fp.beta1 = p.beta1; fp.beta2 = p.beta2; fp.beta3 = p.beta3;
+  fp.Cmin = p.Cmin; fp.Cmax = p.Cmax; fp.ebound = p.ebound;
+  fp.t1_eff = p.t1_eff; fp.t2 = p.t2; fp.t3 = p.t3;
+  for (int m = 0; m < 3; ++m) fp.shp[m] = p.shp[m];
+  for (int m = 0; m < 6; ++m) fp.v2D[m] = double(p.v2D[m]);
+  for (int m = 0; m < 10; ++m) fp.v3D[m] = double(p.v3D[m]);
+  for (int m = 0; m < 3; ++m)
+    for (int n = 0; n < 3; ++n) fp.vind2D[m][n] = p.vind2D[m][n];
+  for (int m = 0; m < 3; ++m)
+    for (int n = 0; n < 3; ++n)
+      for (int q = 0; q < 3; ++q) fp.vind3D[m][n][q] = p.vind3D[m][n][q];
+  return fp;
+}
+static_assert(std::is_trivially_copyable_v<MeamForceParams>,
+              "MeamForceParams is passed by value into the Me5 kernel");
 
 // ----------------------------------------------------------------------------------------
 // The energy driver: E = Σ_i F(ρ̄_i) + Σ_{pairs} φ(r_ij)·S_ij  (LAMMPS adds φ·sij once per
@@ -1277,188 +1669,35 @@ inline MeamAccum meam_run_fixed_force(AtomSoA<Real>& a, const PairGeom& geom, co
       const double scrfcn_ij = scr[i][jn].scrfcn, dscrfcn_ij = scr[i][jn].dscrfcn;
       if (std::fabs(scrfcn_ij) < 1e-20) continue;
       const double sij0 = scrfcn_ij * scr[i][jn].fcpair;
-      const double rij2 = ej.r2, rij = ej.r, recip = 1.0 / rij, rij3 = rij * rij2;
-      const double delij[3] = {ej.dx, ej.dy, ej.dz};
+      const double rij2 = ej.r2, rij = ej.r;
       const double phi = p.phi_spline(rij), phip = p.phip_spline(rij);
       if (i < j) pe_pair.add(phi * sij0);
       if (i >= j) continue;
 
-      const double invre = 1.0 / p.re, ai = rij * invre - 1.0, ro0 = p.rho0;
-      const double rhoa0j = ro0 * std::exp(-p.beta0 * ai), drhoa0j = -p.beta0 * invre * rhoa0j;
-      const double rhoa1j = ro0 * std::exp(-p.beta1 * ai), drhoa1j = -p.beta1 * invre * rhoa1j;
-      const double rhoa2j = ro0 * std::exp(-p.beta2 * ai), drhoa2j = -p.beta2 * invre * rhoa2j;
-      const double rhoa3j = ro0 * std::exp(-p.beta3 * ai), drhoa3j = -p.beta3 * invre * rhoa3j;
-      const double rhoa0i = rhoa0j, drhoa0i = drhoa0j, rhoa1i = rhoa1j, drhoa1i = drhoa1j;
-      const double rhoa2i = rhoa2j, drhoa2i = drhoa2j, rhoa3i = rhoa3j, drhoa3i = drhoa3j;
-      const double t1mi = p.t1_eff, t2mi = p.t2, t3mi = p.t3;
-      const double t1mj = p.t1_eff, t2mj = p.t2, t3mj = p.t3;
-      const MeamDensity &di = dens[i], &dj = dens[j];
-
-      double arg1i1 = 0, arg1j1 = 0, arg1i2 = 0, arg1j2 = 0;
-      double arg1i3 = 0, arg1j3 = 0, arg3i3 = 0, arg3j3 = 0;
-      {
-        int nv2 = 0, nv3 = 0;
-        for (int n = 0; n < 3; ++n) {
-          for (int pp = n; pp < 3; ++pp) {
-            for (int q = pp; q < 3; ++q) {
-              const double arg = delij[n] * delij[pp] * delij[q] * p.v3D[nv3];
-              arg1i3 += di.arho3[nv3] * arg; arg1j3 -= dj.arho3[nv3] * arg; ++nv3;
-            }
-            const double arg = delij[n] * delij[pp] * p.v2D[nv2];
-            arg1i2 += di.arho2[nv2] * arg; arg1j2 += dj.arho2[nv2] * arg; ++nv2;
-          }
-          arg1i1 += di.arho1[n] * delij[n]; arg1j1 -= dj.arho1[n] * delij[n];
-          arg3i3 += di.arho3b[n] * delij[n]; arg3j3 -= dj.arho3b[n] * delij[n];
-        }
-      }
-
-      const double drho0dr1 = drhoa0j * sij0, drho0dr2 = drhoa0i * sij0;
-      double a1 = 2.0 * sij0 / rij;
-      const double drho1dr1 = a1 * (drhoa1j - rhoa1j / rij) * arg1i1;
-      const double drho1dr2 = a1 * (drhoa1i - rhoa1i / rij) * arg1j1;
-      double drho1drm1[3], drho1drm2[3];
-      for (int m = 0; m < 3; ++m) {
-        drho1drm1[m] = a1 * rhoa1j * di.arho1[m];
-        drho1drm2[m] = -a1 * rhoa1i * dj.arho1[m];
-      }
-      double a2 = 2.0 * sij0 / rij2;
-      const double drho2dr1 =
-          a2 * (drhoa2j - 2.0 * rhoa2j / rij) * arg1i2 - 2.0 / 3.0 * di.arho2b * drhoa2j * sij0;
-      const double drho2dr2 =
-          a2 * (drhoa2i - 2.0 * rhoa2i / rij) * arg1j2 - 2.0 / 3.0 * dj.arho2b * drhoa2i * sij0;
-      a2 = 4.0 * sij0 / rij2;
-      double drho2drm1[3], drho2drm2[3];
-      for (int m = 0; m < 3; ++m) {
-        double s1 = 0.0, s2 = 0.0;
-        for (int n = 0; n < 3; ++n) {
-          s1 += di.arho2[p.vind2D[m][n]] * delij[n];
-          s2 -= dj.arho2[p.vind2D[m][n]] * delij[n];
-        }
-        drho2drm1[m] = a2 * rhoa2j * s1;
-        drho2drm2[m] = -a2 * rhoa2i * s2;
-      }
-      double a3 = 2.0 * sij0 / rij3, a3a = 6.0 / 5.0 * sij0 / rij;
-      const double drho3dr1 =
-          a3 * (drhoa3j - 3.0 * rhoa3j / rij) * arg1i3 - a3a * (drhoa3j - rhoa3j / rij) * arg3i3;
-      const double drho3dr2 =
-          a3 * (drhoa3i - 3.0 * rhoa3i / rij) * arg1j3 - a3a * (drhoa3i - rhoa3i / rij) * arg3j3;
-      a3 = 6.0 * sij0 / rij3;
-      a3a = 6.0 * sij0 / (5.0 * rij);
-      double drho3drm1[3], drho3drm2[3];
-      for (int m = 0; m < 3; ++m) {
-        double s1 = 0.0, s2 = 0.0;
-        int nv2 = 0;
-        for (int n = 0; n < 3; ++n)
-          for (int pp = n; pp < 3; ++pp) {
-            const double arg = delij[n] * delij[pp] * p.v2D[nv2];
-            s1 += di.arho3[p.vind3D[m][n][pp]] * arg;
-            s2 += dj.arho3[p.vind3D[m][n][pp]] * arg;
-            ++nv2;
-          }
-        drho3drm1[m] = (a3 * s1 - a3a * di.arho3b[m]) * rhoa3j;
-        drho3drm2[m] = (-a3 * s2 + a3a * dj.arho3b[m]) * rhoa3i;
-      }
-
-      const double t1i = ed[i].t_ave[0], t2i = ed[i].t_ave[1], t3i = ed[i].t_ave[2];
-      const double t1j = ed[j].t_ave[0], t2j = ed[j].t_ave[1], t3j = ed[j].t_ave[2];
-      const double aif = (ed[i].rho0 != 0.0) ? drhoa0j * sij0 / ed[i].rho0 : 0.0;
-      const double ajf = (ed[j].rho0 != 0.0) ? drhoa0i * sij0 / ed[j].rho0 : 0.0;
-      const double dt1dr1 = aif * (t1mj - t1i), dt1dr2 = ajf * (t1mi - t1j);
-      const double dt2dr1 = aif * (t2mj - t2i), dt2dr2 = ajf * (t2mi - t2j);
-      const double dt3dr1 = aif * (t3mj - t3i), dt3dr2 = ajf * (t3mi - t3j);
-      const double* shp = p.shp;
-
-      const double drhodr1 =
-          ed[i].dgamma1 * drho0dr1 +
-          ed[i].dgamma2 * (dt1dr1 * ed[i].rho1 + t1i * drho1dr1 + dt2dr1 * ed[i].rho2 +
-                           t2i * drho2dr1 + dt3dr1 * ed[i].rho3 + t3i * drho3dr1) -
-          ed[i].dgamma3 * (shp[0] * dt1dr1 + shp[1] * dt2dr1 + shp[2] * dt3dr1);
-      const double drhodr2 =
-          ed[j].dgamma1 * drho0dr2 +
-          ed[j].dgamma2 * (dt1dr2 * ed[j].rho1 + t1j * drho1dr2 + dt2dr2 * ed[j].rho2 +
-                           t2j * drho2dr2 + dt3dr2 * ed[j].rho3 + t3j * drho3dr2) -
-          ed[j].dgamma3 * (shp[0] * dt1dr2 + shp[1] * dt2dr2 + shp[2] * dt3dr2);
-      double drhodrm1[3], drhodrm2[3];
-      for (int m = 0; m < 3; ++m) {
-        drhodrm1[m] = ed[i].dgamma2 *
-                      (t1i * drho1drm1[m] + t2i * drho2drm1[m] + t3i * drho3drm1[m]);
-        drhodrm2[m] = ed[j].dgamma2 *
-                      (t1j * drho1drm2[m] + t2j * drho2drm2[m] + t3j * drho3drm2[m]);
-      }
-
-      double drhods1 = 0.0, drhods2 = 0.0;
-      const bool screen_active = std::fabs(dscrfcn_ij) > 1e-20;
-      if (screen_active) {
-        const double drho0ds1 = rhoa0j, drho0ds2 = rhoa0i;
-        const double b1 = 2.0 / rij, b2 = 2.0 / rij2, b3 = 2.0 / rij3, b3a = 6.0 / (5.0 * rij);
-        const double drho1ds1 = b1 * rhoa1j * arg1i1, drho1ds2 = b1 * rhoa1i * arg1j1;
-        const double drho2ds1 = b2 * rhoa2j * arg1i2 - 2.0 / 3.0 * di.arho2b * rhoa2j;
-        const double drho2ds2 = b2 * rhoa2i * arg1j2 - 2.0 / 3.0 * dj.arho2b * rhoa2i;
-        const double drho3ds1 = b3 * rhoa3j * arg1i3 - b3a * rhoa3j * arg3i3;
-        const double drho3ds2 = b3 * rhoa3i * arg1j3 - b3a * rhoa3i * arg3j3;
-        const double ais = (ed[i].rho0 != 0.0) ? rhoa0j / ed[i].rho0 : 0.0;
-        const double ajs = (ed[j].rho0 != 0.0) ? rhoa0i / ed[j].rho0 : 0.0;
-        const double dt1ds1b = ais * (t1mj - t1i), dt1ds2b = ajs * (t1mi - t1j);
-        const double dt2ds1b = ais * (t2mj - t2i), dt2ds2b = ajs * (t2mi - t2j);
-        const double dt3ds1b = ais * (t3mj - t3i), dt3ds2b = ajs * (t3mi - t3j);
-        drhods1 =
-            ed[i].dgamma1 * drho0ds1 +
-            ed[i].dgamma2 * (dt1ds1b * ed[i].rho1 + t1i * drho1ds1 + dt2ds1b * ed[i].rho2 +
-                             t2i * drho2ds1 + dt3ds1b * ed[i].rho3 + t3i * drho3ds1) -
-            ed[i].dgamma3 * (shp[0] * dt1ds1b + shp[1] * dt2ds1b + shp[2] * dt3ds1b);
-        drhods2 =
-            ed[j].dgamma1 * drho0ds2 +
-            ed[j].dgamma2 * (dt1ds2b * ed[j].rho1 + t1j * drho1ds2 + dt2ds2b * ed[j].rho2 +
-                             t2j * drho2ds2 + dt3ds2b * ed[j].rho3 + t3j * drho3ds2) -
-            ed[j].dgamma3 * (shp[0] * dt1ds2b + shp[1] * dt2ds2b + shp[2] * dt3ds2b);
-      }
-
-      const double dUdrij = phip * sij0 + ed[i].frhop * drhodr1 + ed[j].frhop * drhodr2;
-      double dUdsij = 0.0;
-      if (screen_active) dUdsij = phi + ed[i].frhop * drhods1 + ed[j].frhop * drhods2;
-      double dUdrijm[3];
-      for (int m = 0; m < 3; ++m)
-        dUdrijm[m] = ed[i].frhop * drhodrm1[m] + ed[j].frhop * drhodrm2[m];
-
-      const double force = dUdrij * recip + dUdsij * dscrfcn_ij;
-      const double fm0 = delij[0] * force + dUdrijm[0];
-      const double fm1 = delij[1] * force + dUdrijm[1];
-      const double fm2 = delij[2] * force + dUdrijm[2];
-      ffx[i].add(fm0); ffy[i].add(fm1); ffz[i].add(fm2);
-      ffx[j].add(-fm0); ffy[j].add(-fm1); ffz[j].add(-fm2);
+      // SINGLE-SOURCE bond body (shared with the Me5 GPU K3 kernel). F-NOOP: meam_bond_force_device
+      // is the verbatim Me2 bond chain; meam_screen_k_device is the verbatim k-loop body.
+      const MeamForceParams fp = meam_force_params(p);
+      const MeamBondForce bf =
+          meam_bond_force_device(dens[i], dens[j], ed[i], ed[j], ej.dx, ej.dy, ej.dz, rij2, rij,
+                                 scrfcn_ij, scr[i][jn].fcpair, dscrfcn_ij, phi, phip, fp);
+      ffx[i].add(bf.fm[0]); ffy[i].add(bf.fm[1]); ffz[i].add(bf.fm[2]);
+      ffx[j].add(-bf.fm[0]); ffy[j].add(-bf.fm[1]); ffz[j].add(-bf.fm[2]);
 
       if (std::fabs(sij0) < 1e-20 || std::fabs(sij0 - 1.0) < 1e-20) continue;
       if (drop_class > 0) continue;
-      const double delc = p.Cmax - p.Cmin, rbound = rij2 * p.ebound;
       for (size_t kn = 0; kn < nbr[i].size(); ++kn) {
         const auto& ek = nbr[i][kn];
         const int k = ek.j;
         if (k == j) continue;
-        const double dxik = ek.dx, dyik = ek.dy, dzik = ek.dz;
-        const double dxjk = ek.dx - ej.dx, dyjk = ek.dy - ej.dy, dzjk = ek.dz - ej.dz;
-        const double rjk2 = dxjk * dxjk + dyjk * dyjk + dzjk * dzjk;
-        if (rjk2 > rbound) continue;
-        const double rik2 = dxik * dxik + dyik * dyik + dzik * dzik;
-        if (rik2 > rbound) continue;
-        const double xik = rik2 / rij2, xjk = rjk2 / rij2;
-        const double aa = 1.0 - (xik - xjk) * (xik - xjk);
-        if (std::fabs(aa) < 1e-20) continue;
-        double cikj = (2.0 * (xik + xjk) + aa - 2.0) / aa;
-        if (!(cikj >= p.Cmin && cikj <= p.Cmax)) continue;
-        cikj = (cikj - p.Cmin) / delc;
-        double dfc;
-        const double sikj = meam_detail::dfcut(cikj, dfc);
-        double dCikj1, dCikj2;
-        meam_detail::dCfunc2(rij2, rik2, rjk2, dCikj1, dCikj2);
-        const double aw = sij0 / delc * dfc / sikj;
-        const double dsij1 = aw * dCikj1, dsij2 = aw * dCikj2;
-        if (std::fabs(dsij1) < 1e-20 && std::fabs(dsij2) < 1e-20) continue;
-        const double force1 = dUdsij * dsij1, force2 = dUdsij * dsij2;
-        ffx[i].add(force1 * dxik); ffy[i].add(force1 * dyik); ffz[i].add(force1 * dzik);
-        ffx[j].add(force2 * dxjk); ffy[j].add(force2 * dyjk); ffz[j].add(force2 * dzjk);
-        ffx[k].add(-(force1 * dxik + force2 * dxjk));
-        ffy[k].add(-(force1 * dyik + force2 * dyjk));
-        ffz[k].add(-(force1 * dzik + force2 * dzjk));
+        const double rik2 = ek.dx * ek.dx + ek.dy * ek.dy + ek.dz * ek.dz;
+        const MeamScreenK sk = meam_screen_k_device(ek.dx, ek.dy, ek.dz, rik2, ej.dx, ej.dy, ej.dz,
+                                                    rij2, sij0, bf.dUdsij, fp);
+        if (!sk.active) continue;
+        ffx[i].add(sk.force1 * sk.dik[0]); ffy[i].add(sk.force1 * sk.dik[1]); ffz[i].add(sk.force1 * sk.dik[2]);
+        ffx[j].add(sk.force2 * sk.djk[0]); ffy[j].add(sk.force2 * sk.djk[1]); ffz[j].add(sk.force2 * sk.djk[2]);
+        ffx[k].add(-(sk.force1 * sk.dik[0] + sk.force2 * sk.djk[0]));
+        ffy[k].add(-(sk.force1 * sk.dik[1] + sk.force2 * sk.djk[1]));
+        ffz[k].add(-(sk.force1 * sk.dik[2] + sk.force2 * sk.djk[2]));
       }
     }
   }

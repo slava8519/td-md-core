@@ -170,195 +170,42 @@ void meam_window_force(const double* wx, const double* wy, const double* wz, con
       const double scrfcn_ij = scr[i][jn].scrfcn, dscrfcn_ij = scr[i][jn].dscrfcn;
       if (std::fabs(scrfcn_ij) < 1e-20) continue;
       const double sij0 = scrfcn_ij * scr[i][jn].fcpair;
-      const double rij2 = ej.r2, rij = ej.r, recip = 1.0 / rij, rij3 = rij * rij2;
-      const double delij[3] = {ej.dx, ej.dy, ej.dz};
+      const double rij2 = ej.r2, rij = ej.r;
       const double phi = p.phi_spline(rij), phip = p.phip_spline(rij);
       // pair energy: owner i<j, but pe_pair only counts when i is OWNED (its zone attributes it).
       if (is_owned[i]) pe_pair.add(phi * sij0);
 
-      const double invre = 1.0 / p.re, ai = rij * invre - 1.0, ro0 = p.rho0;
-      const double rhoa0j = ro0 * std::exp(-p.beta0 * ai), drhoa0j = -p.beta0 * invre * rhoa0j;
-      const double rhoa1j = ro0 * std::exp(-p.beta1 * ai), drhoa1j = -p.beta1 * invre * rhoa1j;
-      const double rhoa2j = ro0 * std::exp(-p.beta2 * ai), drhoa2j = -p.beta2 * invre * rhoa2j;
-      const double rhoa3j = ro0 * std::exp(-p.beta3 * ai), drhoa3j = -p.beta3 * invre * rhoa3j;
-      const double rhoa0i = rhoa0j, drhoa0i = drhoa0j, rhoa1i = rhoa1j, drhoa1i = drhoa1j;
-      const double rhoa2i = rhoa2j, drhoa2i = drhoa2j, rhoa3i = rhoa3j, drhoa3i = drhoa3j;
-      const double t1mi = p.t1_eff, t2mi = p.t2, t3mi = p.t3;
-      const double t1mj = p.t1_eff, t2mj = p.t2, t3mj = p.t3;
-      const MeamDensity &di = dens[i], &dj = dens[j];
-
-      double arg1i1 = 0, arg1j1 = 0, arg1i2 = 0, arg1j2 = 0;
-      double arg1i3 = 0, arg1j3 = 0, arg3i3 = 0, arg3j3 = 0;
-      {
-        int nv2 = 0, nv3 = 0;
-        for (int n = 0; n < 3; ++n) {
-          for (int pp = n; pp < 3; ++pp) {
-            for (int q = pp; q < 3; ++q) {
-              const double arg = delij[n] * delij[pp] * delij[q] * p.v3D[nv3];
-              arg1i3 += di.arho3[nv3] * arg; arg1j3 -= dj.arho3[nv3] * arg; ++nv3;
-            }
-            const double arg = delij[n] * delij[pp] * p.v2D[nv2];
-            arg1i2 += di.arho2[nv2] * arg; arg1j2 += dj.arho2[nv2] * arg; ++nv2;
-          }
-          arg1i1 += di.arho1[n] * delij[n]; arg1j1 -= dj.arho1[n] * delij[n];
-          arg3i3 += di.arho3b[n] * delij[n]; arg3j3 -= dj.arho3b[n] * delij[n];
-        }
-      }
-
-      const double drho0dr1 = drhoa0j * sij0, drho0dr2 = drhoa0i * sij0;
-      double a1 = 2.0 * sij0 / rij;
-      const double drho1dr1 = a1 * (drhoa1j - rhoa1j / rij) * arg1i1;
-      const double drho1dr2 = a1 * (drhoa1i - rhoa1i / rij) * arg1j1;
-      double drho1drm1[3], drho1drm2[3];
-      for (int mm = 0; mm < 3; ++mm) {
-        drho1drm1[mm] = a1 * rhoa1j * di.arho1[mm];
-        drho1drm2[mm] = -a1 * rhoa1i * dj.arho1[mm];
-      }
-      double a2 = 2.0 * sij0 / rij2;
-      const double drho2dr1 =
-          a2 * (drhoa2j - 2.0 * rhoa2j / rij) * arg1i2 - 2.0 / 3.0 * di.arho2b * drhoa2j * sij0;
-      const double drho2dr2 =
-          a2 * (drhoa2i - 2.0 * rhoa2i / rij) * arg1j2 - 2.0 / 3.0 * dj.arho2b * drhoa2i * sij0;
-      a2 = 4.0 * sij0 / rij2;
-      double drho2drm1[3], drho2drm2[3];
-      for (int mm = 0; mm < 3; ++mm) {
-        double s1 = 0.0, s2 = 0.0;
-        for (int n = 0; n < 3; ++n) {
-          s1 += di.arho2[p.vind2D[mm][n]] * delij[n];
-          s2 -= dj.arho2[p.vind2D[mm][n]] * delij[n];
-        }
-        drho2drm1[mm] = a2 * rhoa2j * s1;
-        drho2drm2[mm] = -a2 * rhoa2i * s2;
-      }
-      double a3 = 2.0 * sij0 / rij3, a3a = 6.0 / 5.0 * sij0 / rij;
-      const double drho3dr1 =
-          a3 * (drhoa3j - 3.0 * rhoa3j / rij) * arg1i3 - a3a * (drhoa3j - rhoa3j / rij) * arg3i3;
-      const double drho3dr2 =
-          a3 * (drhoa3i - 3.0 * rhoa3i / rij) * arg1j3 - a3a * (drhoa3i - rhoa3i / rij) * arg3j3;
-      a3 = 6.0 * sij0 / rij3;
-      a3a = 6.0 * sij0 / (5.0 * rij);
-      double drho3drm1[3], drho3drm2[3];
-      for (int mm = 0; mm < 3; ++mm) {
-        double s1 = 0.0, s2 = 0.0;
-        int nv2 = 0;
-        for (int n = 0; n < 3; ++n)
-          for (int pp = n; pp < 3; ++pp) {
-            const double arg = delij[n] * delij[pp] * p.v2D[nv2];
-            s1 += di.arho3[p.vind3D[mm][n][pp]] * arg;
-            s2 += dj.arho3[p.vind3D[mm][n][pp]] * arg;
-            ++nv2;
-          }
-        drho3drm1[mm] = (a3 * s1 - a3a * di.arho3b[mm]) * rhoa3j;
-        drho3drm2[mm] = (-a3 * s2 + a3a * dj.arho3b[mm]) * rhoa3i;
-      }
-
-      const double t1i = ed[i].t_ave[0], t2i = ed[i].t_ave[1], t3i = ed[i].t_ave[2];
-      const double t1j = ed[j].t_ave[0], t2j = ed[j].t_ave[1], t3j = ed[j].t_ave[2];
-      const double aif = (ed[i].rho0 != 0.0) ? drhoa0j * sij0 / ed[i].rho0 : 0.0;
-      const double ajf = (ed[j].rho0 != 0.0) ? drhoa0i * sij0 / ed[j].rho0 : 0.0;
-      const double dt1dr1 = aif * (t1mj - t1i), dt1dr2 = ajf * (t1mi - t1j);
-      const double dt2dr1 = aif * (t2mj - t2i), dt2dr2 = ajf * (t2mi - t2j);
-      const double dt3dr1 = aif * (t3mj - t3i), dt3dr2 = ajf * (t3mi - t3j);
-      const double* shp = p.shp;
-
-      const double drhodr1 =
-          ed[i].dgamma1 * drho0dr1 +
-          ed[i].dgamma2 * (dt1dr1 * ed[i].rho1 + t1i * drho1dr1 + dt2dr1 * ed[i].rho2 +
-                           t2i * drho2dr1 + dt3dr1 * ed[i].rho3 + t3i * drho3dr1) -
-          ed[i].dgamma3 * (shp[0] * dt1dr1 + shp[1] * dt2dr1 + shp[2] * dt3dr1);
-      const double drhodr2 =
-          ed[j].dgamma1 * drho0dr2 +
-          ed[j].dgamma2 * (dt1dr2 * ed[j].rho1 + t1j * drho1dr2 + dt2dr2 * ed[j].rho2 +
-                           t2j * drho2dr2 + dt3dr2 * ed[j].rho3 + t3j * drho3dr2) -
-          ed[j].dgamma3 * (shp[0] * dt1dr2 + shp[1] * dt2dr2 + shp[2] * dt3dr2);
-      double drhodrm1[3], drhodrm2[3];
-      for (int mm = 0; mm < 3; ++mm) {
-        drhodrm1[mm] = ed[i].dgamma2 *
-                       (t1i * drho1drm1[mm] + t2i * drho2drm1[mm] + t3i * drho3drm1[mm]);
-        drhodrm2[mm] = ed[j].dgamma2 *
-                       (t1j * drho1drm2[mm] + t2j * drho2drm2[mm] + t3j * drho3drm2[mm]);
-      }
-
-      double drhods1 = 0.0, drhods2 = 0.0;
-      const bool screen_active = std::fabs(dscrfcn_ij) > 1e-20;
-      if (screen_active) {
-        const double drho0ds1 = rhoa0j, drho0ds2 = rhoa0i;
-        const double b1 = 2.0 / rij, b2 = 2.0 / rij2, b3 = 2.0 / rij3, b3a = 6.0 / (5.0 * rij);
-        const double drho1ds1 = b1 * rhoa1j * arg1i1, drho1ds2 = b1 * rhoa1i * arg1j1;
-        const double drho2ds1 = b2 * rhoa2j * arg1i2 - 2.0 / 3.0 * di.arho2b * rhoa2j;
-        const double drho2ds2 = b2 * rhoa2i * arg1j2 - 2.0 / 3.0 * dj.arho2b * rhoa2i;
-        const double drho3ds1 = b3 * rhoa3j * arg1i3 - b3a * rhoa3j * arg3i3;
-        const double drho3ds2 = b3 * rhoa3i * arg1j3 - b3a * rhoa3i * arg3j3;
-        const double ais = (ed[i].rho0 != 0.0) ? rhoa0j / ed[i].rho0 : 0.0;
-        const double ajs = (ed[j].rho0 != 0.0) ? rhoa0i / ed[j].rho0 : 0.0;
-        const double dt1ds1b = ais * (t1mj - t1i), dt1ds2b = ajs * (t1mi - t1j);
-        const double dt2ds1b = ais * (t2mj - t2i), dt2ds2b = ajs * (t2mi - t2j);
-        const double dt3ds1b = ais * (t3mj - t3i), dt3ds2b = ajs * (t3mi - t3j);
-        drhods1 =
-            ed[i].dgamma1 * drho0ds1 +
-            ed[i].dgamma2 * (dt1ds1b * ed[i].rho1 + t1i * drho1ds1 + dt2ds1b * ed[i].rho2 +
-                             t2i * drho2ds1 + dt3ds1b * ed[i].rho3 + t3i * drho3ds1) -
-            ed[i].dgamma3 * (shp[0] * dt1ds1b + shp[1] * dt2ds1b + shp[2] * dt3ds1b);
-        drhods2 =
-            ed[j].dgamma1 * drho0ds2 +
-            ed[j].dgamma2 * (dt1ds2b * ed[j].rho1 + t1j * drho1ds2 + dt2ds2b * ed[j].rho2 +
-                             t2j * drho2ds2 + dt3ds2b * ed[j].rho3 + t3j * drho3ds2) -
-            ed[j].dgamma3 * (shp[0] * dt1ds2b + shp[1] * dt2ds2b + shp[2] * dt3ds2b);
-      }
-
-      const double dUdrij = phip * sij0 + ed[i].frhop * drhodr1 + ed[j].frhop * drhodr2;
-      double dUdsij = 0.0;
-      if (screen_active) dUdsij = phi + ed[i].frhop * drhods1 + ed[j].frhop * drhods2;
-      double dUdrijm[3];
-      for (int mm = 0; mm < 3; ++mm)
-        dUdrijm[mm] = ed[i].frhop * drhodrm1[mm] + ed[j].frhop * drhodrm2[mm];
-
-      const double force = dUdrij * recip + dUdsij * dscrfcn_ij;
-      const double fm0 = delij[0] * force + dUdrijm[0];
-      const double fm1 = delij[1] * force + dUdrijm[1];
-      const double fm2 = delij[2] * force + dUdrijm[2];
+      // SINGLE-SOURCE bond body (shared with meam_run_fixed_force + the Me5 GPU K3 kernel). The
+      // transpose-replay scatters each contribution ONLY to OWNED targets. F-NOOP.
+      const MeamForceParams fp = meam_force_params(p);
+      const MeamBondForce bf =
+          meam_bond_force_device(dens[i], dens[j], ed[i], ed[j], ej.dx, ej.dy, ej.dz, rij2, rij,
+                                 scrfcn_ij, scr[i][jn].fcpair, dscrfcn_ij, phi, phip, fp);
       // Role A (o == i, the lower endpoint): +fm. Role B (o == j, the higher endpoint): −fm.
-      if (is_owned[i]) { wFx[i].add(fm0); wFy[i].add(fm1); wFz[i].add(fm2); }
-      if (is_owned[j]) { wFx[j].add(-fm0); wFy[j].add(-fm1); wFz[j].add(-fm2); }
+      if (is_owned[i]) { wFx[i].add(bf.fm[0]); wFy[i].add(bf.fm[1]); wFz[i].add(bf.fm[2]); }
+      if (is_owned[j]) { wFx[j].add(-bf.fm[0]); wFy[j].add(-bf.fm[1]); wFz[j].add(-bf.fm[2]); }
 
       // The screening 3rd-atom k-loop (fires only for partial 0<sij<1 — dead on binary S). POISON
       // (drop_class>0): drop it entirely — the MB2 enumeration teeth (atom-k's force collapses ⇒
       // diverges from the oracle).
       if (std::fabs(sij0) < 1e-20 || std::fabs(sij0 - 1.0) < 1e-20) continue;
       if (drop_class > 0) continue;
-      const double delc = p.Cmax - p.Cmin, rbound = rij2 * p.ebound;
       for (size_t kn = 0; kn < nbr[i].size(); ++kn) {
         const auto& ek = nbr[i][kn];
         const int k = ek.j;
         if (k == j) continue;
-        const double dxik = ek.dx, dyik = ek.dy, dzik = ek.dz;
-        const double dxjk = ek.dx - ej.dx, dyjk = ek.dy - ej.dy, dzjk = ek.dz - ej.dz;
-        const double rjk2 = dxjk * dxjk + dyjk * dyjk + dzjk * dzjk;
-        if (rjk2 > rbound) continue;
-        const double rik2 = dxik * dxik + dyik * dyik + dzik * dzik;
-        if (rik2 > rbound) continue;
-        const double xik = rik2 / rij2, xjk = rjk2 / rij2;
-        const double aa = 1.0 - (xik - xjk) * (xik - xjk);
-        if (std::fabs(aa) < 1e-20) continue;
-        double cikj = (2.0 * (xik + xjk) + aa - 2.0) / aa;
-        if (!(cikj >= p.Cmin && cikj <= p.Cmax)) continue;
-        cikj = (cikj - p.Cmin) / delc;
-        double dfc;
-        const double sikj = meam_detail::dfcut(cikj, dfc);
-        double dCikj1, dCikj2;
-        meam_detail::dCfunc2(rij2, rik2, rjk2, dCikj1, dCikj2);
-        const double aw = sij0 / delc * dfc / sikj;
-        const double dsij1 = aw * dCikj1, dsij2 = aw * dCikj2;
-        if (std::fabs(dsij1) < 1e-20 && std::fabs(dsij2) < 1e-20) continue;
-        const double force1 = dUdsij * dsij1, force2 = dUdsij * dsij2;
+        const double rik2 = ek.dx * ek.dx + ek.dy * ek.dy + ek.dz * ek.dz;
+        const MeamScreenK sk = meam_screen_k_device(ek.dx, ek.dy, ek.dz, rik2, ej.dx, ej.dy, ej.dz,
+                                                    rij2, sij0, bf.dUdsij, fp);
+        if (!sk.active) continue;
         // Role A (o == i): +force1·d_ik. Role B (o == j): +force2·d_jk. Role C (o == k): the
         // −(force1·d_ik + force2·d_jk) third-atom write — the needs_transpose non-symmetric write.
-        if (is_owned[i]) { wFx[i].add(force1 * dxik); wFy[i].add(force1 * dyik); wFz[i].add(force1 * dzik); }
-        if (is_owned[j]) { wFx[j].add(force2 * dxjk); wFy[j].add(force2 * dyjk); wFz[j].add(force2 * dzjk); }
+        if (is_owned[i]) { wFx[i].add(sk.force1 * sk.dik[0]); wFy[i].add(sk.force1 * sk.dik[1]); wFz[i].add(sk.force1 * sk.dik[2]); }
+        if (is_owned[j]) { wFx[j].add(sk.force2 * sk.djk[0]); wFy[j].add(sk.force2 * sk.djk[1]); wFz[j].add(sk.force2 * sk.djk[2]); }
         if (is_owned[k]) {
-          wFx[k].add(-(force1 * dxik + force2 * dxjk));
-          wFy[k].add(-(force1 * dyik + force2 * dyjk));
-          wFz[k].add(-(force1 * dzik + force2 * dzjk));
+          wFx[k].add(-(sk.force1 * sk.dik[0] + sk.force2 * sk.djk[0]));
+          wFy[k].add(-(sk.force1 * sk.dik[1] + sk.force2 * sk.djk[1]));
+          wFz[k].add(-(sk.force1 * sk.dik[2] + sk.force2 * sk.djk[2]));
         }
       }
     }

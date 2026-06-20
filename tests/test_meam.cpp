@@ -38,6 +38,20 @@ core::AtomSoA<double> cluster(core::Box& box) {
   for (int i = 0; i < 3; ++i) { a.x[i] = pos[i][0]; a.y[i] = pos[i][1]; a.z[i] = pos[i][2]; a.type[i] = 1; a.mass[i] = 28.0855; a.id[i] = i + 1; }
   return a;
 }
+// the TAPER-BAND partial-screening triple (Me5-acceptance MUST-FIX): i–j bond 3.95 Å sits in the
+// radial screening taper (rnorm=(rc−rij)/delr=0.5 ∈ (0,1) ⇒ dfcut≠0 ⇒ the dscrfcn `−coef2` term is
+// LIVE), k on the perpendicular bisector at rik=rjk=3.53 Å (< rc) giving C=4·(rik²/rij²)−1≈2.20 ∈
+// (Cmin,Cmax) ⇒ 0<S<1. The standard cluster (bond 3.2 ⇒ rnorm=8 ⇒ dfcut=0 ⇒ coef2=0) leaves the
+// `−coef2` SIGN structurally untested — a +coef2 typo is a silent no-op there (the 4th recurrence of
+// the fc_d/ters_fc_d/partial-screening dead-branch class). Here FD-of-energy bites: flipping the sign
+// drives FD maxerr 2.9e-9 → 1.47 eV/Å.
+core::AtomSoA<double> taper_cluster(core::Box& box) {
+  box.lo = {0, 0, 0}; box.hi = {24, 24, 24}; box.periodic = {false, false, false};
+  core::AtomSoA<double> a; a.resize(3);
+  const double pos[3][3] = {{10, 10, 10}, {13.95, 10, 10}, {11.975, 12.93, 10}};
+  for (int i = 0; i < 3; ++i) { a.x[i] = pos[i][0]; a.y[i] = pos[i][1]; a.z[i] = pos[i][2]; a.type[i] = 1; a.mass[i] = 28.0855; a.id[i] = i + 1; }
+  return a;
+}
 double max_fdiff(const core::AtomSoA<double>& a, const core::AtomSoA<double>& b) {
   double m = 0; for (int i = 0; i < a.n; ++i) m = std::max({m, std::fabs(a.fx[i]-b.fx[i]), std::fabs(a.fy[i]-b.fy[i]), std::fabs(a.fz[i]-b.fz[i])}); return m;
 }
@@ -150,6 +164,20 @@ TEST(Meam, ForceMatchesFiniteDifferenceOfEnergy) {
   EXPECT_LT(fd_of_energy_maxerr(d, bd, p), 1e-5) << "diamond force ≠ −dU/dx";
   core::Box bc; auto c = cluster(bc);
   EXPECT_LT(fd_of_energy_maxerr(c, bc, p), 1e-5) << "cluster force ≠ −dU/dx (screening derivative)";
+}
+
+// G-FD-TAPER ⭐ — the dscrfcn RADIAL-TAPER derivative (`−coef2`) witness (Me5-acceptance MUST-FIX,
+// the 4th structurally-dead-branch recurrence). On the diamond + the 3.2 Å cluster the screened
+// bond's rnorm≥1 ⇒ dfcut=0 ⇒ coef2=0 ⇒ the `−coef2` SIGN is never exercised (a +coef2 typo is a
+// silent no-op). The taper-band triple (bond 3.95 Å, partial S) makes dfcut≠0 ⇒ FD-of-energy
+// witnesses the sign: measured 2.9e-9 correct vs 1.47 eV/Å flipped.
+TEST(Meam, ScreeningTaperDerivativeMatchesFD) {
+  pot::MeamParams p;
+  core::Box bt; auto t = taper_cluster(bt);
+  // the coef2 branch must be LIVE: a partial screened bond (0<S<1) IN the radial taper band.
+  const auto acc = pot::meam_energy(t, core::PairGeom(bt, p.rc), p);
+  ASSERT_EQ(acc.n_screened_partial, 1) << "taper triple not partially screened — coef2 branch dead";
+  EXPECT_LT(fd_of_energy_maxerr(t, bt, p), 1e-5) << "taper-band screening force ≠ −dU/dx (coef2 sign?)";
 }
 
 // G-SCREEN-FORCE-DEAD ⭐ — on the diamond, S is BINARY (∂S=0) ⇒ the screening-derivative k-loop

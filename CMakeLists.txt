@@ -411,6 +411,20 @@ if(TDMD_BUILD_TESTS)
     add_test(NAME Test_CUDA_Tersoff_Ring COMMAND test_cuda_tersoff_ring)
     set_tests_properties(Test_CUDA_Tersoff_Ring PROPERTIES LABELS cuda)
 
+    # Me5: GPU MEAM (the screened many-body force — screening Π_k S + ρ⁰..ρ³ + embedding + the
+    # 3rd-atom ∂S/∂x_k transpose force). --fmad=false (via tdmd_eam_cuda_flags) for GPU-INTERNAL
+    # structural determinism; CPU↔GPU is TOLERANCE (exp/log/pow), the FP64 oracle is the witness.
+    add_executable(test_cuda_meam tests/test_cuda_meam.cu)             # per-window K1/K2/K3 kernels
+    target_link_libraries(test_cuda_meam PRIVATE tdmd_core GTest::gtest_main tdmd_eam_cuda_flags)
+    add_test(NAME Test_CUDA_MEAM COMMAND test_cuda_meam)
+    set_tests_properties(Test_CUDA_MEAM PROPERTIES LABELS cuda)
+
+    add_executable(test_cuda_meam_ring tests/test_cuda_meam_ring.cu)   # live GPU MEAM ring (single + z>1)
+    target_link_libraries(test_cuda_meam_ring PRIVATE tdmd_core GTest::gtest_main
+                          tdmd_eam_cuda_flags Threads::Threads)
+    add_test(NAME Test_CUDA_MEAM_Ring COMMAND test_cuda_meam_ring)
+    set_tests_properties(Test_CUDA_MEAM_Ring PROPERTIES LABELS cuda)
+
     # M6 E5c: cell-list culled EAM kernels. Test A (bitwise cells == all-window)
     # + Test B (the BLOCKING dropped-donor gate vs eam_direct_fp64). --fmad=false
     # via tdmd_eam_cuda_flags (the f_over_r/Horner fuse would break 1 ULP).
