@@ -30,7 +30,7 @@
 
 namespace core = tdmd::core;
 namespace pot = tdmd::potentials;
-namespace cuda = tdmd::cuda;
+namespace tdcu = tdmd::cuda;
 
 namespace {
 struct Window {
@@ -63,7 +63,7 @@ Forces cpu_window(const Window& w, const pot::MeamParams& p, int drop = 0) {
   return f;
 }
 GpuForces gpu_window(const Window& w, const pot::MeamParams& p, bool skip_sort = false, int drop = 0) {
-  cuda::GpuMeamWinForce<double> g(p, w.box);
+  tdcu::GpuMeamWinForce<double> g(p, w.box);
   g.skip_sort = skip_sort; g.drop_class = drop;
   const core::PairGeom geom(w.box, p.rc);
   std::vector<core::fixed::ForceAccum> Fx(w.m), Fy(w.m), Fz(w.m);
@@ -132,9 +132,9 @@ TEST(CudaMeam, NeighbourCapMargin) {
   pot::MeamParams p;
   const int dia = max_nbr(dia_win(), p);
   const int slab = max_nbr(slab_win(false), p);
-  fprintf(stderr, "[G1] realized max in-rc neighbours: diamond=%d slab=%d (cap=%d)\n", dia, slab, cuda::kMeamMaxNbr);
-  EXPECT_LT(dia, cuda::kMeamMaxNbr);
-  EXPECT_LT(slab, cuda::kMeamMaxNbr);
+  fprintf(stderr, "[G1] realized max in-rc neighbours: diamond=%d slab=%d (cap=%d)\n", dia, slab, tdcu::kMeamMaxNbr);
+  EXPECT_LT(dia, tdcu::kMeamMaxNbr);
+  EXPECT_LT(slab, tdcu::kMeamMaxNbr);
 }
 
 // G2 — CPU↔GPU TOLERANCE (NOT bitwise — exp/log/pow ~1 ulp), diamond + slab (free + PBC).
@@ -252,7 +252,7 @@ TEST(CudaMeam, OverflowHalt) {
   std::mt19937 rng(1); std::uniform_real_distribution<double> u(0.0, 2.5);  // dense cube within rc=4
   for (int i = 0; i < 80; ++i) { w.wx.push_back(u(rng)); w.wy.push_back(u(rng)); w.wz.push_back(u(rng)); w.key.push_back(i); w.owned.push_back(i); }
   w.m = 80;  // each atom sees ~79 mutual neighbours (max sep 2.5·√3≈4.33; many < rc=4) > kMaxNbr=64
-  cuda::GpuMeamWinForce<double> g(p, w.box);
+  tdcu::GpuMeamWinForce<double> g(p, w.box);
   const core::PairGeom geom(w.box, p.rc);
   std::vector<core::fixed::ForceAccum> Fx(80), Fy(80), Fz(80);
   core::fixed::EnergyAccum pe; double mr2 = 1e300;

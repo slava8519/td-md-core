@@ -27,7 +27,7 @@
 
 namespace core = tdmd::core;
 namespace pot = tdmd::potentials;
-namespace cuda = tdmd::cuda;
+namespace tdcu = tdmd::cuda;
 
 namespace {
 core::ConveyorOptions ropt(long steps, int n_zones, int n_nodes, double dt) {
@@ -39,7 +39,7 @@ core::ConveyorOptions ropt(long steps, int n_zones, int n_nodes, double dt) {
 core::ConveyorResult gpu_run(core::AtomSoA<double>& a, const core::Box& box,
                              const pot::MeamParams& p, const core::ConveyorOptions& o) {
   pot::MeamPotential<double> mpot(p);
-  return pot::run_meam_ring(a, box, mpot, o, cuda::GpuMeamWinForce<double>(p, box));
+  return pot::run_meam_ring(a, box, mpot, o, tdcu::GpuMeamWinForce<double>(p, box));
 }
 bool state_eq(const core::AtomSoA<double>& a, const core::AtomSoA<double>& b) {
   for (int i = 0; i < a.n; ++i)
@@ -139,16 +139,16 @@ TEST(CudaMeamRing, MatchesFp64OracleTrajectory) {
 TEST(CudaMeamRing, FirewallAcceptsScreeningTranspose) {
   using pot::PassDecl; using pot::PassKind;
   pot::MeamPotential<double> mpot{};
-  EXPECT_NO_THROW(cuda::GpuMeamWinForce<double>::assert_supported(mpot.passes()));
-  static_assert(requires { cuda::GpuMeamWinForce<double>::assert_supported(std::span<const pot::PassDecl>{}); },
+  EXPECT_NO_THROW(tdcu::GpuMeamWinForce<double>::assert_supported(mpot.passes()));
+  static_assert(requires { tdcu::GpuMeamWinForce<double>::assert_supported(std::span<const pot::PassDecl>{}); },
                 "firewall seam must be live");
   const PassDecl ters2[2] = {{PassKind::BondOrder,true,false,false,0},{PassKind::Force,true,true,false,40}};
-  EXPECT_THROW(cuda::GpuMeamWinForce<double>::assert_supported(ters2), std::runtime_error);
+  EXPECT_THROW(tdcu::GpuMeamWinForce<double>::assert_supported(ters2), std::runtime_error);
   const PassDecl eam_sym[3] = {{PassKind::Density,true,false,false,44},{PassKind::Embedding,false,false,false,30},{PassKind::Force,true,false,false,40}};
-  EXPECT_THROW(cuda::GpuMeamWinForce<double>::assert_supported(eam_sym), std::runtime_error);
+  EXPECT_THROW(tdcu::GpuMeamWinForce<double>::assert_supported(eam_sym), std::runtime_error);
   PassDecl it[3] = {{PassKind::Density,true,false,false,44},{PassKind::Embedding,false,false,false,30},{PassKind::Force,true,true,false,40}};
   it[0].iterative = true;
-  EXPECT_THROW(cuda::GpuMeamWinForce<double>::assert_supported(it), std::runtime_error);
+  EXPECT_THROW(tdcu::GpuMeamWinForce<double>::assert_supported(it), std::runtime_error);
 }
 
 // G13 — anti-deadlock across node counts.

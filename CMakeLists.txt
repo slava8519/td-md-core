@@ -111,6 +111,13 @@ if(TDMD_WITH_CUDA)
   target_compile_options(bench_eam PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 
+  # Me5b (perf track): MEAM cell-list culling bake-off (R_cull per N) + the FIRST
+  # angular flagship-scale (10⁶) atom-steps/s number. --fmad=false (deterministic_fp64).
+  add_executable(bench_meam_cells tools/bench_meam_cells.cu)
+  target_link_libraries(bench_meam_cells PRIVATE tdmd_core)
+  target_compile_options(bench_meam_cells PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+
   # E5c FMA twin: same kernels, FMA contraction ON (the GPU default). On the
   # FP64-1:64 RTX 5080 a fused mul-add is 1 FP64 op vs 2 ⇒ ~2× the FP64
   # throughput of the --fmad=false determinism build. GPU-INTERNAL determinism
@@ -428,6 +435,17 @@ if(TDMD_BUILD_TESTS)
                           tdmd_eam_cuda_flags Threads::Threads)
     add_test(NAME Test_CUDA_MEAM_Ring COMMAND test_cuda_meam_ring)
     set_tests_properties(Test_CUDA_MEAM_Ring PROPERTIES LABELS cuda)
+
+    # Me5b: cell-list culled MEAM kernels. G-A (bitwise cells == all-window via the canonical-k
+    # cull) + G-B (the BLOCKING dropped-screening-k gate vs meam_direct_fp64, on the PARTIAL
+    # fixtures) + G-POISON teeth (both knobs). --fmad=false via tdmd_eam_cuda_flags.
+    add_executable(test_cuda_meam_cells tests/test_cuda_meam_cells.cu)
+    target_link_libraries(test_cuda_meam_cells PRIVATE tdmd_core GTest::gtest_main
+                          tdmd_eam_cuda_flags)
+    target_compile_options(test_cuda_meam_cells PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
+    add_test(NAME Test_CUDA_MEAM_Cells COMMAND test_cuda_meam_cells)
+    set_tests_properties(Test_CUDA_MEAM_Cells PROPERTIES LABELS cuda)
 
     # M6 E5c: cell-list culled EAM kernels. Test A (bitwise cells == all-window)
     # + Test B (the BLOCKING dropped-donor gate vs eam_direct_fp64). --fmad=false
