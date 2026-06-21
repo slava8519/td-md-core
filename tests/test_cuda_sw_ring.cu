@@ -146,3 +146,20 @@ TEST(CudaSwRing, AntiDeadlock) {
     EXPECT_EQ(r.steps_done, 2 * z + 3) << "incomplete z=" << z;
   }
 }
+
+// G13 ⭐ — LIVE-RING cells integration (SW-T5b → ring): the cells path (now cull=true production
+// default) is BITWISE to the all-window ring IN THE LIVE RING (z=1 AND 1-vs-z), free + PBC. SW is
+// int64-order-free ⇒ cells≡all-window by B1; this proves it survives the host-orchestrated ring.
+TEST(CudaSwRing, LiveRingCellsBitwiseToAllWindow) {
+  pot::SwParams sp; pot::SwPotential<double> spot(sp); const double dt = 0.0004; const long steps = 8;
+  for (bool pbc : {false, true}) {
+    core::Box box; auto init = tdmd::gen::make_diamond_si(2, 2, kNz, 5.431, 0.0, box);
+    box.periodic = {true, true, pbc}; core::thermal::maxwell_init(init, 300.0, 21); core::thermal::zero_momentum(init);
+    core::AtomSoA<double> aw = init, cl = init, c2 = init;
+    pot::run_sw_ring(aw, box, spot, ropt(steps, 6, 1, dt), tdcu::GpuSwWinForce<double>(sp, box, /*cull=*/false));
+    pot::run_sw_ring(cl, box, spot, ropt(steps, 6, 1, dt), tdcu::GpuSwWinForce<double>(sp, box, /*cull=*/true));
+    EXPECT_TRUE(state_eq(aw, cl)) << "SW cells-ring ≠ all-window-ring (z=1, pbc=" << pbc << ")";
+    pot::run_sw_ring(c2, box, spot, ropt(steps, 6, 3, dt), tdcu::GpuSwWinForce<double>(sp, box, /*cull=*/true));
+    EXPECT_TRUE(state_eq(cl, c2)) << "SW cells-ring 1-vs-z (z=3) not bitwise (pbc=" << pbc << ")";
+  }
+}

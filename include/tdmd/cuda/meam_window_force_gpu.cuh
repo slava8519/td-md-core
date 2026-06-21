@@ -202,8 +202,8 @@ struct GpuMeamWinForce {
   int drop_class = 0;       // TEST-ONLY (G6 poison): drop Role C → the MB2 teeth
   int poison_s = 0;         // TEST-ONLY (G-POISON): force a too-small cell stencil (G-A teeth)
 
-  GpuMeamWinForce(const potentials::MeamParams& p, const core::Box& box, bool cull = false,
-                  int cell_div = 0)
+  GpuMeamWinForce(const potentials::MeamParams& p, const core::Box& box, bool cull = true,
+                  int cell_div = 0)  // cull DEFAULT-ON (gates green; AUTO): live-ring R_ring≈17× bitwise
       : st(std::make_shared<GpuMeamWindowState>(p, box, cull, cell_div)) {
     // Three-leg min-image guard (MEAM's j–k leg is a DIFFERENCE of two min-imaged vectors).
     for (int d = 0; d < 3; ++d)

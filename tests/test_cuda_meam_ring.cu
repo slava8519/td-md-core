@@ -162,3 +162,23 @@ TEST(CudaMeamRing, AntiDeadlock) {
     EXPECT_EQ(r.steps_done, 2 * z + 3) << "incomplete z=" << z;
   }
 }
+
+// G14 ⭐ — LIVE-RING cells integration (Me5b → ring): the cells path (now the cull=true production
+// default) is BITWISE to the all-window ring IN THE LIVE RING (z=1 AND 1-vs-z), slab + diamond,
+// free + PBC. Proves cells≡all-window survives the host-orchestrated ring (not just isolation). The
+// cull translates — the all-window MEAM ring is intractable at scale (~17× slower, measured) ⇒ cells
+// default-on. Both paths constructed EXPLICITLY (independent of the flipped default) ⇒ pins both.
+TEST(CudaMeamRing, LiveRingCellsBitwiseToAllWindow) {
+  pot::MeamParams p; const double dt = 0.0003; const long steps = 6;
+  for (int which = 0; which < 2; ++which)
+    for (bool pbc : {false, true}) {
+      core::Box box; core::AtomSoA<double> init = which == 0 ? slab(box, pbc, 21) : dia(box, pbc, 21);
+      pot::MeamPotential<double> mp(p);
+      core::AtomSoA<double> aw = init, cl = init, c2 = init;
+      pot::run_meam_ring(aw, box, mp, ropt(steps, 6, 1, dt), tdcu::GpuMeamWinForce<double>(p, box, /*cull=*/false));
+      pot::run_meam_ring(cl, box, mp, ropt(steps, 6, 1, dt), tdcu::GpuMeamWinForce<double>(p, box, /*cull=*/true));
+      EXPECT_TRUE(state_eq(aw, cl)) << "cells-ring ≠ all-window-ring (z=1, which=" << which << " pbc=" << pbc << ")";
+      pot::run_meam_ring(c2, box, mp, ropt(steps, 6, 3, dt), tdcu::GpuMeamWinForce<double>(p, box, /*cull=*/true));
+      EXPECT_TRUE(state_eq(cl, c2)) << "cells-ring 1-vs-z (z=3) not bitwise (which=" << which << " pbc=" << pbc << ")";
+    }
+}

@@ -151,3 +151,20 @@ TEST(CudaTersoffRing, AntiDeadlock) {
     EXPECT_EQ(r.steps_done, 2 * z + 3) << "incomplete z=" << z;
   }
 }
+
+// G14 ⭐ — LIVE-RING cells integration (Tersoff-Te5b → ring): the cells path (now cull=true production
+// default) is BITWISE to the all-window ring IN THE LIVE RING (z=1 AND 1-vs-z), free + PBC. Tersoff's
+// FP64 ζ-sum needs the canonical-ζ cull ⇒ this proves the cull stays bitwise in the host ring.
+TEST(CudaTersoffRing, LiveRingCellsBitwiseToAllWindow) {
+  pot::TersoffParams p; pot::TersoffPotential<double> tpot(p); const double dt = 0.0004; const long steps = 8;
+  for (bool pbc : {false, true}) {
+    core::Box box; auto init = tdmd::gen::make_diamond_si(2, 2, kNz, 5.431, 0.0, box);
+    box.periodic = {true, true, pbc}; core::thermal::maxwell_init(init, 300.0, 21); core::thermal::zero_momentum(init);
+    core::AtomSoA<double> aw = init, cl = init, c2 = init;
+    pot::run_tersoff_ring(aw, box, tpot, ropt(steps, 6, 1, dt), tdcu::GpuTersoffWinForce<double>(p, box, /*cull=*/false));
+    pot::run_tersoff_ring(cl, box, tpot, ropt(steps, 6, 1, dt), tdcu::GpuTersoffWinForce<double>(p, box, /*cull=*/true));
+    EXPECT_TRUE(state_eq(aw, cl)) << "Tersoff cells-ring ≠ all-window-ring (z=1, pbc=" << pbc << ")";
+    pot::run_tersoff_ring(c2, box, tpot, ropt(steps, 6, 3, dt), tdcu::GpuTersoffWinForce<double>(p, box, /*cull=*/true));
+    EXPECT_TRUE(state_eq(cl, c2)) << "Tersoff cells-ring 1-vs-z (z=3) not bitwise (pbc=" << pbc << ")";
+  }
+}

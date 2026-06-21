@@ -658,3 +658,21 @@ EAM-cells куллит O(m)-сумму плотности (B1-order-free int64).
 **ИСПРАВЛЕННЫЙ ВЕРДИКТ:** «register-bound, обратно ∝ register-pressure» — МИС-АТРИБУЦИЯ; register count — ПРОКСИ объёма FP64-работы, не связывающее ограничение. Реальный потолок — FP64-трансцендентная пропускная (consumer-Blackwell 1:64). Дешёвые рычаги (registers/gather-once) NULL; FMA модест (+8% SW/Tersoff, 0% MEAM). **Большие рычаги (отложены, риск):** алгоритмическое сокращение трансцендентов; mixed-precision FP32-трансценденты (ломает bitwise + LAMMPS-точность). MEAM не выиграет от FMA — нужен алгоритмический рычаг.
 
 **ОГОВОРКИ:** числа INTERNAL (free-z/z=1/fp64); под сопернич. за GPU −2-3× (мерить idle); память gated к 10⁶.
+
+### Live-ring cells integration (2026-06-21) — angular cells DEFAULT-ON в живом кольце
+
+Вопрос: переносится ли изолированный cull (R_cull) на ЖИВОЕ host-оркестрованное `*GpuRing` (как E5c-ring у EAM)? **ДА — и побитово.** Дефолт `cull` у `Gpu{Meam,Sw,Tersoff}WinForce` ctor флипнут `false→true` (гейты зелёные; AUTO `cell_div`), как у EAM E5c.
+
+**КОРРЕКТНОСТЬ (новый гейт `LiveRingCellsBitwiseToAllWindow`, по одному на кольцо-тест):** cells-кольцо ≡ all-window-кольцо **ПОБИТОВО** в живом кольце (z=1 И 1-vs-z, free+PBC, slab+diamond) — оба пути конструируются ЯВНО (cull=false vs true), независимо от флипнутого дефолта ⇒ пинят оба. Доказывает, что cells≡all-window переживает host-оркестрацию (gather/transport/Λ-chain), не только изоляцию (`test_cuda_*_cells`). Suite CUDA 57/57, CPU 40/40.
+
+**ПЕРЕНОС (R_ring = t(all-window-ring)/t(cells-ring), изолир. прогон):**
+
+| Потенциал | N | R_ring | all-window-кольцо |
+|---|---|---|---|
+| **SW** | 4096 | **2.3×** | 0.51 с (дешёвое — cull при этом N скромен) |
+| **Tersoff** | 4096 | **12.6×** | 14.3 с |
+| **MEAM** | 2048 / 6144 | **17.5× / 17.1×** | 51 с / 153 с (интрактабельно!) |
+
+R_ring ∝ стоимости all-window (MEAM-screening > Tersoff-ζ > SW). **All-window MEAM/Tersoff-кольцо ИНТРАКТАБЕЛЬНО на масштабе** (153 с на 6144 атома × 3 шага) ⇒ cells не «оптимизация», а ВКЛЮЧАЮЩЕЕ условие живого angular-кольца. Поэтому default-on. (E5c-ring у EAM: R_ring 4.30, 99% kernel-bound — тот же вывод.)
+
+**ОГОВОРКА:** R_ring измерен z=1/free-z/fp64; z>1 на одной GPU concurrency-dead (mutex на null-stream, как у EAM) — реальный multi-zone выигрыш = multi-GPU (M5b). Cells на одной GPU дают пер-window kernel-выигрыш в кольце.

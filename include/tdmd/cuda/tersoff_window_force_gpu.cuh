@@ -156,8 +156,8 @@ struct GpuTersoffWinForce {
   bool skip_sort = false;  // TEST-ONLY (G-ζORDER): skip the canonical sort to prove it bites
   int poison_s = 0;        // TEST-ONLY (G-POISON): force a too-small cell stencil (G-A teeth)
 
-  GpuTersoffWinForce(const potentials::TersoffParams& tp, const core::Box& box, bool cull = false,
-                     int cell_div = 0)
+  GpuTersoffWinForce(const potentials::TersoffParams& tp, const core::Box& box, bool cull = true,
+                     int cell_div = 0)  // cull DEFAULT-ON (gates green; AUTO): live-ring cull translates bitwise
       : st(std::make_shared<GpuTersoffWindowState>(tp, box, cull, cell_div)) {
     for (int d = 0; d < 3; ++d)
       if (box.periodic[d] && box.len(d) < 2.0 * tp.rcut())

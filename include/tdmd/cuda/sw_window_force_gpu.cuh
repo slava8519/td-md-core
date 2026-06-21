@@ -146,8 +146,8 @@ struct GpuSwWinForce {
   std::shared_ptr<GpuSwWindowState> st;
   int poison_s = 0;  // TEST-ONLY (G-POISON): force a too-small cell stencil (G-A teeth)
 
-  GpuSwWinForce(const potentials::SwParams& sp, const core::Box& box, bool cull = false,
-                int cell_div = 0)
+  GpuSwWinForce(const potentials::SwParams& sp, const core::Box& box, bool cull = true,
+                int cell_div = 0)  // cull DEFAULT-ON (gates green; AUTO): live-ring cull translates bitwise
       : st(std::make_shared<GpuSwWindowState>(sp, box, cull, cell_div)) {
     // SW two-wing min-image guard (host; mirrors SwRing ctor + sw_zone_pass): every
     // periodic box dim > 2·rcut, else a wing bond could wrap to a wrong image (the
