@@ -54,7 +54,8 @@ FetchContent_MakeAvailable(yaml-cpp)
 add_library(tdmd_core
   src/io/reader_lammps.cpp
   src/io/writer.cpp
-  src/io/rescue.cpp)
+  src/io/rescue.cpp
+  src/cli/dashboard.cpp)   # M7: live ANSI dashboard renderer (pure formatter)
 target_include_directories(tdmd_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_compile_definitions(tdmd_core PUBLIC
   TDMD_PROJECT_ROOT="${CMAKE_CURRENT_SOURCE_DIR}")
@@ -354,6 +355,11 @@ if(TDMD_BUILD_TESTS)
   add_executable(test_metrics tests/test_metrics.cpp)      # M4-N: perf-breakdown math
   target_link_libraries(test_metrics PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_Metrics COMMAND test_metrics)
+
+  add_executable(test_dashboard tests/test_dashboard.cpp)  # M7: live ANSI dashboard + A6
+  target_link_libraries(test_dashboard PRIVATE tdmd_core GTest::gtest_main
+                        Threads::Threads)
+  add_test(NAME Test_Dashboard COMMAND test_dashboard)
 
   add_executable(test_oracle tests/test_oracle.cpp)        # M4-N Gate-02a: physical oracle
   target_link_libraries(test_oracle PRIVATE tdmd_core GTest::gtest_main)

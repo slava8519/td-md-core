@@ -1,0 +1,57 @@
+# TD-MD Core — Docker / Podman image (the Apptainer def's twin).
+#
+# The one intentional difference from deploy/apptainer/tdmd.def: this COPYs the
+# working checkout (`COPY . /opt/tdmd` — builds THIS tree, e.g. a PR), whereas
+# the .def `git clone`s a fixed tag (reproducible cluster deploy). Both bake the
+# same CPU smoke as a build-time RUN.
+#
+# Build (from the repo root):
+#   docker build  -f deploy/docker/Containerfile -t tdmd .
+#   podman build  -f deploy/docker/Containerfile -t tdmd .
+# Run single-GPU:
+#   docker run --gpus all tdmd config/your.yaml
+# Compile-only (no GPU on the build host): the smoke is CPU-only by design.
+
+# ---- build stage ----
+FROM nvidia/cuda:13.1.0-devel-ubuntu24.04 AS build
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        cmake ninja-build git ca-certificates g++ \
+        libopenmpi-dev openmpi-bin \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /opt/tdmd
+COPY . /opt/tdmd
+
+# yaml-cpp + googletest are FetchContent (CMakeLists) — the build needs network.
+# Arch defaults to the dev-box 5080; override per cluster with --build-arg.
+ARG TDMD_CUDA_ARCH=120-real
+RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DTDMD_WITH_CUDA=ON -DTDMD_WITH_MPI=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="${TDMD_CUDA_ARCH}" \
+    && cmake --build build
+
+# In-container CPU smoke at build time (the build host has no GPU): -LE cuda
+# excludes the GPU-labeled tests; golden tests are LAMMPS-free; then run the
+# engine a few steps on a tiny golden config.
+RUN ctest --test-dir build --output-on-failure -LE cuda \
+    && ./build/tdmd config/config_m0.yaml
+
+# ---- runtime stage ----
+# A runtime base (no nvcc) keeps the deploy image smaller; --gpus all + the host
+# driver provide the CUDA runtime. libopenmpi for the multi-node ring (M5b).
+FROM nvidia/cuda:13.1.0-runtime-ubuntu24.04 AS runtime
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        openmpi-bin libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=build /opt/tdmd/build /opt/tdmd/build
+COPY --from=build /opt/tdmd/config /opt/tdmd/config
+COPY --from=build /opt/tdmd/reference_data /opt/tdmd/reference_data
+WORKDIR /opt/tdmd
+
+# Default: run the engine on the given config (default = the m0 smoke).
+ENTRYPOINT ["/opt/tdmd/build/tdmd"]
+CMD ["config/config_m0.yaml"]

@@ -1,12 +1,17 @@
 #include <algorithm>
 #include <cstdio>
+#include <cstdlib>
+#include <memory>
 #include <string>
 #include <cmath>
+#include <unistd.h>
 
 #include "tdmd/io/config.hpp"
 #include "tdmd/io/reader_lammps.hpp"
 #include "tdmd/io/writer.hpp"
 #include "tdmd/io/rescue.hpp"
+#include "tdmd/cli/dashboard.hpp"
+#include "tdmd/cli/progress_monitor.hpp"
 #include "tdmd/core/conveyor.hpp"
 #include "tdmd/core/soa.hpp"
 #include "tdmd/core/simulation.hpp"
@@ -44,8 +49,29 @@ struct RingLJ {
 
 }  // namespace
 
+// TTY detection (design Part 3c): live ANSI only on an interactive terminal,
+// never in CI/pipes/NO_COLOR. The dashboard renders to STDERR so STDOUT stays
+// the parseable summary.
+namespace {
+bool want_ansi() {
+  return ::isatty(fileno(stdout)) && std::getenv("TERM") != nullptr &&
+         std::getenv("CI") == nullptr && std::getenv("NO_COLOR") == nullptr;
+}
+}  // namespace
+
 int main(int argc, char** argv) {
-  const std::string cfg_path = (argc > 1) ? argv[1] : "config/config_m0.yaml";
+  std::string cfg_path = "config/config_m0.yaml";
+  bool dashboard = false;
+  bool got_cfg = false;
+  for (int i = 1; i < argc; ++i) {
+    const std::string a = argv[i];
+    if (a == "--dashboard") {
+      dashboard = true;
+    } else if (!got_cfg) {
+      cfg_path = a;
+      got_cfg = true;
+    }
+  }
 
   io::Config cfg;
   try {
@@ -62,10 +88,9 @@ int main(int argc, char** argv) {
   // FS-EAM) / PR-E3 (on the ring). Reject explicitly so it can NEVER silently
   // fall through to the morse branch below (the dispatch is `if lj … else morse`).
   if (cfg.pot_type == "eam") {
-    std::fprintf(stderr,
-                 "[fatal] potential.type: eam parsed OK but is not runnable in "
-                 "this build — EAM lands in M6 PR-E1+ (see "
-                 "docs/_meta/M6_EAM_MANYBODY_DESIGN_2026-06-14.md)\n");
+    std::fprintf(stderr, "[fatal] potential.type: eam parsed OK but is not runnable in "
+                         "this build — EAM lands in M6 PR-E1+ (see "
+                         "docs/_meta/M6_EAM_MANYBODY_DESIGN_2026-06-14.md)\n");
     return 2;
   }
 
@@ -73,17 +98,17 @@ int main(int argc, char** argv) {
   std::printf("=== TD-MD Core ===\n");
   std::printf("config       : %s\n", cfg_path.c_str());
   std::printf("units        : metal (eV, Å, amu, ps)\n");
-  std::printf("constants    : kB=%.9e eV/K  ftm2v=%.6f  mvv2e=%.7e\n",
-              units::kB, units::ftm2v, units::mvv2e);
+  std::printf("constants    : kB=%.9e eV/K  ftm2v=%.6f  mvv2e=%.7e\n", units::kB, units::ftm2v,
+              units::mvv2e);
   std::printf("precision    : %s\n", cfg.precision_mode.c_str());
-  std::printf("ensemble     : %s   steps=%ld   dt=%g ps (%s)\n",
-              cfg.ensemble.c_str(), cfg.steps, cfg.dt, cfg.ts_mode.c_str());
+  std::printf("ensemble     : %s   steps=%ld   dt=%g ps (%s)\n", cfg.ensemble.c_str(), cfg.steps,
+              cfg.dt, cfg.ts_mode.c_str());
   if (cfg.pot_type == "lj")
-    std::printf("potential    : lj  r_cut=%g  truncation=%s  epsilon=%g sigma=%g\n",
-                cfg.rcut, cfg.truncation.c_str(), cfg.lj_epsilon, cfg.lj_sigma);
+    std::printf("potential    : lj  r_cut=%g  truncation=%s  epsilon=%g sigma=%g\n", cfg.rcut,
+                cfg.truncation.c_str(), cfg.lj_epsilon, cfg.lj_sigma);
   else
-    std::printf("potential    : morse  r_cut=%g  truncation=%s  D=%g alpha=%g r0=%g\n",
-                cfg.rcut, cfg.truncation.c_str(), cfg.D, cfg.alpha, cfg.r0);
+    std::printf("potential    : morse  r_cut=%g  truncation=%s  D=%g alpha=%g r0=%g\n", cfg.rcut,
+                cfg.truncation.c_str(), cfg.D, cfg.alpha, cfg.r0);
 
   core::AtomSoA<double> atoms;
   core::Box box;
@@ -93,44 +118,39 @@ int main(int argc, char** argv) {
     return 1;
   }
   std::printf("geometry     : %s  N=%d  box=[%.4f %.4f %.4f]  pbc=[%d%d%d]\n",
-              cfg.geom_file.c_str(), atoms.n, box.len(0), box.len(1), box.len(2),
-              box.periodic[0], box.periodic[1], box.periodic[2]);
+              cfg.geom_file.c_str(), atoms.n, box.len(0), box.len(1), box.len(2), box.periodic[0],
+              box.periodic[1], box.periodic[2]);
 
   // min-image validity (ConfigSchema): r_cut <= ½·min box edge
   const double min_edge = std::min({box.len(0), box.len(1), box.len(2)});
   if (cfg.rcut > 0.5 * min_edge + 1e-12) {
-    std::fprintf(stderr,
-                 "[fatal] r_cut=%g > half min box edge %g — min-image invalid\n",
-                 cfg.rcut, 0.5 * min_edge);
+    std::fprintf(stderr, "[fatal] r_cut=%g > half min box edge %g — min-image invalid\n", cfg.rcut,
+                 0.5 * min_edge);
     return 1;
   }
 
   // M2.6 (B8): init_temperature > 0 — Maxwell velocities from run.seed
   // (overrides any Velocities from the data file); 0 — keep file velocities.
   if (cfg.init_temperature > 0.0) {
-    core::thermal::maxwell_init(atoms, cfg.init_temperature,
-                                static_cast<uint64_t>(cfg.seed));
+    core::thermal::maxwell_init(atoms, cfg.init_temperature, static_cast<uint64_t>(cfg.seed));
   }
   {
-    const double T0 =
-        core::thermal::temperature(atoms, core::thermal::dof_thermal(atoms.n));
+    const double T0 = core::thermal::temperature(atoms, core::thermal::dof_thermal(atoms.n));
     const auto p = core::thermal::momentum(atoms);
     std::printf("thermal init : %s  T(0)=%.4f K  |p|=(%.3e %.3e %.3e) amu·Å/ps\n",
-                cfg.init_temperature > 0.0 ? "maxwell(seed)" : "from data file",
-                T0, p[0], p[1], p[2]);
+                cfg.init_temperature > 0.0 ? "maxwell(seed)" : "from data file", T0, p[0], p[1],
+                p[2]);
   }
 
   core::SimOptions opt;
-  opt.steps       = cfg.steps;
-  opt.dt          = cfg.dt;
-  opt.auto_step   = (cfg.ts_mode == "auto");
-  opt.ts          = {cfg.C1, cfg.K2, cfg.C3, cfg.C_buf,
-                     cfg.cell_size, cfg.dt_max, 1e-6};
+  opt.steps = cfg.steps;
+  opt.dt = cfg.dt;
+  opt.auto_step = (cfg.ts_mode == "auto");
+  opt.ts = {cfg.C1, cfg.K2, cfg.C3, cfg.C_buf, cfg.cell_size, cfg.dt_max, 1e-6};
   opt.frame_every = cfg.traj_every;
   if (opt.auto_step)
-    std::printf("auto-step    : C1=%g K2=%g C3=%g C_buf=%g cell=%g dt_max=%g\n",
-                opt.ts.C1, opt.ts.K2, opt.ts.C3, opt.ts.C_buf,
-                opt.ts.cell_size, opt.ts.dt_max);
+    std::printf("auto-step    : C1=%g K2=%g C3=%g C_buf=%g cell=%g dt_max=%g\n", opt.ts.C1,
+                opt.ts.K2, opt.ts.C3, opt.ts.C_buf, opt.ts.cell_size, opt.ts.dt_max);
 
   // --- M4: TD ring path (CPU reference conveyor) when decomposition asks ---
   int n_zones = cfg.n_zones;
@@ -168,25 +188,44 @@ int main(int argc, char** argv) {
     co.verlet_K_off = cfg.verlet_K_off;
     co.verlet_default = cfg.verlet_default;
 
-    const potentials::Truncation rtr =
-        cfg.truncation == "cut"           ? potentials::Truncation::Cut
-        : cfg.truncation == "force_shift" ? potentials::Truncation::ForceShift
-                                          : potentials::Truncation::Shift;
+    // --- M7 dashboard (observational; INV-9 preserved — gate A7) ---
+    std::unique_ptr<cli::ProgressMonitor> mon;
+    if (dashboard) {
+      const bool tty = want_ansi();
+      cli::Snapshot ctx;
+      ctx.e0 = 0.0;  // filled by the first pass via on_pass (pe+ke); e0 from t0
+      ctx.n_dof = core::thermal::dof_thermal(atoms.n);
+      ctx.zones = n_zones;
+      ctx.nodes = cfg.ring_nodes;
+      mon = std::make_unique<cli::ProgressMonitor>(stderr, tty, cfg.steps, ctx);
+      mon->set_c_buf(cfg.C_buf);
+      // The hook is fired once per completed pass, AFTER the B1 reduce, from
+      // the node thread that wrote stats[h-1]. The monitor locks its snapshot.
+      // OBSERVATIONAL ONLY: the lambda never touches atoms/forces/dt (gate A7).
+      cli::ProgressMonitor* mp = mon.get();
+      co.on_pass = [mp](long h, const core::PassStats& st) { mp->on_pass_stats(h, st); };
+      mon->start();
+    }
+
+    const potentials::Truncation rtr = cfg.truncation == "cut" ? potentials::Truncation::Cut
+                                       : cfg.truncation == "force_shift"
+                                           ? potentials::Truncation::ForceShift
+                                           : potentials::Truncation::Shift;
     core::ConveyorResult rc;
     try {
       if (cfg.pot_type == "lj") {
         potentials::LJParams<double> p{cfg.lj_epsilon, cfg.lj_sigma};
-        RingLJ pair{p, potentials::CutoffScheme::make(
-                           rtr, cfg.rcut, [&](double r, double& u, double& f) {
-                             potentials::pair_lj(r, p, u, f);
-                           })};
+        RingLJ pair{
+            p, potentials::CutoffScheme::make(rtr, cfg.rcut, [&](double r, double& u, double& f) {
+              potentials::pair_lj(r, p, u, f);
+            })};
         rc = core::run_conveyor(atoms, box, cfg.rcut, pair, co);
       } else {
         potentials::MorseParams<double> p{cfg.D, cfg.alpha, cfg.r0};
-        RingMorse pair{p, potentials::CutoffScheme::make(
-                              rtr, cfg.rcut, [&](double r, double& u, double& f) {
-                                potentials::pair_morse(r, p, u, f);
-                              })};
+        RingMorse pair{
+            p, potentials::CutoffScheme::make(rtr, cfg.rcut, [&](double r, double& u, double& f) {
+              potentials::pair_morse(r, p, u, f);
+            })};
         rc = core::run_conveyor(atoms, box, cfg.rcut, pair, co);
       }
     } catch (const std::exception& e) {
@@ -194,101 +233,157 @@ int main(int argc, char** argv) {
       return 1;
     }
     if (rc.halt != core::Halt::None) {
-      std::fprintf(stderr, "[HALT] %s\n", rc.halt_msg.c_str());
+      std::string rescue_written;
       if (cfg.rescue_enabled) {
         // ring halt: atoms hold the t0 state (a consistent mid-ring geometry
         // does not exist — ZoneFSM §9; the in-flight dump is an M4+ item)
-        io::write_rescue_xyz(cfg.rescue_file, atoms, box,
-                             rc.halt_msg + " [ring: t0 state]");
-        std::fprintf(stderr, "[HALT] rescue dump (t0 state): %s\n",
-                     cfg.rescue_file.c_str());
+        io::write_rescue_xyz(cfg.rescue_file, atoms, box, rc.halt_msg + " [ring: t0 state]");
+        rescue_written = cfg.rescue_file;
       }
+      if (mon) {  // final dashboard frame shows the red HALT line + rescue path
+        mon->set_halt(rc.halt_msg, rescue_written);
+        mon->stop();
+      }
+      std::fprintf(stderr, "[HALT] %s\n", rc.halt_msg.c_str());
+      if (!rescue_written.empty())
+        std::fprintf(stderr, "[HALT] rescue dump (t0 state): %s\n", rescue_written.c_str());
       return 3;
     }
+    if (mon) mon->stop();  // flush the final running frame before the summary
     const auto& last = rc.stats.back();
     std::printf("step 0       : E=%.10f eV\n", rc.e0);
-    std::printf("after %ld    : E=%.10f eV  (pe=%.10f ke=%.10f)\n",
-                rc.steps_done, last.pe + last.ke, last.pe, last.ke);
+    std::printf("after %ld    : E=%.10f eV  (pe=%.10f ke=%.10f)\n", rc.steps_done,
+                last.pe + last.ke, last.pe, last.ke);
     if (co.auto_step)
-      std::printf("final dt     : %.5g ps  (v_max=%.4g Å/ps)\n", last.dt,
-                  last.v_max);
+      std::printf("final dt     : %.5g ps  (v_max=%.4g Å/ps)\n", last.dt, last.v_max);
     return 0;
   }
 
   std::printf("neighbor     : %s%s\n", cfg.neighbor_mode.c_str(),
-              cfg.neighbor_mode == "cluster"
-                  ? ("  skin=" + std::to_string(cfg.skin) + " Å").c_str()
-                  : "  (O(N²) reference)");
+              cfg.neighbor_mode == "cluster" ? ("  skin=" + std::to_string(cfg.skin) + " Å").c_str()
+                                             : "  (O(N²) reference)");
 
   io::TrajectoryWriter writer(cfg.traj_file);
-  auto frame = [&](long step) { writer.write_frame(step, atoms, box); };
 
-  const potentials::Truncation trunc =
-      cfg.truncation == "cut"         ? potentials::Truncation::Cut
-      : cfg.truncation == "force_shift" ? potentials::Truncation::ForceShift
-                                        : potentials::Truncation::Shift;
+  // --- M7 dashboard on the direct (non-ring) path: the existing on_frame is
+  // its observation point. on_frame only gets `step`, so the Snapshot is built
+  // from the live atoms (KE/T/v_max are computable; PE is not exposed by the
+  // stepper callback, so the direct-path frame surfaces T/v_max/progress and a
+  // KE-based sparkline). Observational only — it reads atoms, never writes. ---
+  std::unique_ptr<cli::ProgressMonitor> dmon;
+  if (dashboard) {
+    const bool tty = want_ansi();
+    cli::Snapshot ctx;
+    ctx.n_dof = core::thermal::dof_thermal(atoms.n);
+    ctx.zones = 1;
+    ctx.nodes = 1;
+    dmon = std::make_unique<cli::ProgressMonitor>(stderr, tty, cfg.steps, ctx);
+    dmon->set_c_buf(cfg.C_buf);
+    dmon->start();
+  }
+  auto frame = [&](long step) {
+    writer.write_frame(step, atoms, box);
+    if (dmon) {
+      cli::Snapshot s;
+      s.pass = step;
+      s.total = cfg.steps;
+      s.n_dof = core::thermal::dof_thermal(atoms.n);
+      s.ke = 0.0;
+      for (int i = 0; i < atoms.n; ++i)
+        s.ke += 0.5 * units::mvv2e * atoms.mass[i] *
+                core::buffer::speed2(atoms.vx[i], atoms.vy[i], atoms.vz[i]);
+      s.v_max = core::buffer::max_speed(atoms);
+      s.dt = opt.dt;  // display dt (auto mode updates it per step)
+      s.zones = 1;
+      s.nodes = 1;
+      dmon->on_snapshot(s);
+    }
+  };
+
+  const potentials::Truncation trunc = cfg.truncation == "cut" ? potentials::Truncation::Cut
+                                       : cfg.truncation == "force_shift"
+                                           ? potentials::Truncation::ForceShift
+                                           : potentials::Truncation::Shift;
   const bool cluster = (cfg.neighbor_mode == "cluster");  // M3: Z-order clusters
 
   core::SimResult res;
-  auto run_direct = [&](auto pot) {
-    res = core::run_simulation(atoms, box, pot, opt, frame);
-  };
+  auto run_direct = [&](auto pot) { res = core::run_simulation(atoms, box, pot, opt, frame); };
   auto run_cluster = [&](auto pot) {
     pot.skin = cfg.skin;
     pot.cell = cfg.cell_size;
     res = core::run_simulation(atoms, box, pot, opt, frame);
-    std::printf("pair-list    : %ld rebuild(s) over %ld steps\n",
-                pot.rebuild_count, res.steps_done);
+    std::printf("pair-list    : %ld rebuild(s) over %ld steps\n", pot.rebuild_count,
+                res.steps_done);
   };
   if (cfg.pot_type == "lj") {
     if (cluster) {
       potentials::ClusteredLJ<double> pot;
-      pot.epsilon = cfg.lj_epsilon; pot.sigma = cfg.lj_sigma;
-      pot.rcut = cfg.rcut; pot.truncation = trunc;
+      pot.epsilon = cfg.lj_epsilon;
+      pot.sigma = cfg.lj_sigma;
+      pot.rcut = cfg.rcut;
+      pot.truncation = trunc;
       run_cluster(std::move(pot));
     } else {
       potentials::LJPotential<double> pot;
-      pot.epsilon = cfg.lj_epsilon; pot.sigma = cfg.lj_sigma;
-      pot.rcut = cfg.rcut; pot.truncation = trunc;
+      pot.epsilon = cfg.lj_epsilon;
+      pot.sigma = cfg.lj_sigma;
+      pot.rcut = cfg.rcut;
+      pot.truncation = trunc;
       run_direct(std::move(pot));
     }
   } else {
     if (cluster) {
       potentials::ClusteredMorse<double> pot;
-      pot.D = cfg.D; pot.alpha = cfg.alpha; pot.r0 = cfg.r0;
-      pot.rcut = cfg.rcut; pot.truncation = trunc;
+      pot.D = cfg.D;
+      pot.alpha = cfg.alpha;
+      pot.r0 = cfg.r0;
+      pot.rcut = cfg.rcut;
+      pot.truncation = trunc;
       run_cluster(std::move(pot));
     } else {
       potentials::MorsePotential<double> pot;
-      pot.D = cfg.D; pot.alpha = cfg.alpha; pot.r0 = cfg.r0;
-      pot.rcut = cfg.rcut; pot.truncation = trunc;
+      pot.D = cfg.D;
+      pot.alpha = cfg.alpha;
+      pot.r0 = cfg.r0;
+      pot.rcut = cfg.rcut;
+      pot.truncation = trunc;
       run_direct(std::move(pot));
     }
   }
 
   if (res.halt != core::Halt::None) {
-    std::fprintf(stderr, "[HALT] %s\n", res.halt_msg.c_str());
     // NonFiniteEnergy state is garbage — no rescue (restartable dump needs the
     // last finite state, backlog B9/minor-13); Overlap/Causality dump as-is.
+    std::string rescue_written;
     if (cfg.rescue_enabled && res.halt != core::Halt::NonFiniteEnergy) {
       io::write_rescue_xyz(cfg.rescue_file, atoms, box, res.halt_msg);
-      std::fprintf(stderr, "[HALT] rescue dump: %s\n", cfg.rescue_file.c_str());
+      rescue_written = cfg.rescue_file;
     }
+    if (dmon) {
+      dmon->set_halt(res.halt_msg, rescue_written);
+      dmon->stop();
+    }
+    std::fprintf(stderr, "[HALT] %s\n", res.halt_msg.c_str());
+    if (!rescue_written.empty())
+      std::fprintf(stderr, "[HALT] rescue dump: %s\n", rescue_written.c_str());
     switch (res.halt) {
-      case core::Halt::NonFiniteEnergy: return 2;
-      case core::Halt::Causality:       return 3;
-      case core::Halt::Overlap:         return 4;
-      default:                          return 2;
+    case core::Halt::NonFiniteEnergy:
+      return 2;
+    case core::Halt::Causality:
+      return 3;
+    case core::Halt::Overlap:
+      return 4;
+    default:
+      return 2;
     }
   }
 
+  if (dmon) dmon->stop();  // flush the final direct-path frame
   std::printf("step 0       : E=%.10f eV\n", res.e0);
-  std::printf("after %ld    : E=%.10f  drift(max-min)=%.3e eV  rel=%.3e\n",
-              res.steps_done, res.e_final, res.drift,
-              res.drift / std::fabs(res.e0));
+  std::printf("after %ld    : E=%.10f  drift(max-min)=%.3e eV  rel=%.3e\n", res.steps_done,
+              res.e_final, res.drift, res.drift / std::fabs(res.e0));
   if (opt.auto_step)
-    std::printf("final dt     : %.5g ps  (v_max=%.4g Å/ps)\n",
-                res.dt_final, res.v_max);
+    std::printf("final dt     : %.5g ps  (v_max=%.4g Å/ps)\n", res.dt_final, res.v_max);
   std::printf("trajectory   : %s\n", cfg.traj_file.c_str());
   return 0;
 }

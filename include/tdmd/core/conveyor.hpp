@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <deque>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -88,6 +89,7 @@
 // surface as Halt::Internal (the §9 rescue path), not as UB or assert.
 namespace tdmd::core {
 
+struct PassStats;  // defined below — referenced by the M7 dashboard hook (on_pass)
 struct ConveyorOptions {
   long   steps = 0;
   int    n_zones = 1;
@@ -134,6 +136,13 @@ struct ConveyorOptions {
   // ring lands in PR-E3. Defaults {1,false} = pair, bitwise no-op.
   int    reach_mult = 1;
   bool   symmetric_reach = false;
+  // M7 dashboard hook — OBSERVATIONAL ONLY. Fired exactly once per completed pass,
+  // from the node thread that wrote stats[h-1], AFTER the B1 int64 reduce. It reads
+  // a finished PassStats; it MUST NOT touch atoms/forces/dt (INV-9 sacred). z node
+  // threads fire concurrently ⇒ the impl must be thread-safe. Empty by default ⇒
+  // zero overhead beyond one `if (on_pass)` ⇒ the bitwise hot path is byte-identical
+  // (gate A7: Test_Conveyor.A7DashboardHookIsBitwiseObservational).
+  std::function<void(long pass_h, const PassStats& st)> on_pass{};
 };
 
 // Per-pass record. v_max/a_max/k2cap are the pass aggregates that feed the
@@ -549,6 +558,7 @@ class TimeConveyor {
       return fail(Halt::NonFiniteEnergy,
                   "non-finite energy at step " + std::to_string(h));
     res_.stats[std::size_t(h - 1)] = {pass_pe, ke, dt, agg.v, agg.a, agg.k2cap};
+    if (o_.on_pass) o_.on_pass(h, res_.stats[std::size_t(h - 1)]);  // M7 observational hook (A7)
     return true;
   }
 

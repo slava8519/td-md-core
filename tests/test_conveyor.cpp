@@ -15,6 +15,8 @@
 
 #include <cmath>
 #include <cstring>
+#include <functional>
+#include <mutex>
 #include <set>
 #include <string>
 #include <vector>
@@ -59,8 +61,7 @@ constexpr double kRcut = 4.0;
 // sit MID-SLAB between zone boundaries — otherwise boundary-sitting atoms
 // start with zero slack against the static-membership guard and thermal
 // excursions trip StaleZone on perfectly healthy runs.
-core::AtomSoA<double> make_fcc(core::Box& box, int cx, int cy, int cz,
-                               bool pz, double a0 = 4.05) {
+core::AtomSoA<double> make_fcc(core::Box& box, int cx, int cy, int cz, bool pz, double a0 = 4.05) {
   core::AtomSoA<double> at;
   at.resize(4 * cx * cy * cz);
   box.lo = {0.0, 0.0, 0.0};
@@ -84,16 +85,15 @@ core::AtomSoA<double> make_fcc(core::Box& box, int cx, int cy, int cz,
 
 core::AtomSoA<double> load72(core::Box& box) {
   core::AtomSoA<double> atoms;
-  EXPECT_TRUE(io::read_lammps_data(
-      project_root() + "/reference_data/al_fcc_72.data", atoms, box));
+  EXPECT_TRUE(io::read_lammps_data(project_root() + "/reference_data/al_fcc_72.data", atoms, box));
   return atoms;
 }
 
 // Serial reference stepper: monolithic velocity-Verlet over the SAME static
 // zone decomposition, forces assembled by the serial w-pass (Test_Zones'
 // validated path). The conveyor must reproduce it BITWISE at fixed dt.
-void serial_stepper(core::AtomSoA<double>& a, const core::Box& box,
-                    int n_zones, long steps, double dt) {
+void serial_stepper(core::AtomSoA<double>& a, const core::Box& box, int n_zones, long steps,
+                    double dt) {
   MorsePair pair;
   const auto zd = core::ZoneDecomposition::build(a, box, n_zones, kRcut);
   core::zero_forces(a);
@@ -109,22 +109,21 @@ void serial_stepper(core::AtomSoA<double>& a, const core::Box& box,
 ::testing::AssertionResult bitwise_eq(const core::AtomSoA<double>& a,
                                       const core::AtomSoA<double>& b) {
   if (a.n != b.n) return ::testing::AssertionFailure() << "size mismatch";
-  auto cmp = [&](const std::vector<double>& u, const std::vector<double>& v,
-                 const char* name) {
-    return std::memcmp(u.data(), v.data(), u.size() * sizeof(double)) == 0
-               ? ""
-               : name;
+  auto cmp = [&](const std::vector<double>& u, const std::vector<double>& v, const char* name) {
+    return std::memcmp(u.data(), v.data(), u.size() * sizeof(double)) == 0 ? "" : name;
   };
   std::string bad;
-  bad += cmp(a.x, b.x, "x ");   bad += cmp(a.y, b.y, "y ");
-  bad += cmp(a.z, b.z, "z ");   bad += cmp(a.vx, b.vx, "vx ");
-  bad += cmp(a.vy, b.vy, "vy "); bad += cmp(a.vz, b.vz, "vz ");
+  bad += cmp(a.x, b.x, "x ");
+  bad += cmp(a.y, b.y, "y ");
+  bad += cmp(a.z, b.z, "z ");
+  bad += cmp(a.vx, b.vx, "vx ");
+  bad += cmp(a.vy, b.vy, "vy ");
+  bad += cmp(a.vz, b.vz, "vz ");
   if (bad.empty()) return ::testing::AssertionSuccess();
   return ::testing::AssertionFailure() << "bitwise mismatch in: " << bad;
 }
 
-core::ConveyorOptions opts_fixed(long steps, int n_zones, int n_nodes,
-                                 double dt) {
+core::ConveyorOptions opts_fixed(long steps, int n_zones, int n_nodes, double dt) {
   core::ConveyorOptions o;
   o.steps = steps;
   o.n_zones = n_zones;
@@ -134,8 +133,7 @@ core::ConveyorOptions opts_fixed(long steps, int n_zones, int n_nodes,
   return o;
 }
 
-core::AtomSoA<double> run_case(const core::AtomSoA<double>& init,
-                               const core::Box& box,
+core::AtomSoA<double> run_case(const core::AtomSoA<double>& init, const core::Box& box,
                                const core::ConveyorOptions& o,
                                core::ConveyorResult* out = nullptr) {
   core::AtomSoA<double> a = init;
@@ -198,8 +196,8 @@ TEST(Conveyor, Determinism1vsZAuto) {
   o.n_nodes = 1;
   o.auto_step = true;
   o.dt_initial = 0.001;
-  o.ts.C1 = 0.01;   // small displacement target -> dt tracks v_max(h-n+1)
-  o.ts.C3 = 1.0;    // retarget every pass — the handoff chain is really used
+  o.ts.C1 = 0.01;  // small displacement target -> dt tracks v_max(h-n+1)
+  o.ts.C3 = 1.0;   // retarget every pass — the handoff chain is really used
   o.ts.K2 = 50.0;
   o.ts.C_buf = 1.5;
   o.ts.cell_size = 2.33;
@@ -216,10 +214,9 @@ TEST(Conveyor, Determinism1vsZAuto) {
   // documented recurrence dt(h+1) = auto_dt(v_max(h−n+1), dt(h), k2cap(h−n+1))
   // is replayed here from the recorded per-pass aggregates.
   for (std::size_t i = 4; i < r1.stats.size(); ++i) {
-    const double want = core::buffer::auto_dt(
-        r1.stats[i - 4].v_max, r1.stats[i - 1].dt, o.ts, r1.stats[i - 4].k2cap);
-    ASSERT_EQ(want, r1.stats[i].dt) << "Λ-chain recurrence broken at pass "
-                                    << i + 1;
+    const double want = core::buffer::auto_dt(r1.stats[i - 4].v_max, r1.stats[i - 1].dt, o.ts,
+                                              r1.stats[i - 4].k2cap);
+    ASSERT_EQ(want, r1.stats[i].dt) << "Λ-chain recurrence broken at pass " << i + 1;
   }
 
   for (int z : {2, 3, 4}) {
@@ -308,8 +305,7 @@ TEST(Conveyor, PbcClosureMatchesSerialAndConservesMomentum) {
     auto got = run_case(init, box, opts_fixed(50, 4, z, 0.002));
     EXPECT_TRUE(bitwise_eq(ref, got)) << "z=" << z;
     const auto p = core::thermal::momentum(got);
-    for (int d = 0; d < 3; ++d)
-      EXPECT_NEAR(p[d], p0[d], 1e-9) << "momentum drift, z=" << z;
+    for (int d = 0; d < 3; ++d) EXPECT_NEAR(p[d], p0[d], 1e-9) << "momentum drift, z=" << z;
   }
 }
 
@@ -342,12 +338,14 @@ TEST(Conveyor, CausalityHaltFires) {
   box.periodic = {false, false, false};
   core::AtomSoA<double> a;
   a.resize(2);
-  a.x[0] = 17.9; a.x[1] = 22.1;       // r = 4.2 — just beyond rcut 4.0
+  a.x[0] = 17.9;
+  a.x[1] = 22.1;  // r = 4.2 — just beyond rcut 4.0
   a.y[0] = a.y[1] = 6.0;
   a.z[0] = a.z[1] = 6.0;
-  a.vx[0] = 20.0; a.vx[1] = -20.0;    // closing fast: force pops mid-step
+  a.vx[0] = 20.0;
+  a.vx[1] = -20.0;  // closing fast: force pops mid-step
   a.type = {1, 1};
-  a.mass = {1.0, 1.0};                // light -> huge acceleration
+  a.mass = {1.0, 1.0};  // light -> huge acceleration
 
   auto o = opts_fixed(10, 1, 1, 0.02);
   auto r = core::run_conveyor(a, box, kRcut, MorsePair{}, o);
@@ -361,17 +359,18 @@ TEST(Conveyor, CausalityHaltFires) {
 TEST(Conveyor, StaleZoneGuardFires) {
   core::Box box;
   box.lo = {0.0, 0.0, 0.0};
-  box.hi = {12.0, 12.0, 15.0};        // 3 zones of width 5 >= rcut 4
+  box.hi = {12.0, 12.0, 15.0};  // 3 zones of width 5 >= rcut 4
   box.periodic = {false, false, false};
   core::AtomSoA<double> a;
-  a.resize(2);                         // zones 0 and 1; zone 2 stays empty
+  a.resize(2);  // zones 0 and 1; zone 2 stays empty
   for (int i = 0; i < 2; ++i) {
-    a.x[i] = 6.0; a.y[i] = 6.0;
-    a.z[i] = 2.5 + 5.0 * i;           // far beyond rcut — no forces, ever
+    a.x[i] = 6.0;
+    a.y[i] = 6.0;
+    a.z[i] = 2.5 + 5.0 * i;  // far beyond rcut — no forces, ever
     a.type[i] = 1;
     a.mass[i] = 26.9815;
   }
-  a.vz[1] = 1.0;                       // middle-zone atom marches up the axis
+  a.vz[1] = 1.0;  // middle-zone atom marches up the axis
 
   auto o = opts_fixed(200, 3, 1, 0.05);
   auto r = core::run_conveyor(a, box, kRcut, MorsePair{}, o);
@@ -393,18 +392,18 @@ TEST(Conveyor, DegenerateInputsAndGuards) {
   box.periodic = {true, true, true};
   core::AtomSoA<double> a;
   a.resize(4);
-  const double pos[4][3] = {
-      {3.0, 3.0, 2.0}, {6.0, 6.0, 2.5}, {9.0, 9.0, 3.0}, {4.0, 8.0, 2.2}};
+  const double pos[4][3] = {{3.0, 3.0, 2.0}, {6.0, 6.0, 2.5}, {9.0, 9.0, 3.0}, {4.0, 8.0, 2.2}};
   for (int i = 0; i < 4; ++i) {
-    a.x[i] = pos[i][0]; a.y[i] = pos[i][1]; a.z[i] = pos[i][2];
+    a.x[i] = pos[i][0];
+    a.y[i] = pos[i][1];
+    a.z[i] = pos[i][2];
     a.type[i] = 1;
     a.mass[i] = 26.9815;
   }
   core::AtomSoA<double> ref = a;
   serial_stepper(ref, box, 3, 7, 0.001);
   core::AtomSoA<double> got = a;
-  auto r = core::run_conveyor(got, box, kRcut, MorsePair{},
-                              opts_fixed(7, 3, 2, 0.001));
+  auto r = core::run_conveyor(got, box, kRcut, MorsePair{}, opts_fixed(7, 3, 2, 0.001));
   EXPECT_EQ(r.halt, core::Halt::None) << r.halt_msg;
   EXPECT_TRUE(bitwise_eq(ref, got));
 
@@ -420,23 +419,23 @@ TEST(Conveyor, DegenerateInputsAndGuards) {
   core::AtomSoA<double> b = init;
   core::Box pbox = fbox;
   pbox.periodic = {true, true, true};
-  EXPECT_THROW(core::run_conveyor(b, pbox, kRcut, MorsePair{},
-                                  opts_fixed(2, 2, 1, 0.001)),
+  EXPECT_THROW(core::run_conveyor(b, pbox, kRcut, MorsePair{}, opts_fixed(2, 2, 1, 0.001)),
                std::invalid_argument);
 
   // (4) coincident atoms: PairGeom skips the degenerate pair from evaluation,
   // but min_r2 must still see it -> Halt::Overlap (B10), not a silent no-force run
   core::AtomSoA<double> c;
   c.resize(2);
-  c.x = {6.0, 6.0}; c.y = {6.0, 6.0}; c.z = {2.5, 2.5};
+  c.x = {6.0, 6.0};
+  c.y = {6.0, 6.0};
+  c.z = {2.5, 2.5};
   c.type = {1, 1};
   c.mass = {26.9815, 26.9815};
   core::Box cbox;
   cbox.lo = {0.0, 0.0, 0.0};
   cbox.hi = {12.0, 12.0, 12.0};
   cbox.periodic = {false, false, false};
-  auto rc = core::run_conveyor(c, cbox, kRcut, MorsePair{},
-                               opts_fixed(2, 1, 1, 0.001));
+  auto rc = core::run_conveyor(c, cbox, kRcut, MorsePair{}, opts_fixed(2, 1, 1, 0.001));
   EXPECT_EQ(rc.halt, core::Halt::Overlap) << rc.halt_msg;
 }
 
@@ -460,7 +459,7 @@ TEST(Conveyor, Replica36BitwiseDeterminism) {
   o.n_nodes = 1;
   o.auto_step = true;
   o.dt_initial = 0.001;
-  o.ts = {};            // C1=0.1 (дисс. С1=10), K2=50, C3=0.5, C_buf=1.5
+  o.ts = {};  // C1=0.1 (дисс. С1=10), K2=50, C3=0.5, C_buf=1.5
   o.ts.cell_size = 2.33;
 
   core::ConveyorResult r1, r4;
@@ -472,4 +471,88 @@ TEST(Conveyor, Replica36BitwiseDeterminism) {
   ASSERT_EQ(r1.stats.size(), r4.stats.size());
   for (std::size_t i = 0; i < r1.stats.size(); ++i)
     ASSERT_EQ(r1.stats[i].dt, r4.stats[i].dt) << "dt diverged at pass " << i + 1;
+}
+
+// --- A7: THE DETERMINISM GATE for the M7 dashboard hook -------------------
+// ConveyorOptions::on_pass is OBSERVATIONAL ONLY. This gate is the load-
+// bearing proof: a NON-TRIVIAL on_pass (here it reads every PassStats scalar
+// into a checksum AND counts fires from all z node threads, i.e. it really
+// runs and really touches the const stats) must leave the ring's final state
+// BITWISE-IDENTICAL to the same run with on_pass detached (empty). If the bits
+// differ, the hook touched the sacred path — INV-9 broken. Headless tests stay
+// green either way, so without this gate the break would be invisible (the
+// project's standing "deterministic-but-wrong is invisible" rule).
+
+namespace {
+// A thread-safe checksum that genuinely consumes the const PassStats — proving
+// the callback is live, not optimized away. It does NOT touch the ring.
+struct PassChecksum {
+  std::mutex mu;
+  double sum = 0.0;
+  long fires = 0;
+  void operator()(long h, const core::PassStats& st) {
+    std::lock_guard lk(mu);
+    sum += st.pe + st.ke + st.dt + st.v_max + st.a_max + double(h);
+    ++fires;
+  }
+};
+}  // namespace
+
+TEST(Conveyor, A7DashboardHookIsBitwiseObservational) {
+  // (1) The 1-vs-z scenario, fixed dt, with a non-trivial on_pass attached on
+  //     the z>1 run — must match the DETACHED z=1 reference bitwise.
+  {
+    core::Box box;
+    auto init = make_fcc(box, 2, 2, 6, /*pz=*/false);
+    core::thermal::maxwell_init(init, 300.0, 11);
+
+    // reference: NO hook, z=1
+    auto ref = run_case(init, box, opts_fixed(80, 4, 1, 0.002));
+
+    for (int z : {1, 2, 3, 4, 5}) {
+      PassChecksum cs;
+      auto o = opts_fixed(80, 4, z, 0.002);
+      o.on_pass = std::ref(cs);  // LIVE, non-trivial, concurrent across z nodes
+      core::ConveyorResult r;
+      auto got = run_case(init, box, o, &r);
+      EXPECT_TRUE(bitwise_eq(ref, got)) << "hooked z=" << z << " diverged";
+      EXPECT_EQ(cs.fires, r.steps_done) << "z=" << z << " hook must fire once/pass";
+      EXPECT_NE(cs.sum, 0.0) << "z=" << z << " hook must have actually run";
+    }
+  }
+
+  // (2) A short auto-step NVE run (the headline path) with the hook vs without:
+  //     bitwise-identical final coords AND velocities.
+  {
+    core::Box box;
+    auto init = make_fcc(box, 2, 2, 6, /*pz=*/false);
+    core::thermal::maxwell_init(init, 300.0, 13);
+
+    core::ConveyorOptions base;
+    base.steps = 500;
+    base.n_zones = 4;
+    base.n_nodes = 3;
+    base.auto_step = true;
+    base.dt_initial = 0.001;
+    base.ts = {};
+    base.ts.cell_size = 2.33;
+
+    core::AtomSoA<double> a_off = init, a_on = init;
+    auto r_off = core::run_conveyor(a_off, box, kRcut, MorsePair{}, base);
+    ASSERT_EQ(r_off.halt, core::Halt::None) << r_off.halt_msg;
+
+    PassChecksum cs;
+    auto hooked = base;
+    hooked.on_pass = std::ref(cs);
+    auto r_on = core::run_conveyor(a_on, box, kRcut, MorsePair{}, hooked);
+    ASSERT_EQ(r_on.halt, core::Halt::None) << r_on.halt_msg;
+
+    EXPECT_TRUE(bitwise_eq(a_off, a_on)) << "on_pass perturbed the NVE state";
+    EXPECT_EQ(cs.fires, r_on.steps_done);
+    EXPECT_NE(cs.sum, 0.0);
+    // dt sequence (the auto Λ-chain) is also untouched.
+    ASSERT_EQ(r_off.stats.size(), r_on.stats.size());
+    for (std::size_t i = 0; i < r_off.stats.size(); ++i)
+      ASSERT_EQ(r_off.stats[i].dt, r_on.stats[i].dt) << "dt diverged at " << i;
+  }
 }

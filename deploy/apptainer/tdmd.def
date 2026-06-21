@@ -1,0 +1,90 @@
+Bootstrap: docker
+From: nvidia/cuda:13.1.0-devel-ubuntu24.04
+
+# TD-MD Core — Apptainer (Singularity) image for HPC deploy.
+#
+# Build (on a node with the toolchain; needs network in %post for FetchContent):
+#   apptainer build tdmd.sif deploy/apptainer/tdmd.def
+# The %test runs at build time on the (GPU-less) build host => CPU-only smoke.
+#
+# Run single-GPU:   apptainer run --nv tdmd.sif config/your.yaml
+# GPU gate:         apptainer exec --nv tdmd.sif ctest --test-dir /opt/tdmd/build -L cuda
+# Multi-node (M5b): mpirun -np N apptainer exec --nv tdmd.sif \
+#                       /opt/tdmd/build/tdmd config/config_ring.yaml
+#
+# Arch override for a non-5080 cluster (A100=80-real, H100=90-real): set the
+# TDMD_CUDA_ARCH build-arg env before `apptainer build` (see %post).
+
+%files
+    # Bake the repo's smoke config + golden data into the image so %runscript /
+    # %test work with no external files.
+    config /opt/tdmd-share/config
+    reference_data /opt/tdmd-share/reference_data
+
+%post
+    set -eux
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update
+    apt-get install -y --no-install-recommends \
+        cmake ninja-build git ca-certificates g++ \
+        libopenmpi-dev openmpi-bin
+    rm -rf /var/lib/apt/lists/*
+
+    # Clone the engine at a reproducible ref (cluster deploy wants a fixed tag;
+    # the docker/Containerfile twin COPYs the working checkout instead).
+    git clone --branch opus --depth 1 \
+        https://github.com/slava8519/td-md-core.git /opt/tdmd
+    cd /opt/tdmd
+
+    # CUDA arch: default to the dev-box 5080 (120-real, from CMakeLists); a
+    # cluster overrides via the TDMD_CUDA_ARCH env (e.g. "80-real" for A100).
+    # yaml-cpp + googletest are FetchContent (CMakeLists) — %post has network.
+    CUDA_ARCH="${TDMD_CUDA_ARCH:-120-real}"
+    cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+        -DTDMD_WITH_CUDA=ON -DTDMD_WITH_MPI=ON \
+        -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH}"
+    cmake --build build
+
+%test
+    # Runs at `apptainer build` time on the build host, which has NO GPU =>
+    # CPU-only smoke. -LE cuda EXCLUDES the GPU-labeled tests (the inverse of
+    # the gpu_gate.sh `-L cuda`); the golden tests are LAMMPS-free.
+    set -eux
+    cd /opt/tdmd
+    ctest --test-dir build --output-on-failure -LE cuda
+    # The engine actually runs a few steps on a tiny golden config (CPU path).
+    ./build/tdmd /opt/tdmd-share/config/config_m0.yaml
+
+%runscript
+    # Default entrypoint. cd to the repo root FIRST so the bundled m0 config's
+    # repo-relative geometry path (reference_data/al_fcc_72.data) resolves — the
+    # engine reads geometry relative to CWD (acceptance note). A user config
+    # should be an absolute path, or relative to /opt/tdmd.
+    cd /opt/tdmd
+    exec build/tdmd "${@:-config/config_m0.yaml}"
+
+%help
+    TD-MD Core — Time Decomposition molecular dynamics engine.
+
+    Single-GPU run:
+        apptainer run --nv tdmd.sif config/your.yaml
+        # or: apptainer run --nv tdmd.sif /opt/tdmd-share/config/config_m0.yaml
+
+    Live dashboard (interactive TTY):
+        apptainer run --nv tdmd.sif config/your.yaml --dashboard
+
+    GPU correctness gate (needs a device; ctest -L cuda + compute-sanitizer
+    via scripts/gpu_gate.sh inside the source tree):
+        apptainer exec --nv tdmd.sif ctest --test-dir /opt/tdmd/build -L cuda
+
+    Multi-node ring (M5b; needs >=2 GPUs across nodes + a host MPI launcher):
+        mpirun -np N apptainer exec --nv tdmd.sif \
+            /opt/tdmd/build/tdmd config/config_ring.yaml
+
+    Non-5080 cluster: rebuild with TDMD_CUDA_ARCH set (A100=80-real,
+    H100=90-real) before `apptainer build`.
+
+%labels
+    Project    TD-MD Core
+    Component  HPC deploy image (M7)
+    Base       nvidia/cuda:13.1.0-devel-ubuntu24.04

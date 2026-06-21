@@ -1,30 +1,165 @@
 name: ci
 
+# M7 — full CI. The M7 acceptance criterion (Roadmap): "CI зелёный на чистой
+# машине (без LAMMPS — golden-тесты); деплой контейнера на кластере проходит
+# smoke-тест." Jobs 1-3 are GitHub-hosted (CPU / compile-only CUDA, cloud-safe);
+# job 4 is the documented self-hosted GPU gate (push-to-main / dispatch only).
+#
+# What CI deliberately does NOT do (the project's load-bearing conventions):
+#   * NO `cuda`-labeled ctest in the cloud — no GPU on hosted runners; the CUDA
+#     job COMPILES ONLY. The GPU suite runs via scripts/gpu_gate.sh on the
+#     self-hosted 5080 (job 4) or locally.
+#   * NO scripts/gpu_gate.sh in the cloud — it needs a device + compute-sanitizer
+#     and exits non-zero without one (it is "NOT a cloud-CI job" by design).
+#   * NO -DWITH_LAMMPS=ON — golden references are frozen under reference_data/;
+#     the default build is LAMMPS-free. THIS is what makes "CI зелёный без LAMMPS"
+#     satisfiable today.
+#   * NO apt libyaml-cpp-dev / libgtest-dev — both are FetchContent-pinned
+#     (yaml-cpp 0.8.0, googletest v1.15.2) for one source of version truth.
+#   * NO routine container-build job — the CUDA-devel base is multi-GB and the
+#     angular .cu TUs are slow; the in-container CPU smoke runs at `apptainer
+#     build` time (deploy/), not on every PR.
+
 on:
   push:
+    branches: [main, opus]
   pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # --- Job 1: the M7 criterion — CPU build + the ~40 golden/determinism tests.
   build-test:
     name: build & test (${{ matrix.cxx }})
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04          # pinned (not -latest) to match the container base
     strategy:
       fail-fast: false
       matrix:
         cxx: [g++, clang++]
     env:
       CXX: ${{ matrix.cxx }}
+      CCACHE_DIR: ${{ github.workspace }}/.ccache
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install ninja
-        run: sudo apt-get update && sudo apt-get install -y ninja-build
+      - name: Install toolchain
+        run: sudo apt-get update && sudo apt-get install -y ninja-build ccache
+
+      # Cache the FetchContent deps (yaml-cpp + googletest, rebuilt every cold
+      # run otherwise) and the ccache object cache. Key busts on a CMakeLists
+      # change (e.g. a pinned-tag bump).
+      - uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps
+            ${{ github.workspace }}/.ccache
+          key: deps-${{ matrix.cxx }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            deps-${{ matrix.cxx }}-
 
       - name: Configure
         run: cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
 
       - name: Build
         run: cmake --build build
 
-      - name: Test (milestone tests; GPU-labeled tests run via scripts/gpu_gate.sh locally)
-        run: ctest --test-dir build --output-on-failure
+      # -LE cuda is a defensive belt: with TDMD_WITH_CUDA=OFF no cuda-labeled
+      # test is even registered, so this is a no-op today — but it documents
+      # intent and survives a future default flip (the cloud never runs a GPU
+      # kernel). The two long ring tests carry ctest TIMEOUTs (300/600s) so a
+      # deadlock fails deterministically instead of hanging the runner.
+      - name: Test (CPU; golden-data, LAMMPS-free; GPU tests excluded)
+        run: ctest --test-dir build --output-on-failure -LE cuda
+
+  # --- Job 2: lint — format gate + a warnings-as-errors build of core + CLI.
+  lint:
+    name: lint (clang-format + -Werror)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ninja-build clang-format
+          clang-format --version
+
+      # The committed .clang-format (LLVM base, IndentWidth 2, ColumnLimit 100,
+      # house knobs) documents the target style for new code + IDEs. The legacy
+      # tree is NOT yet clang-format-normalized (a repo-wide `clang-format -i`
+      # is a ~140-file cosmetic churn — deferred to a dedicated style PR), so
+      # this check is ADVISORY (continue-on-error): it surfaces drift in the log
+      # without blocking. Flip to a blocking `--Werror` once normalization lands.
+      # The substantive lint is the -Werror build below.
+      - name: clang-format drift (advisory — tree not yet normalized)
+        continue-on-error: true
+        run: |
+          mapfile -t FILES < <(find src include tests tools \
+            \( -name '*.cpp' -o -name '*.hpp' -o -name '*.cu' -o -name '*.cuh' \) -type f)
+          clang-format --dry-run "${FILES[@]}"
+
+      # Promote the project's existing -Wall -Wextra to errors on the core lib +
+      # config + CLI (the highest-value, lowest-noise static check, no new config).
+      - name: Warnings-as-errors build (core + config + CLI)
+        run: |
+          cmake -S . -B build-werror -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_CXX_FLAGS=-Werror -DTDMD_BUILD_TESTS=OFF
+          cmake --build build-werror --target tdmd_core tdmd_config tdmd
+
+  # --- Job 3: cuda-compile — nvcc compiles the GPU/MPI sources, NO GPU run.
+  cuda-compile:
+    name: cuda-compile (mpi=${{ matrix.mpi }})
+    runs-on: ubuntu-24.04
+    container: nvidia/cuda:13.1.0-devel-ubuntu24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        mpi: [OFF, ON]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install host toolchain
+        run: |
+          apt-get update
+          apt-get install -y cmake ninja-build git ca-certificates g++ \
+            libopenmpi-dev openmpi-bin
+          nvcc --version    # canary: prints the toolkit version (silent-drift watch)
+
+      # -DCMAKE_CUDA_ARCHITECTURES=75 decouples the job from sm_120/CUDA-version
+      # availability (CMakeLists hardcodes 120-real for the 5080, but honors a
+      # pre-set arch). CI only needs nvcc to COMPILE, not to emit 5080 SASS.
+      # NB: 75 (Turing), NOT 70 — CUDA 13.x DROPPED sm_70 (Volta); nvcc 13.1
+      # rejects `compute_70`, so 75 is the lowest arch the devel image accepts
+      # (verified locally against cuda_13.1.r13.1). TDMD_BUILD_TESTS=OFF — gtest
+      # is not needed for a compile check; the .cu test TUs are skipped, the
+      # GPU sources still compile via the tools/headers they share.
+      - name: Configure (CUDA on, MPI=${{ matrix.mpi }})
+        run: cmake -S . -B build-cuda -G Ninja -DCMAKE_BUILD_TYPE=Release
+             -DTDMD_WITH_CUDA=ON -DTDMD_WITH_MPI=${{ matrix.mpi }}
+             -DCMAKE_CUDA_ARCHITECTURES=75 -DTDMD_BUILD_TESTS=OFF
+
+      # COMPILE ONLY — never ctest here (no GPU). gpu_gate.sh is also out: it
+      # needs a device + compute-sanitizer.
+      - name: Build (compile-only — no ctest)
+        run: cmake --build build-cuda
+
+  # --- Job 4: gpu — the self-hosted gate. DEFINED BUT INERT in the cloud.
+  # The `if:` is the security control the public-repo posture demands: NO
+  # pull_request path reaches it, so untrusted fork code never executes on the
+  # dev box. Runs only on a dispatch or a push to main, on a registered runner.
+  gpu:
+    name: gpu gate (self-hosted, RTX 5080)
+    if: github.event_name == 'workflow_dispatch' ||
+        (github.event_name == 'push' && github.ref == 'refs/heads/main')
+    runs-on: [self-hosted, gpu]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build (CUDA, native arch)
+        run: cmake -S . -B build-cuda -G Ninja -DTDMD_WITH_CUDA=ON
+             && cmake --build build-cuda
+      - name: GPU gate (ctest -L cuda + compute-sanitizer)
+        run: ./scripts/gpu_gate.sh build-cuda

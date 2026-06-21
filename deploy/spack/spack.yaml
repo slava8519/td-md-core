@@ -1,0 +1,31 @@
+# TD-MD Core — Spack environment (the no-privileged-build / air-gapped escape
+# hatch). On a real cluster you often cannot run a privileged container build,
+# and the SITE OpenMPI/UCX must win so MPI traverses the fabric.
+#
+# Deliberately SHORT: Spack provides only the TOOLCHAIN + system libs. It does
+# NOT manage yaml-cpp / googletest — those stay FetchContent-pinned in
+# CMakeLists.txt (one source of version truth, no skew). ~cuda mirrors the
+# project's "OpenMPI is NOT CUDA-aware -> host-staging" transport constraint
+# (M5a MpiRingEdge).
+#
+# Validate the concretization anywhere NOW:
+#   spack env activate -d deploy/spack
+#   spack concretize
+# Install against a cluster's compilers (LATER, at the M5b trigger):
+#   spack install
+#   # then, in the activated env:
+#   cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+#       -DTDMD_WITH_CUDA=ON -DTDMD_WITH_MPI=ON \
+#       -DCMAKE_CUDA_ARCHITECTURES=<cluster-arch>
+#   cmake --build build
+spack:
+  specs:
+    - cmake@3.27:
+    - ninja
+    - cuda@13.1
+    - "openmpi@4.1.6 ~cuda"   # host-staging transport (not CUDA-aware), per M5a
+    - git
+    - gcc@13.3                # the toolchain the project is validated against
+  concretizer:
+    unify: true
+  view: true
