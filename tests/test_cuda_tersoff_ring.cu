@@ -26,7 +26,7 @@
 
 namespace core = tdmd::core;
 namespace pot = tdmd::potentials;
-namespace cuda = tdmd::cuda;
+namespace tdcu = tdmd::cuda;
 
 namespace {
 constexpr int kNz = 12;
@@ -39,7 +39,7 @@ core::ConveyorOptions ropt(long steps, int n_zones, int n_nodes, double dt) {
 core::ConveyorResult gpu_run(core::AtomSoA<double>& a, const core::Box& box,
                              const pot::TersoffParams& p, const core::ConveyorOptions& o) {
   pot::TersoffPotential<double> tpot(p);
-  return pot::run_tersoff_ring(a, box, tpot, o, cuda::GpuTersoffWinForce<double>(p, box));
+  return pot::run_tersoff_ring(a, box, tpot, o, tdcu::GpuTersoffWinForce<double>(p, box));
 }
 bool state_eq(const core::AtomSoA<double>& a, const core::AtomSoA<double>& b) {
   for (int i = 0; i < a.n; ++i)
@@ -128,15 +128,15 @@ TEST(CudaTersoffRing, MatchesFp64OracleTrajectory) {
 TEST(CudaTersoffRing, FirewallAcceptsBondOrder) {
   using pot::PassDecl; using pot::PassKind;
   pot::TersoffPotential<double> tpot{};
-  EXPECT_NO_THROW(cuda::GpuTersoffWinForce<double>::assert_supported(tpot.passes()));
-  static_assert(requires { cuda::GpuTersoffWinForce<double>::assert_supported(
+  EXPECT_NO_THROW(tdcu::GpuTersoffWinForce<double>::assert_supported(tpot.passes()));
+  static_assert(requires { tdcu::GpuTersoffWinForce<double>::assert_supported(
       std::span<const pot::PassDecl>{}); }, "firewall seam must be live");
   const PassDecl sw2[2] = {{PassKind::Force,true,false,false,40},{PassKind::Force,true,true,false,40}};
-  EXPECT_THROW(cuda::GpuTersoffWinForce<double>::assert_supported(sw2), std::runtime_error);  // SW desc
+  EXPECT_THROW(tdcu::GpuTersoffWinForce<double>::assert_supported(sw2), std::runtime_error);  // SW desc
   const PassDecl eam3[3] = {{PassKind::Density,true,false,false,44},{PassKind::Embedding,false,false,false,30},{PassKind::Force,true,false,false,40}};
-  EXPECT_THROW(cuda::GpuTersoffWinForce<double>::assert_supported(eam3), std::runtime_error);  // count
+  EXPECT_THROW(tdcu::GpuTersoffWinForce<double>::assert_supported(eam3), std::runtime_error);  // count
   const PassDecl sym[2] = {{PassKind::BondOrder,true,false,false,0},{PassKind::Force,true,false,false,40}};  // Force NOT transpose
-  EXPECT_THROW(cuda::GpuTersoffWinForce<double>::assert_supported(sym), std::runtime_error);  // symmetric trap
+  EXPECT_THROW(tdcu::GpuTersoffWinForce<double>::assert_supported(sym), std::runtime_error);  // symmetric trap
 }
 
 // G13 — anti-deadlock across node counts.

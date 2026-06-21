@@ -118,6 +118,22 @@ if(TDMD_WITH_CUDA)
   target_compile_options(bench_meam_cells PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 
+  # SW T5b (perf track): SW cell-list culling bake-off (R_cull per N) + the SW entry of the
+  # angular flagship (10⁶) atom-steps/s table. SW is int64-ORDER-FREE ⇒ cells == all-window
+  # BITWISE by B1 (no canonical sort). --fmad=false keeps GPU-INTERNAL determinism structural.
+  add_executable(bench_sw_cells tools/bench_sw_cells.cu)
+  target_link_libraries(bench_sw_cells PRIVATE tdmd_core)
+  target_compile_options(bench_sw_cells PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+
+  # Tersoff Te5b (perf track): Tersoff cell-list culling bake-off (R_cull per N) + the Tersoff entry
+  # of the angular flagship (10⁶) atom-steps/s table. Tersoff is MEAM-LIKE (FP64 ζ-sum) ⇒ cells ==
+  # all-window BITWISE via the canonical-ζ cull. --fmad=false keeps GPU-INTERNAL determinism structural.
+  add_executable(bench_tersoff_cells tools/bench_tersoff_cells.cu)
+  target_link_libraries(bench_tersoff_cells PRIVATE tdmd_core)
+  target_compile_options(bench_tersoff_cells PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+
   # E5c FMA twin: same kernels, FMA contraction ON (the GPU default). On the
   # FP64-1:64 RTX 5080 a fused mul-add is 1 FP64 op vs 2 ⇒ ~2× the FP64
   # throughput of the --fmad=false determinism build. GPU-INTERNAL determinism
@@ -411,6 +427,17 @@ if(TDMD_BUILD_TESTS)
     add_test(NAME Test_CUDA_SW_Ring COMMAND test_cuda_sw_ring)
     set_tests_properties(Test_CUDA_SW_Ring PROPERTIES LABELS cuda)
 
+    # SW T5b: cell-list culled SW kernel. G-A (bitwise cells == all-window — SW is int64-ORDER-
+    # FREE ⇒ NO canonical sort, the EAM-like proof) + G-B (the dropped-φ₃-triplet gate vs
+    # sw_direct_fp64) + G-POISON teeth + G-OVERFLOW (the M1 nb[] guard). --fmad=false via flags.
+    add_executable(test_cuda_sw_cells tests/test_cuda_sw_cells.cu)
+    target_link_libraries(test_cuda_sw_cells PRIVATE tdmd_core GTest::gtest_main
+                          tdmd_eam_cuda_flags)
+    target_compile_options(test_cuda_sw_cells PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
+    add_test(NAME Test_CUDA_SW_Cells COMMAND test_cuda_sw_cells)
+    set_tests_properties(Test_CUDA_SW_Cells PROPERTIES LABELS cuda)
+
     add_executable(test_cuda_tersoff tests/test_cuda_tersoff.cu)   # Te5: per-window 4-role kernel
     target_link_libraries(test_cuda_tersoff PRIVATE tdmd_core GTest::gtest_main tdmd_eam_cuda_flags)
     add_test(NAME Test_CUDA_Tersoff COMMAND test_cuda_tersoff)
@@ -421,6 +448,18 @@ if(TDMD_BUILD_TESTS)
                           tdmd_eam_cuda_flags Threads::Threads)
     add_test(NAME Test_CUDA_Tersoff_Ring COMMAND test_cuda_tersoff_ring)
     set_tests_properties(Test_CUDA_Tersoff_Ring PROPERTIES LABELS cuda)
+
+    # Te5b: cell-list culled Tersoff kernel. G-A (bitwise cells == all-window via the canonical-ζ
+    # cull — Tersoff is MEAM-LIKE, the FP64 ζ-sum is order-sensitive) + G-B (the BLOCKING dropped-
+    # bond/triplet gate vs tersoff_direct_fp64) + G-POISON teeth + G-OVERFLOW (the M1 nb[]/ζ-buffer
+    # guard). --fmad=false via tdmd_eam_cuda_flags.
+    add_executable(test_cuda_tersoff_cells tests/test_cuda_tersoff_cells.cu)
+    target_link_libraries(test_cuda_tersoff_cells PRIVATE tdmd_core GTest::gtest_main
+                          tdmd_eam_cuda_flags)
+    target_compile_options(test_cuda_tersoff_cells PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xptxas=-v>)
+    add_test(NAME Test_CUDA_Tersoff_Cells COMMAND test_cuda_tersoff_cells)
+    set_tests_properties(Test_CUDA_Tersoff_Cells PROPERTIES LABELS cuda)
 
     # Me5: GPU MEAM (the screened many-body force — screening Π_k S + ρ⁰..ρ³ + embedding + the
     # 3rd-atom ∂S/∂x_k transpose force). --fmad=false (via tdmd_eam_cuda_flags) for GPU-INTERNAL

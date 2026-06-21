@@ -26,7 +26,7 @@
 
 namespace core = tdmd::core;
 namespace pot = tdmd::potentials;
-namespace cuda = tdmd::cuda;
+namespace tdcu = tdmd::cuda;  // not `cuda` — sw_window_force_gpu.cuh transitively pulls CUB's ::cuda
 
 namespace {
 struct Window {
@@ -58,7 +58,7 @@ Forces cpu_window(const Window& w, const pot::SwParams& sp) {
 // GPU forces via the policy; raw=true returns the raw int64 (for G3 bitwise).
 struct GpuForces { std::vector<double> fx, fy, fz; std::vector<long long> rx, ry, rz; double pe = 0; long long ntri = 0; };
 GpuForces gpu_window(const Window& w, const pot::SwParams& sp) {
-  cuda::GpuSwWinForce<double> g(sp, w.box);
+  tdcu::GpuSwWinForce<double> g(sp, w.box);
   const core::PairGeom geom(w.box, sp.rcut());
   std::vector<core::fixed::ForceAccum> Fx(w.m), Fy(w.m), Fz(w.m);
   core::fixed::EnergyAccum pe; double mr2 = 1e300;
@@ -187,7 +187,7 @@ TEST(CudaSw, OverflowHalt) {
   Window w; w.box.lo = {-10, -10, -10}; w.box.hi = {10, 10, 10}; w.box.periodic = {false, false, false};
   w.wx = {0.0, 0.1}; w.wy = {0.0, 0.0}; w.wz = {0.0, 0.0};  // r = 0.1 Å ⇒ huge φ2 force
   w.key = {0, 1}; w.owned = {0, 1}; w.m = 2;
-  cuda::GpuSwWinForce<double> g(sp, w.box);
+  tdcu::GpuSwWinForce<double> g(sp, w.box);
   const core::PairGeom geom(w.box, sp.rcut());
   std::vector<core::fixed::ForceAccum> Fx(2), Fy(2), Fz(2);
   core::fixed::EnergyAccum pe; double mr2 = 1e300;

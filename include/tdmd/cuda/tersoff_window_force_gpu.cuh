@@ -15,6 +15,7 @@
 #include "tdmd/core/soa.hpp"
 #include "tdmd/core/zones.hpp"
 #include "tdmd/cuda/zone_tersoff.cuh"      // tersoff_force_kernel, kMaxNbr, kZoneBlock
+#include "tdmd/cuda/zone_tersoff_cells.cuh"  // Te5b: cell-list culled Tersoff kernel + TersoffCellGrid
 #include "tdmd/potentials/many_body.hpp"   // PassDecl/PassKind (the firewall)
 #include "tdmd/potentials/tersoff.hpp"     // TersoffParams
 #include "tdmd/potentials/tersoff_ring.hpp"  // TersoffPotential, TersoffRing (the policy-ctor)
@@ -55,7 +56,29 @@ struct GpuTersoffWindowState {
   long long last_nbonds = 0, last_ntri = 0;  // TEST-ONLY; the ring SINKS counts (benign WAR race)
   std::mutex mu;
 
-  explicit GpuTersoffWindowState(const potentials::TersoffParams& t) : tp(t) {
+  // Te5b — cell-list culling of the per-window Tersoff force. cells ≡ all-window RAW int64 BITWISE
+  // by B1 + the canonical-ζ cull (zone_tersoff_cells.cuh): the int64 force lanes are order-free, and
+  // zeta_center_cells key-sorts the stencil ζ-k candidates so the FP64 ζ-sum reassociates in the
+  // SAME order the host-sorted all-window zeta_center walks. The box is captured at construction
+  // (static membership for the run); compute() only gets a PairGeom, which lacks box.lo the grid
+  // needs. cull=false keeps the all-window kernel as the in-process BITWISE REFERENCE.
+  double box_lo[3] = {0, 0, 0}, box_len[3] = {0, 0, 0};
+  bool periodic[3] = {false, false, false};
+  double rcut = 0.0;
+  bool cull = false;     // DEFAULT OFF until G-A/G-B/G-POISON green, then AUTO.
+  int cell_div = 0;      // 0 = AUTO (target ~2.5 atoms/cell, resolved in ensure_grid_geometry).
+                         // 1 = legacy ~rcut cells / ±1. Any k is bitwise == all-window (G-A).
+  unsigned long long cells_passes = 0;
+  TersoffCellGrid grid_{};
+  bool grid_built_ = false;
+
+  explicit GpuTersoffWindowState(const potentials::TersoffParams& t, const core::Box& box,
+                                 bool cull_, int cell_div_)
+      : tp(t), cull(cull_), cell_div(cell_div_) {
+    box_lo[0] = box.lo[0]; box_lo[1] = box.lo[1]; box_lo[2] = box.lo[2];
+    box_len[0] = box.len(0); box_len[1] = box.len(1); box_len[2] = box.len(2);
+    periodic[0] = box.periodic[0]; periodic[1] = box.periodic[1]; periodic[2] = box.periodic[2];
+    rcut = t.rcut();
     double v = 1e300;
     std::memcpy(&sentinel, &v, 8);
     d_pe = ters_wf_detail::ters_wf_malloc<long long>(1);
@@ -83,9 +106,42 @@ struct GpuTersoffWindowState {
     d_fx = ters_wf_detail::ters_wf_malloc<long long>(cap_m);
     d_fy = ters_wf_detail::ters_wf_malloc<long long>(cap_m);
     d_fz = ters_wf_detail::ters_wf_malloc<long long>(cap_m);
+    // cell-list per-atom buffers grow with the window (ncells is box-static, allocated once in
+    // ensure_grid_geometry). Mirrors GpuSwWindowState::grow.
+    if (grid_.d_cell_of) { cudaFree(grid_.d_cell_of); cudaFree(grid_.d_order); }
+    grid_.d_cell_of = ters_wf_detail::ters_wf_malloc<int>(cap_m);
+    grid_.d_order = ters_wf_detail::ters_wf_malloc<int>(cap_m);
+    grid_.m = cap_m;
+  }
+
+  // Build the window cell grid GEOMETRY once (box-static). Per-pass only counts/order refresh (in
+  // compute). One rc-padded whole-window grid (n_zones=1) — reach is sub-cell ⇒ covers o's
+  // neighbours + Roles 3/4's 2·rcut + the ζ-k. AUTO cell_div heuristic COPIED VERBATIM from
+  // GpuSwWindowState::ensure_grid_geometry: target ~2.5 atoms/cell, derive k from the realized k=1
+  // occupancy m/ncells_k1. Bitwise-safe for ANY k (zone_tersoff_cells.cuh G-A). Clamped [1,4].
+  void ensure_grid_geometry(int m_hint) {
+    if (grid_built_) return;
+    if (cell_div <= 0) {
+      const auto g1 = make_zone_grid(box_lo, box_len, periodic, rcut, 1, 0, 1);
+      const int nc1 = g1.ncells();
+      const double atoms_per = nc1 > 0 ? double(m_hint) / double(nc1) : 1.0;
+      int k = int(std::lround(std::cbrt(atoms_per / 2.5)));
+      cell_div = std::clamp(k, 1, 4);
+    }
+    grid_.g = make_zone_grid(box_lo, box_len, periodic, rcut, /*n_zones=*/1, /*zone_id=*/0, cell_div);
+    grid_.ncells = grid_.g.ncells();
+    grid_.d_counts = ters_wf_detail::ters_wf_malloc<int>(std::size_t(grid_.ncells));
+    grid_.d_starts = ters_wf_detail::ters_wf_malloc<int>(std::size_t(grid_.ncells));
+    grid_.d_cursor = ters_wf_detail::ters_wf_malloc<int>(std::size_t(grid_.ncells));
+    std::size_t cub_bytes = 0;
+    cub::DeviceScan::ExclusiveSum(nullptr, cub_bytes, grid_.d_counts, grid_.d_starts, grid_.ncells);
+    grid_.cub_bytes = cub_bytes;
+    grid_.d_cub = ters_wf_detail::ters_wf_malloc<char>(cub_bytes);
+    grid_built_ = true;
   }
   ~GpuTersoffWindowState() {
     free_scratch();
+    tersoff_cells_free(grid_);
     for (void* p : {(void*)d_pe, (void*)d_nbonds, (void*)d_ntri, (void*)d_mr, (void*)d_of})
       if (p) cudaFree(p);
   }
@@ -98,9 +154,11 @@ template <typename Real>
 struct GpuTersoffWinForce {
   std::shared_ptr<GpuTersoffWindowState> st;
   bool skip_sort = false;  // TEST-ONLY (G-ζORDER): skip the canonical sort to prove it bites
+  int poison_s = 0;        // TEST-ONLY (G-POISON): force a too-small cell stencil (G-A teeth)
 
-  GpuTersoffWinForce(const potentials::TersoffParams& tp, const core::Box& box)
-      : st(std::make_shared<GpuTersoffWindowState>(tp)) {
+  GpuTersoffWinForce(const potentials::TersoffParams& tp, const core::Box& box, bool cull = false,
+                     int cell_div = 0)
+      : st(std::make_shared<GpuTersoffWindowState>(tp, box, cull, cell_div)) {
     for (int d = 0; d < 3; ++d)
       if (box.periodic[d] && box.len(d) < 2.0 * tp.rcut())
         throw std::invalid_argument("GpuTersoffWinForce: periodic box dim < 2·rcut — min-image ambiguous");
@@ -169,9 +227,31 @@ struct GpuTersoffWinForce {
     cudaMemsetAsync(s.d_fy, 0, m * sizeof(long long));
     cudaMemsetAsync(s.d_fz, 0, m * sizeof(long long));
 
-    tersoff_force_kernel<<<ters_wf_detail::ters_ng(n_owned), kZoneBlock>>>(
-        s.wx, s.wy, s.wz, s.wkey, m, s.d_owned, n_owned, geom, s.tp,
-        s.d_fx, s.d_fy, s.d_fz, s.d_pe, s.d_nbonds, s.d_ntri, s.d_mr, s.d_of);
+    // s.cull=false keeps the all-window kernel as the in-process BITWISE REFERENCE. The cull is raw-
+    // int64-bitwise to it by B1 + the canonical-ζ cull (zone_tersoff_cells.cuh). The canonical sort
+    // above STAYS (it is the reference ζ-k order the cells canonical-ζ cull matches).
+    if (s.cull) {
+      s.ensure_grid_geometry(m);
+      TersoffCellGrid& g = s.grid_;
+      cudaMemsetAsync(g.d_counts, 0, std::size_t(g.ncells) * sizeof(int));
+      cell_count_kernel<<<ters_wf_detail::ters_ng(m), kZoneBlock>>>(s.wx, s.wy, s.wz, m, g.g,
+                                                                    g.d_cell_of, g.d_counts);
+      cub::DeviceScan::ExclusiveSum(g.d_cub, g.cub_bytes, g.d_counts, g.d_starts, g.ncells);
+      cudaMemcpyAsync(g.d_cursor, g.d_starts, std::size_t(g.ncells) * sizeof(int),
+                      cudaMemcpyDeviceToDevice);
+      cell_scatter_kernel<<<ters_wf_detail::ters_ng(m), kZoneBlock>>>(g.d_cell_of, m, g.d_cursor,
+                                                                      g.d_order);
+      if (poison_s > 0) { g.g.sx = g.g.sy = g.g.sz = poison_s; }  // TEST-ONLY (G-POISON teeth)
+      if (n_owned > 0)
+        tersoff_force_cells_kernel<<<ters_wf_detail::ters_ng(n_owned), kZoneBlock>>>(
+            s.wx, s.wy, s.wz, s.wkey, m, s.d_owned, n_owned, geom, s.tp, g.g, g.d_starts, g.d_counts,
+            g.d_order, s.d_fx, s.d_fy, s.d_fz, s.d_pe, s.d_nbonds, s.d_ntri, s.d_mr, s.d_of);
+      ++s.cells_passes;
+    } else {
+      tersoff_force_kernel<<<ters_wf_detail::ters_ng(n_owned), kZoneBlock>>>(
+          s.wx, s.wy, s.wz, s.wkey, m, s.d_owned, n_owned, geom, s.tp,
+          s.d_fx, s.d_fy, s.d_fz, s.d_pe, s.d_nbonds, s.d_ntri, s.d_mr, s.d_of);
+    }
 
     std::vector<long long> hfx(m), hfy(m), hfz(m);
     cudaMemcpy(hfx.data(), s.d_fx, m * sizeof(long long), cudaMemcpyDeviceToHost);

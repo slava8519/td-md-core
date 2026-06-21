@@ -28,7 +28,7 @@
 
 namespace core = tdmd::core;
 namespace pot = tdmd::potentials;
-namespace cuda = tdmd::cuda;
+namespace tdcu = tdmd::cuda;
 
 namespace {
 struct Window {
@@ -58,7 +58,7 @@ Forces cpu_window(const Window& w, const pot::TersoffParams& p) {
 }
 struct GpuForces { std::vector<double> fx, fy, fz; std::vector<long long> rx, ry, rz; double pe = 0; long long nb = 0, ntri = 0; };
 GpuForces gpu_window(const Window& w, const pot::TersoffParams& p, bool skip_sort = false) {
-  cuda::GpuTersoffWinForce<double> g(p, w.box);
+  tdcu::GpuTersoffWinForce<double> g(p, w.box);
   g.skip_sort = skip_sort;
   const core::PairGeom geom(w.box, p.rcut());
   std::vector<core::fixed::ForceAccum> Fx(w.m), Fy(w.m), Fz(w.m);
@@ -187,7 +187,7 @@ TEST(CudaTersoff, OverflowHalt) {
   std::mt19937 rng(1); std::uniform_real_distribution<double> u(0.0, 1.5);  // 70 atoms in a 1.5Å cube
   for (int i = 0; i < 70; ++i) { w.wx.push_back(u(rng)); w.wy.push_back(u(rng)); w.wz.push_back(u(rng)); w.key.push_back(i); w.owned.push_back(i); }
   w.m = 70;  // each atom sees ~69 mutual neighbours (max sep 1.5·√3=2.6 < rcut=3.2) > kMaxNbr=64
-  cuda::GpuTersoffWinForce<double> g(p, w.box);
+  tdcu::GpuTersoffWinForce<double> g(p, w.box);
   const core::PairGeom geom(w.box, p.rcut());
   std::vector<core::fixed::ForceAccum> Fx(70), Fy(70), Fz(70);
   core::fixed::EnergyAccum pe; double mr2 = 1e300;

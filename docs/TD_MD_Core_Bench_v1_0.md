@@ -628,3 +628,25 @@ EAM-cells куллит O(m)-сумму плотности (B1-order-free int64).
 **ВЕРДИКТ ПРОБЫ: GO** (потолок 1.49–1.71×; latency-bound ядра ⇒ concurrent цепочки заполняют простаивающие циклы). Это ПОТОЛОК (один global sync; живое кольцо с пер-узловыми syncs + host-gather может быть только хуже). Предрег. полосы: <1.20 NO-GO / 1.20–1.5 PARTIAL / ≥1.5 GO.
 
 **#1 ПОСТРОЕН и ЗАМЕРЕН → ЖИВОЙ NULL (откат).** Построил #1 (per-node scratch+streams, снял mutex: каждый узел свой `GpuEamWindowState`+`cudaStreamNonBlocking`, все device-операции на узловом stream'е, D2H async + `cudaStreamSynchronize` — фикс silent-stale-D2H; node-id протянут в политику, CPU-оракул игнорирует). **Детерминизм цел: `Test_CUDA_EAM_Ring` 12/12 побитово (GPU≡CPU, 1-vs-z, fp64-оракул, sub-rcut, culled).** Но живой **Axis-B `SPEEDUP_z`=1.00** (A(nodes=1)=2.594e5, A(nodes=5)=2.596e5, reps=8) — **NULL**, ниже предрег. STOP 1.3×. Потолок пробы 1.49–1.71× **полностью съеден host-оркестрацией кольца** (пер-проходный host-gather + transport-handoff + блокирующий sync) и/или сериализацией пайплайна по зависимости траектории (зона j+1 на узле k+1 ждёт выход зоны с узла k). Согласуется с §E5c-ring f=0.99: кольцо host-оркестрованное, и на одной GPU пер-узловой параллелизм ядер не реализуется без устранения host round-trip. **РЕШЕНИЕ: #1 откатан** (побитово-корректный, но нулевой single-GPU выигрыш ⇒ не несём сложность; пер-узловые stream'ы на одной GPU — НЕ то, что нужно M5b: M5b нужен #3 device-resident cross-GPU транспорт). #2/#3 — в M5b. **Чистый measure-first исход: проба сказала GO (concurrency ЕСТЬ на уровне ядер), живой замер сказал NO (host-оркестрация съедает) ⇒ сложность не отгружена.** Воспроизведение: `./build-cuda/probe_eam_concurrency`.
+
+### Angular flagship — SW-T5b + Tersoff-Te5b cells (2026-06-21, ветка `opus`; приёмка `wf_3d184ec4` ACCEPT, без MUST-FIX)
+
+Завершение «флагмана углов»: cell-list культинг для SW (`zone_sw_cells.cuh`) и Tersoff (`zone_tersoff_cells.cuh`) — форки паттерна Me5b. `zone_sw.cuh`/`zone_tersoff.cuh`/`zone_cells.cuh` + sibling-cells БАЙТ-НЕТРОНУТЫ (F-NOOP; CPU 40/40, sibling-тесты целы). cull default OFF, AUTO `cell_div` (=k=1 при 10⁶). cuda→tdcu alias в 4 sibling-тестах (CUB-clash, alias-only).
+
+**КЛЮЧЕВОЕ РАЗЛИЧИЕ:** **SW int64-order-free** — сила int64-аккумулируется per-owned, нет FP-редукции по third-atom-зависимому набору ⇒ cells побитово к all-window по B1 НАПРЯМУЮ (как EAM-cells, БЕЗ canonical sort; G-A проходит без сортировки = доказательство). **Tersoff MEAM-like** — bond-order ζ_ij=Σ_k FP-сумма ⇒ нужен **canonical-ζ-cull** (`zeta_center_cells`: gather стенсильных k → insertion-sort по global key → сумма) как у MEAM. G-SORT измерил DEFENSIVE (суб-Q24.40, как Te3b/Te5/Me5b).
+
+**M1-страж (урок Me5b silent-OOB) — ВЕРИФИЦИРОВАН ИНЪЕКЦИЕЙ приёмкой:** каждый per-thread gather-буфер bound-checked + sticky-HALT (SW: `nb[64]`; Tersoff: `nb[64]` + ζ-candidate `kkey/khx..[64]`). Ревьюер удалял КАЖДЫЙ страж → compute-sanitizer ловил OOB (оба форка); restored — memcheck 0. Класс Me5b-OOB ЗАКРЫТ для обоих.
+
+**Гейты `Test_CUDA_SW_Cells` 9/9 + `Test_CUDA_Tersoff_Cells` 10/10 (memcheck+racecheck+initcheck чисто):** G-A (cells≡all-window СЫРОЙ int64 ∀cell_div∈{1,2,3,4}), G-B (cells≡`{sw,tersoff}_direct_fp64` оракул — единств. свидетель выпавшего триплета/ζ-вклада, non-vacuous n_triplets>0), G-POISON (стенсиль-too-small расходится), G-SORT (Tersoff — DEFENSIVE), G-OVERFLOW (dense-cube HALT), G-W, G-momentum.
+
+**ФЛАГМАН-ТАБЛИЦА (RTX 5080, изолир. ядро z=1/free-z/fp64 — НЕ живое кольцо, НЕ EAM-сравнение; приёмка воспроизвела на IDLE-GPU):**
+
+| Потенциал | a-steps/s @ 10⁶ | регистры (cells K-force) | R_cull (1k→4k) | память @ 10⁶ |
+|---|---|---|---|---|
+| **SW** | **2.59e6** | 114 | 3.96×→11.7× | 0.84 GiB |
+| **Tersoff** | **9.18e5** | 185 | 23.6×→87.6× | 1.16 GiB |
+| **MEAM** | **6.04e4** | 254 | 7.6×→36.9× | 1.46 GiB |
+
+**НАХОДКА — флагман ОБРАТНО пропорционален register-pressure transpose-replay:** SW(114)→2.6e6 > Tersoff(185)→9.2e5 > MEAM(254)→6e4, 0 spill на всех, монотонно. Все три register/occupancy-bound на одном архитектурном потолке (один поток на owned-атом, transpose-replay целиком в регистрах). Cull РАБОТАЕТ (R_cull растёт ∝N), но абсолют упёрт в регистры — НЕ в культинг. **ОБЩИЙ рычаг (отложен measure-first, ~8×):** собрать in-rc список соседа ОДИН раз + переиспользовать по ролям (снижает И буферы ⇒ И регистры — связаны; побитово-эквив. ибо G-SORT defensive) + register-restructuring; суб-rcut k (E5c-subrcut) — ортогональный рычаг (AUTO=k=1 @ 10⁶). Device-resident/живое-кольцо + denser multi-k фикстура (сделает ли ζ-реассоциацию супер-квант ⇒ canonical-ζ load-bearing) — отложены.
+
+**ОГОВОРКИ:** числа INTERNAL (free-z/z=1/fp64); под СОПЕРНИЧЕСТВОМ за GPU проседают ~2-3× (приёмка с || ревьюерами — мерить в одиночку на idle-GPU); память gated к 10⁶.

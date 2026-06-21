@@ -24,7 +24,7 @@
 
 namespace core = tdmd::core;
 namespace pot = tdmd::potentials;
-namespace cuda = tdmd::cuda;
+namespace tdcu = tdmd::cuda;  // not `cuda` — sw_window_force_gpu.cuh transitively pulls CUB's ::cuda
 
 namespace {
 constexpr int kNz = 12;
@@ -37,7 +37,7 @@ core::ConveyorOptions ropt(long steps, int n_zones, int n_nodes, double dt) {
 core::ConveyorResult gpu_run(core::AtomSoA<double>& a, const core::Box& box,
                              const pot::SwParams& sp, const core::ConveyorOptions& o) {
   pot::SwPotential<double> spot(sp);
-  return pot::run_sw_ring(a, box, spot, o, cuda::GpuSwWinForce<double>(sp, box));
+  return pot::run_sw_ring(a, box, spot, o, tdcu::GpuSwWinForce<double>(sp, box));
 }
 bool state_eq(const core::AtomSoA<double>& a, const core::AtomSoA<double>& b) {
   for (int i = 0; i < a.n; ++i)
@@ -125,13 +125,13 @@ TEST(CudaSwRing, MatchesFp64OracleTrajectory) {
 TEST(CudaSwRing, FirewallAcceptsTranspose) {
   using pot::PassDecl; using pot::PassKind;
   pot::SwPotential<double> spot{};
-  EXPECT_NO_THROW(cuda::GpuSwWinForce<double>::assert_supported(spot.passes()));
-  static_assert(requires { cuda::GpuSwWinForce<double>::assert_supported(
+  EXPECT_NO_THROW(tdcu::GpuSwWinForce<double>::assert_supported(spot.passes()));
+  static_assert(requires { tdcu::GpuSwWinForce<double>::assert_supported(
       std::span<const pot::PassDecl>{}); }, "firewall seam must be live");
   const PassDecl eam3[3] = {{PassKind::Density,true,false,false,44},{PassKind::Embedding,false,false,false,30},{PassKind::Force,true,false,false,40}};
-  EXPECT_THROW(cuda::GpuSwWinForce<double>::assert_supported(eam3), std::runtime_error);
+  EXPECT_THROW(tdcu::GpuSwWinForce<double>::assert_supported(eam3), std::runtime_error);
   const PassDecl sym[2] = {{PassKind::Force,true,false,false,40},{PassKind::Force,true,false,false,40}};  // φ3 NOT transpose
-  EXPECT_THROW(cuda::GpuSwWinForce<double>::assert_supported(sym), std::runtime_error);
+  EXPECT_THROW(tdcu::GpuSwWinForce<double>::assert_supported(sym), std::runtime_error);
 }
 
 // G12 — anti-deadlock across node counts.
