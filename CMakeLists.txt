@@ -134,6 +134,17 @@ if(TDMD_WITH_CUDA)
   target_compile_options(bench_tersoff_cells PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 
+  # Angular FMA twins (perf track, register-lever investigation 2026-06-21): the angular cells
+  # force kernels are FP64-COMPUTE-bound (ncu: sm__pipe_fp64 ~60-65%, memory ~1-3%) — NOT register-
+  # or memory-bound (__launch_bounds__/gather-once are NULL). FMA fuses the FP64 mul-adds ⇒ the only
+  # cheap lever on the FP64-1:64 5080. Same kernels, FMA contraction ON (default); GPU-INTERNAL
+  # determinism survives FMA (B1), CPU↔GPU bitwise given up — measures the determinism tax. Measured
+  # ~+11% (MEAM) — modest, the transcendentals (exp/pow/log) don't fuse.
+  foreach(pot meam sw tersoff)
+    add_executable(bench_${pot}_cells_fma tools/bench_${pot}_cells.cu)
+    target_link_libraries(bench_${pot}_cells_fma PRIVATE tdmd_core)
+  endforeach()
+
   # E5c FMA twin: same kernels, FMA contraction ON (the GPU default). On the
   # FP64-1:64 RTX 5080 a fused mul-add is 1 FP64 op vs 2 ⇒ ~2× the FP64
   # throughput of the --fmad=false determinism build. GPU-INTERNAL determinism
