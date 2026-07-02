@@ -18,6 +18,9 @@
 #include "tdmd/core/zones.hpp"  // PairGeom
 #include "tdmd/cuda/zone_eam.cuh"  // eam_density/embedding/force kernels, EamSetflView
 #include "tdmd/cuda/zone_eam_cells.cuh"  // E5c-integration: culled kernels + window grid
+#include "tdmd/potentials/eam.hpp"  // PR-0a: assert_eam_symmetric_passes (NOT transitively
+                                    // reachable via zone_eam.cuh→eam_spline→eam_analytic;
+                                    // cycle-safe — eam.hpp pulls no cuda headers)
 #include "tdmd/potentials/eam_spline.hpp"
 #include "tdmd/potentials/many_body.hpp"  // PassDecl/PassKind — the descriptor firewall
 
@@ -248,38 +251,22 @@ struct GpuEamWindowForce {
   // loop); WITHOUT this gate a potential could ship needs_transpose=true, this policy would
   // silently run the symmetric accumulator and produce DETERMINISTIC, bitwise-stable,
   // 1-vs-z-identical — and physically WRONG forces, invisible to every consistency gate.
-  // EamRing calls this (via `if constexpr requires`) before the run; EAM's passes() ⇒
-  // exactly [Density,Embedding,Force], all symmetric ⇒ a pure no-op (no behavior change).
+  // EamRing calls this UNCONDITIONALLY before the run (PR-0a; the old `if constexpr
+  // requires` opt-in is gone); EAM's passes() ⇒ exactly [Density,Embedding,Force], all
+  // symmetric ⇒ a pure no-op (no behavior change).
   //
-  // FIREWALL SCOPE (honest): this guards the EamRing STREAMING path ONLY. The z=1 driver
-  // eam_gpu_run_singlenode (eam_conveyor_gpu.cuh — used by eam_drift/eam_rdf_stat/eam_coexist)
-  // runs the symmetric kernels DIRECTLY from a raw EamSetfl, with NO descriptor ⇒ NOT gated
-  // (see its `FIREWALL GAP` anchor). And the `requires`-clause is opt-in: a future GPU policy
-  // that omits/mis-signs assert_supported silently bypasses. Both are contained TODAY
-  // (EamPotential is the sole, final, [D,E,F]-symmetric potential), and both close when MEAM
-  // lands: gate the single-node driver + promote the policy contract to a C++20 concept +
-  // static_assert (the MB1/MB2 acceptance items). This PR converts the EamRing seam from
-  // latent-wrong to loud; it does not claim to cover every GPU-EAM entry point.
+  // FIREWALL SCOPE (PR-0a — BOTH named gaps CLOSED): the two escape hatches this comment
+  // used to name are now shut. (1) The z=1 driver eam_gpu_run_singlenode gained a mandatory
+  // descriptor gate (eam_conveyor_gpu.cuh — its `FIREWALL GAP` anchor now reads CLOSED). (2)
+  // The opt-in `if constexpr requires` was promoted to the C++20 concept WindowForcePolicy
+  // (many_body.hpp) with a class-scope static_assert in every ring ⇒ a policy that omits/
+  // mis-signs assert_supported is now a COMPILE error, not a silent bypass (the overdue
+  // MB1/MB2 promise). This gate itself now DELEGATES to the single EAM source of truth
+  // (assert_eam_symmetric_passes, eam.hpp) ⇒ no parity drift between CPU/GPU/driver; the
+  // accept/reject SEMANTICS are preserved (message texts normalized, `who`-prefixed —
+  // the teeth check throw/no-throw, not strings; design R4).
   static void assert_supported(std::span<const potentials::PassDecl> passes) {
-    if (passes.size() != 3)
-      throw std::runtime_error("GpuEamWindowForce: only the EAM 3-pass (Density,Embedding,"
-          "Force) sequence is implemented on the GPU — got " + std::to_string(passes.size()) +
-          " passes (MEAM/Tersoff/ReaxFF GPU dispatch unimplemented)");
-    const potentials::PassKind want[3] = {potentials::PassKind::Density,
-        potentials::PassKind::Embedding, potentials::PassKind::Force};
-    for (std::size_t p = 0; p < 3; ++p) {
-      if (passes[p].kind != want[p])
-        throw std::runtime_error("GpuEamWindowForce: unexpected pass kind at " +
-            std::to_string(p) + " (this policy implements EAM Density→Embedding→Force only)");
-      if (passes[p].needs_transpose)
-        throw std::runtime_error("GpuEamWindowForce: needs_transpose UNIMPLEMENTED — the GPU "
-            "symmetric int64 accumulator (q(j)=−q(i)) CANNOT run a non-symmetric angular/"
-            "bond-order term (MEAM/Tersoff write force to a third atom k). Build the transpose "
-            "accumulator path with that potential; do not silently run the symmetric one.");
-      if (passes[p].iterative)
-        throw std::runtime_error("GpuEamWindowForce: iterative pass (QEq/CG, ReaxFF) "
-            "UNIMPLEMENTED on the GPU window-force policy");
-    }
+    potentials::assert_eam_symmetric_passes(passes, "GpuEamWindowForce");
   }
 
 #ifdef TDMD_EAM_RING_TIMERS

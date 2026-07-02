@@ -10,6 +10,7 @@
 #include <cuda_runtime.h>
 
 #include <array>
+#include <span>
 #include <vector>
 
 #include "tdmd/core/soa.hpp"
@@ -112,6 +113,53 @@ TEST(CudaEamRing, SingleNodeMatchesSerialVV) {
 
     EXPECT_TRUE(bitwise_eq(ref, gpu)) << "n_zones=" << n_zones;
   }
+}
+
+// T-GAP (PR-0a) — the FIREWALL GAP at eam_gpu_run_singlenode is CLOSED. The mandatory
+// descriptor gate is the FIRST statement of the driver, BEFORE any device work: a copy-
+// reuse under a needs_transpose / wrong-shape / wclass-illegal descriptor now THROWS.
+// The default call (no passes arg) is the positive path (covered by every other test).
+// KILL: remove the gate from the head of eam_gpu_run_singlenode → all EXPECT_THROW fail.
+TEST(CudaEamRing, SingleNodeDriverFirewallGate) {
+  const auto setfl = make_setfl();
+  core::Box box;
+  auto init = make_fcc(2, 2, 6, 4.05, box);
+  const auto zd = core::ZoneDecomposition::build(init, box, 2, kRcut, 2);
+  namespace pot = tdmd::potentials;
+
+  // positive: the default descriptor (steps=0 — no trajectory, just the gate + step-0 work)
+  core::AtomSoA<double> ok = init;
+  EXPECT_NO_THROW(tdcu::eam_gpu_run_singlenode(ok, box, zd, setfl, /*steps=*/0, /*dt=*/0.001));
+
+  auto poison_throws = [&](std::span<const pot::PassDecl> p) {
+    core::AtomSoA<double> a = init;
+    EXPECT_THROW(tdcu::eam_gpu_run_singlenode(a, box, zd, setfl, 0, 0.001, /*symmetric=*/true,
+                                              nullptr, nullptr, nullptr, p),
+                 std::runtime_error);
+  };
+  // needs_transpose at each slot (the MEAM/Tersoff reuse hazard)
+  for (int slot = 0; slot < 3; ++slot) {
+    std::array<pot::PassDecl, 3> p{pot::kEamPassDecls[0], pot::kEamPassDecls[1],
+                                   pot::kEamPassDecls[2]};
+    p[slot].needs_transpose = true;
+    poison_throws(p);
+  }
+  // wrong count
+  std::array<pot::PassDecl, 4> four{pot::kEamPassDecls[0], pot::kEamPassDecls[1],
+                                    pot::kEamPassDecls[2], pot::kEamPassDecls[2]};
+  poison_throws(four);
+  // wclass-illegal (kAccumB1 + fb=0) — caught by validate inside the gate
+  std::array<pot::PassDecl, 3> bad{pot::kEamPassDecls[0], pot::kEamPassDecls[1],
+                                   pot::kEamPassDecls[2]};
+  bad[0].w_class = pot::WClass::kAccumB1;
+  bad[0].accum_fracbits = 0;
+  poison_throws(bad);
+  // wclass-illegal, shape-legal (roles on a kCOnly pass) — the design §9 4th poison:
+  // proves validate wiring THROUGH the driver on a descriptor the shape checks pass
+  std::array<pot::PassDecl, 3> bad2{pot::kEamPassDecls[0], pot::kEamPassDecls[1],
+                                    pot::kEamPassDecls[2]};
+  bad2[1].donor_roles = pot::donor_bit(pot::DonorRole::kSelf);
+  poison_throws(bad2);
 }
 
 namespace {

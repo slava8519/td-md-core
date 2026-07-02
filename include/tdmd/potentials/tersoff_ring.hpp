@@ -171,10 +171,20 @@ struct TersoffWinForceLocalKey {
     tersoff_window_force<Real>(wx, wy, wz, localkey.data(), m, owned, n_owned, *tp, geom, wFx,
                                wFy, wFz, pe, min_r2, nb, nt);
   }
+  // PR-0a: poison differs ONLY in compute() (local-key gating); delegate the descriptor
+  // capability (the concept mandates presence).
+  static void assert_supported(std::span<const potentials::PassDecl> passes) {
+    TersoffWinForce<Real>::assert_supported(passes);
+  }
 };
 
 template <typename Real, typename WinForce = TersoffWinForce<Real>>
 class TersoffRing {
+  static_assert(potentials::WindowForcePolicy<WinForce>,
+      "WinForce must model WindowForcePolicy (static assert_supported + 14-arg const "
+      "compute) — the opt-in `if constexpr requires` firewall was silently bypassable "
+      "(PR-0a; see many_body.hpp)");
+
  public:
   // The default-policy ctor (CPU): builds the policy from pot.ters (a TersoffParams).
   TersoffRing(AtomSoA<Real>& atoms, const Box& box, const TersoffPotential<Real>& pot,
@@ -205,11 +215,12 @@ class TersoffRing {
     zd_ = core::ZoneDecomposition::build(atoms_, box_, o_.n_zones, rcut_, /*reach_mult=*/2);
     n_ = zd_.n_zones;
     z_ = o_.n_nodes;
-    // descriptor firewall: a GPU window-force policy validates pot_.passes() (refuses
-    // needs_transpose / unsupported kinds — the symmetric accumulator would silently run
-    // wrong). The CPU policy has no assert_supported ⇒ this is a compile-time no-op.
-    if constexpr (requires { WinForce::assert_supported(pot_.passes()); })
-      WinForce::assert_supported(pot_.passes());
+    // descriptor firewall (PR-0a: UNCONDITIONAL — the concept guarantees the hooks
+    // exist). validate_pass_decls checks descriptor self-consistency; assert_supported
+    // checks the policy's capability (Tersoff's [BondOrder,Force] with a transpose Force
+    // is ACCEPTED). No-op on legal Tersoff ⇒ F-NOOP.
+    potentials::validate_pass_decls(pot_.passes());
+    WinForce::assert_supported(pot_.passes());
 
     // t0 forces via the serial oracle (same kernel ⇒ same bits) for the 1st drift.
     core::zero_forces(atoms_);

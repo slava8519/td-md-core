@@ -81,10 +81,27 @@ struct CpuEamWindowForce {
       eam_window_force<Math, core::fixed::FixedAccum<40>>(
           wx, wy, wz, key, m, owned, n_owned, *math, geom, rho_cap, wFx, wFy, wFz, pe, min_r2);
   }
+
+  // PR-0a (FIREWALL GAP at the CPU-EAM seam — closed): the CPU policy runs the SAME
+  // symmetric eam_window_force ⇒ its accept-set ≡ the GPU policy. Delegates to the
+  // single EAM gate (eam.hpp). On legal EAM this is a no-op ⇒ F-NOOP (Test_EAM_Ring
+  // byte-identical). Was ABSENT ⇒ the `if constexpr requires` firewall was dead on the
+  // CPU ring; the concept now MANDATES this (many_body.hpp WindowForcePolicy).
+  static void assert_supported(std::span<const potentials::PassDecl> passes) {
+    potentials::assert_eam_symmetric_passes(passes, "CpuEamWindowForce");
+  }
 };
 
 template <typename Real, typename Math, typename WinForce = CpuEamWindowForce<Math>>
 class EamRing {
+  // PR-0a: the WinForce contract, PROMOTED from the opt-in `if constexpr requires`
+  // (silently bypassable — the overdue MB1/MB2 promise). Fires on ANY instantiation
+  // of the ring, even a TU that only constructs it (many_body.hpp).
+  static_assert(potentials::WindowForcePolicy<WinForce>,
+      "WinForce must model WindowForcePolicy (static assert_supported + 14-arg const "
+      "compute) — the opt-in `if constexpr requires` firewall was silently bypassable "
+      "(PR-0a; see many_body.hpp)");
+
  public:
   // The default-policy ctor (CPU): builds the policy from pot.math. Byte-compatible
   // with the pre-refactor signature — every existing call site is unchanged.
@@ -112,11 +129,13 @@ class EamRing {
     zd_ = core::ZoneDecomposition::build(atoms_, box_, o_.n_zones, rcut_, /*reach_mult=*/2);
     n_ = zd_.n_zones;
     z_ = o_.n_nodes;
-    // descriptor firewall: a GPU window-force policy validates pot_.passes() (refuses
-    // needs_transpose / unsupported kinds — the symmetric accumulator would silently run
-    // wrong). The CPU policy has no assert_supported ⇒ this is a compile-time no-op.
-    if constexpr (requires { WinForce::assert_supported(pot_.passes()); })
-      WinForce::assert_supported(pot_.passes());
+    // descriptor firewall (PR-0a: UNCONDITIONAL — the concept guarantees the hooks
+    // exist, so the old `if constexpr requires` opt-in is gone). validate_pass_decls
+    // checks descriptor self-consistency (W-teeth); assert_supported checks the policy's
+    // capability (refuses needs_transpose / unsupported kinds ⇒ the symmetric accumulator
+    // cannot silently run wrong). Both no-op on legal EAM ⇒ F-NOOP.
+    potentials::validate_pass_decls(pot_.passes());
+    WinForce::assert_supported(pot_.passes());
 
     // t0 forces via the serial oracle (same kernel ⇒ same bits) for the 1st drift.
     core::zero_forces(atoms_);

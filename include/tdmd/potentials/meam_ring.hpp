@@ -182,6 +182,11 @@ static_assert(std::is_trivially_copyable_v<MeamWinForce<double>>,
 
 template <typename Real, typename WinForce = MeamWinForce<Real>>
 class MeamRing {
+  static_assert(potentials::WindowForcePolicy<WinForce>,
+      "WinForce must model WindowForcePolicy (static assert_supported + 14-arg const "
+      "compute) — the opt-in `if constexpr requires` firewall was silently bypassable "
+      "(PR-0a; see many_body.hpp)");
+
  public:
   // The default-policy ctor (CPU): builds the policy from pot.meam (a MeamParams).
   MeamRing(AtomSoA<Real>& atoms, const Box& box, const MeamPotential<Real>& pot,
@@ -213,13 +218,13 @@ class MeamRing {
     zd_ = core::ZoneDecomposition::build(atoms_, box_, o_.n_zones, rcut_, /*reach_mult=*/2);
     n_ = zd_.n_zones;
     z_ = o_.n_nodes;
-    // descriptor firewall: a GPU window-force policy validates pot_.passes() (the MEAM
-    // [Density,Embedding,Force(needs_transpose)] descriptor — a symmetric-only accumulator would
-    // silently run the screening 3rd-atom write wrong). The CPU policy DOES define assert_supported
-    // ⇒ this fires at run() (a self-check on the descriptor wiring; MeamWinForce ACCEPTS the
-    // needs_transpose Force).
-    if constexpr (requires { WinForce::assert_supported(pot_.passes()); })
-      WinForce::assert_supported(pot_.passes());
+    // descriptor firewall (PR-0a: UNCONDITIONAL — the concept guarantees the hooks
+    // exist). validate_pass_decls checks descriptor self-consistency; assert_supported
+    // checks capability — the MEAM [Density,Embedding,Force(needs_transpose)] descriptor
+    // is ACCEPTED (the screening 3rd-atom transpose-replay is the correct mechanism).
+    // No-op on legal MEAM ⇒ F-NOOP.
+    potentials::validate_pass_decls(pot_.passes());
+    WinForce::assert_supported(pot_.passes());
 
     // t0 forces via the serial oracle (same kernel ⇒ same bits) for the 1st drift.
     core::zero_forces(atoms_);

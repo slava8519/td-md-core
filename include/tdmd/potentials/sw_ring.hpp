@@ -134,10 +134,20 @@ struct SwWinForceLocalKey {
     sw_window_force<Real>(wx, wy, wz, localkey.data(), m, owned, n_owned, *sp, geom,
                           wFx, wFy, wFz, pe, min_r2, sink);
   }
+  // PR-0a: the poison differs from SwWinForce ONLY in compute() (the local-key gating);
+  // its descriptor capability is identical ⇒ delegate (the concept mandates presence).
+  static void assert_supported(std::span<const potentials::PassDecl> passes) {
+    SwWinForce<Real>::assert_supported(passes);
+  }
 };
 
 template <typename Real, typename WinForce = SwWinForce<Real>>
 class SwRing {
+  static_assert(potentials::WindowForcePolicy<WinForce>,
+      "WinForce must model WindowForcePolicy (static assert_supported + 14-arg const "
+      "compute) — the opt-in `if constexpr requires` firewall was silently bypassable "
+      "(PR-0a; see many_body.hpp)");
+
  public:
   // The default-policy ctor (CPU): builds the policy from pot.sw (a SwParams).
   SwRing(AtomSoA<Real>& atoms, const Box& box, const SwPotential<Real>& pot,
@@ -168,11 +178,13 @@ class SwRing {
     zd_ = core::ZoneDecomposition::build(atoms_, box_, o_.n_zones, rcut_, /*reach_mult=*/2);
     n_ = zd_.n_zones;
     z_ = o_.n_nodes;
-    // descriptor firewall: a GPU window-force policy validates pot_.passes() (refuses
-    // needs_transpose / unsupported kinds — the symmetric accumulator would silently run
-    // wrong). The CPU policy has no assert_supported ⇒ this is a compile-time no-op.
-    if constexpr (requires { WinForce::assert_supported(pot_.passes()); })
-      WinForce::assert_supported(pot_.passes());
+    // descriptor firewall (PR-0a: UNCONDITIONAL — the concept guarantees the hooks
+    // exist). validate_pass_decls checks descriptor self-consistency (W-teeth);
+    // assert_supported checks the policy's capability. SW's φ₃ IS needs_transpose and
+    // SwWinForce ACCEPTS it (the transpose-replay is the correct mechanism) ⇒ no-op on
+    // legal SW ⇒ F-NOOP.
+    potentials::validate_pass_decls(pot_.passes());
+    WinForce::assert_supported(pot_.passes());
 
     // t0 forces via the serial oracle (same kernel ⇒ same bits) for the 1st drift.
     core::zero_forces(atoms_);

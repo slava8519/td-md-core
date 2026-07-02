@@ -19,9 +19,13 @@ SANITIZER="${COMPUTE_SANITIZER:-compute-sanitizer}"
 # Long-horizon tests (26k/50k passes) are the same code paths as the short
 # ones — excluded from sanitizer runs for time. racecheck additionally skips
 # Mixed* (pathological slowdown, see Bench doc; pack/unpack kernels write
-# disjoint per-atom elements — race-free by construction, memcheck-covered).
+# disjoint per-atom elements — race-free by construction, memcheck-covered)
+# and *OffEquilibrium* (M4-S 3000-step shock stress: measured 2h+ under
+# racecheck 2026-07-02 while the SHORT Verlet tests — same code paths — take
+# ~20 s each and STAY racechecked; the stress test remains memcheck-covered,
+# matching its M4-S acceptance record).
 MEMCHECK_FILTER='-*Replica36*:*NveInvariant50k*'
-RACECHECK_FILTER='-*Replica36*:*NveInvariant50k*:*Mixed*'
+RACECHECK_FILTER='-*Replica36*:*NveInvariant50k*:*Mixed*:*OffEquilibrium*'
 for bin in "$BUILD"/test_cuda_*; do
   [[ -x "$bin" ]] || continue
   echo "=== gpu_gate: $SANITIZER --tool memcheck $(basename "$bin") ==="

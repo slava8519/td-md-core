@@ -187,6 +187,22 @@ if(TDMD_WITH_CUDA)
   target_compile_definitions(bench_eam_ring PRIVATE TDMD_EAM_RING_TIMERS)
   target_compile_options(bench_eam_ring PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+
+  # PR-0a (audit §7 p.2): CI compile-surface — the angular GPU window-force policies
+  # (sw/tersoff/meam) + the Gpu*Ring instantiations compile in the cloud cuda-compile job
+  # (TDMD_BUILD_TESTS=OFF skipped them — they were included only by test TUs). Never runs
+  # device code; a broken member in PR-1..4 is caught by CI, not the next local GPU run.
+  # ci.yml is UNCHANGED — the cuda-compile job builds ALL targets at TESTS=OFF.
+  # Two TUs: zone_sw.cuh and zone_tersoff.cuh both define kMaxNbr ⇒ SW and Tersoff
+  # cannot share a TU. The first carries {eam,meam,sw}, the second isolates tersoff.
+  add_executable(cuda_compile_check tools/cuda_compile_check.cu)
+  target_link_libraries(cuda_compile_check PRIVATE tdmd_core Threads::Threads)
+  target_compile_options(cuda_compile_check PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
+  add_executable(cuda_compile_check_tersoff tools/cuda_compile_check_tersoff.cu)
+  target_link_libraries(cuda_compile_check_tersoff PRIVATE tdmd_core Threads::Threads)
+  target_compile_options(cuda_compile_check_tersoff PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false>)
 endif()
 
 # --- M3 timing evidence: direct vs clustered (manual tool, not a CI gate) ---
@@ -355,6 +371,10 @@ if(TDMD_BUILD_TESTS)
   add_executable(test_metrics tests/test_metrics.cpp)      # M4-N: perf-breakdown math
   target_link_libraries(test_metrics PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_Metrics COMMAND test_metrics)
+
+  add_executable(test_w_contract tests/test_w_contract.cpp)  # PR-0a: W-contract descriptor
+  target_link_libraries(test_w_contract PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_W_Contract COMMAND test_w_contract)
 
   add_executable(test_dashboard tests/test_dashboard.cpp)  # M7: live ANSI dashboard + A6
   target_link_libraries(test_dashboard PRIVATE tdmd_core GTest::gtest_main

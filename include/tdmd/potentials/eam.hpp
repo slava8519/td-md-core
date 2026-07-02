@@ -2,6 +2,9 @@
 #include <algorithm>
 #include <cmath>
 #include <functional>
+#include <span>
+#include <stdexcept>
+#include <string>
 #include <vector>
 
 #include "tdmd/core/fixed_accum.hpp"
@@ -95,6 +98,43 @@ EamAccum eam_direct_fp64(AtomSoA<Real>& a, const Box& box, const Math& m,
   return acc;
 }
 
+// PR-0a: the SINGLE source of the EAM descriptor (needed by eam_gpu_run_singlenode,
+// which has no potential object). EamPotential::passes() returns THIS same span —
+// no two copies of truth (tooth T-SRC). Was EamPotential<Real,Math>::kPasses, a
+// per-instantiation member unreachable without the Math type; hoisted to a
+// namespace-scope constant (kPasses had no consumer outside eam.hpp — verified).
+inline constexpr PassDecl kEamPassDecls[3] = {
+    {PassKind::Density, /*reuse*/ true, false, false, 44},
+    {PassKind::Embedding, /*reuse*/ false, false, false, 30},  // local map
+    {PassKind::Force, /*reuse*/ true, false, false, 40},
+};
+inline constexpr std::span<const PassDecl> eam_pass_decls() { return {kEamPassDecls, 3}; }
+
+// PR-0a: the shared "symmetric EAM [Density,Embedding,Force]" gate — the accept/reject
+// SEMANTICS of GpuEamWindowForce::assert_supported (eam_window_force_gpu.cuh) preserved;
+// message texts normalized + `who`-prefixed (teeth check throw/no-throw, not strings —
+// design R4). Consumers: GpuEamWindowForce (DELEGATES, К3 —
+// one truth instead of parity-policing), CpuEamWindowForce (new), eam_gpu_run_
+// singlenode. Calls validate_pass_decls (К9) ⇒ every EAM entry point also rejects
+// wclass-illegal descriptors.
+inline void assert_eam_symmetric_passes(std::span<const PassDecl> passes, const char* who) {
+  validate_pass_decls(passes);
+  auto fail = [&](std::string m) {
+    throw std::runtime_error(std::string(who) + ": " + std::move(m));
+  };
+  if (passes.size() != 3)
+    fail("only the EAM 3-pass (Density,Embedding,Force) sequence is supported — got "
+         + std::to_string(passes.size()) + " passes");
+  const PassKind want[3] = {PassKind::Density, PassKind::Embedding, PassKind::Force};
+  for (std::size_t p = 0; p < 3; ++p) {
+    if (passes[p].kind != want[p]) fail("unexpected pass kind at " + std::to_string(p));
+    if (passes[p].needs_transpose)
+      fail("needs_transpose UNSUPPORTED — the symmetric int64 accumulator q(j)=-q(i) "
+           "cannot run a non-symmetric angular/bond-order term (force to a third atom k)");
+    if (passes[p].iterative) fail("iterative pass (QEq/CG) UNSUPPORTED");
+  }
+}
+
 // --- (2) IManyBodyPotential instance. Math supplies eval_phi/eval_rhoa/eval_F
 // + rcut + density_fracbits() (AnalyticEam now; EamSetfl spline in PR-E2).
 template <typename Real, typename Math>
@@ -102,12 +142,7 @@ struct EamPotential final : IManyBodyPotential<Real> {
   Math math;
   explicit EamPotential(Math m) : math(std::move(m)) {}
 
-  static constexpr PassDecl kPasses[3] = {
-      {PassKind::Density, /*reuse*/ true, false, false, 44},
-      {PassKind::Embedding, /*reuse*/ false, false, false, 30},  // local map
-      {PassKind::Force, /*reuse*/ true, false, false, 40},
-  };
-  std::span<const PassDecl> passes() const override { return {kPasses, 3}; }
+  std::span<const PassDecl> passes() const override { return {kEamPassDecls, 3}; }
   EffectiveRange effective_range() const override { return {2, /*symmetric_reach*/ true}; }
 
   void run_pass(int p, const AtomSoA<Real>& a, const PairGeom& /*geom*/,
@@ -140,9 +175,6 @@ struct EamPotential final : IManyBodyPotential<Real> {
     }
   }
 };
-
-template <typename Real, typename Math>
-constexpr PassDecl EamPotential<Real, Math>::kPasses[3];
 
 // Drives EamPotential through its 3 passes over a direct O(N²) candidate walk,
 // writing the fixed-point accumulators back into a.f. Mirrors PR-E3's engine

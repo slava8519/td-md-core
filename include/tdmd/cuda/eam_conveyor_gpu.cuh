@@ -2,6 +2,7 @@
 #include <cuda_runtime.h>
 
 #include <cstring>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
@@ -111,13 +112,19 @@ T* up(const std::vector<T>& v) {
 // donor is DETECTABLE. out_f{x,y,z} (optional, size n) receive the forces at the
 // final config (with steps=0, the step-0 forces — for the independent-oracle gate).
 //
-// FIREWALL GAP: this driver runs the EAM SYMMETRIC int64 accumulator (q(j)=−q(i))
-// DIRECTLY from a raw EamSetfl — it has NO PassDecl, so it is NOT covered by
-// GpuEamWindowForce::assert_supported (which gates only the EamRing path). It is the
-// oldest/simplest GPU-EAM entry point (the physics suite copies it) ⇒ the LIKELY MEAM
-// reuse site. A MEAM/Tersoff author MUST NOT run a needs_transpose (angular/bond-order,
-// non-symmetric, force-to-third-atom-k) potential through this — build the transpose
-// accumulator path instead. When MEAM lands, descriptor-gate this driver too (MB1).
+// FIREWALL GAP — CLOSED (PR-0a; the overdue "gate the single-node driver when MEAM lands"
+// / MB1 promise). This driver runs the EAM SYMMETRIC int64 accumulator (q(j)=−q(i)) directly
+// from a raw EamSetfl; it is the oldest/simplest GPU-EAM entry point (the physics suite copies
+// it) ⇒ the LIKELY MEAM/Tersoff reuse site. A MANDATORY descriptor gate now runs as the FIRST
+// statement (NOT an `if constexpr` opt-in), BEFORE any device work: a copy-reuse of this driver
+// under a needs_transpose (angular/bond-order, force-to-third-atom-k) potential now THROWS
+// instead of silently running the symmetric accumulator. `passes` defaults to the single source
+// kEamPassDecls; the parameter exists so (a) a reuser/generalization INHERITS the gate rather
+// than bypassing it, (b) the gate tooth is non-vacuous (a poison descriptor → throw, T-GAP).
+// HONEST (not over-claimed): the PRIMARY protection stays TYPE-based (you cannot pass MeamParams
+// here); the value is the inject tooth + the mandatory pattern + retiring the overdue promise.
+// symmetric=false (Oracle-A poison) is the WINDOW shape, orthogonal to the descriptor ⇒ works
+// as before.
 template <typename Real>
 void eam_gpu_run_singlenode(core::AtomSoA<Real>& a, const core::Box& box,
                             const core::ZoneDecomposition& zd,
@@ -125,7 +132,10 @@ void eam_gpu_run_singlenode(core::AtomSoA<Real>& a, const core::Box& box,
                             double dt, bool symmetric = true,
                             std::vector<double>* out_fx = nullptr,
                             std::vector<double>* out_fy = nullptr,
-                            std::vector<double>* out_fz = nullptr) {
+                            std::vector<double>* out_fz = nullptr,
+                            std::span<const potentials::PassDecl> passes =
+                                potentials::eam_pass_decls()) {
+  potentials::assert_eam_symmetric_passes(passes, "eam_gpu_run_singlenode");
   using namespace eam_sn_detail;
   const int n = a.n;
   const int nz = zd.n_zones;

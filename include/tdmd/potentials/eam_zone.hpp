@@ -1,14 +1,16 @@
 #pragma once
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <numeric>
+#include <span>
 #include <stdexcept>
 #include <vector>
 
 #include "tdmd/core/fixed_accum.hpp"
 #include "tdmd/core/soa.hpp"
 #include "tdmd/core/zones.hpp"  // ZoneDecomposition, PairGeom
-#include "tdmd/potentials/eam.hpp"  // EamPotential
+#include "tdmd/potentials/eam.hpp"  // EamPotential, PassDecl, validate_pass_decls
 
 // M6 PR-E3 — serial multi-pass zone EAM with SYMMETRIC THREE-ZONE residence.
 // The bitwise reference for the EAM ring (analog of zones.hpp::zone_force_pass
@@ -80,6 +82,104 @@ inline int eam_window_layout(int j, int n, bool pbc, int wslots[3]) {
     }
   }
   return nw;
+}
+
+// === PR-0a (W-contract, audit §3.1) — the SINGLE source of truth for the donation
+// schedule. Sits next to eam_window_layout (its E5b-F4 precedent — one place, no
+// center-vs-edge off-by-one). PURE function; in PR-0a NO ring consumes it (consumers
+// are PR-1/2). Contract (SPEC; violating any point = a regression of an audit MUST-FIX):
+//  (1) PASS SLOT-space: slot = arrival position; label=(r+slot)%n, r=(h-1)%n
+//      (ZoneFSM §7.2; helpers pass_rotation/slot_zone_id below — the SINGLE source of
+//      the formulas). The schedule is PASS-INVARIANT. ALL future PERSISTENT structures
+//      (ρ-accumulators, CSR, epochs, device mirrors) key by zone_id, NOT by slot;
+//      PR-2's tooth is a PBC run of ≥2 full rotations, n≥5, bitwise.
+//  (2) self(k): precondition — the false→true edge of ensure_drift(k) with pass h's dt
+//      (NOT "on RECV": dt arrives with arrival 0, drift is lazy). drift idempotence is
+//      load-bearing (finalize self-drifts wrap-members again).
+//  (3) cross(a,b): at CoRes(a,b) — both slots arrived AND drifted.
+//  (4) pbc seam cross(n-1,0): available from CoRes(slot n-1, slot 0) = arrival of the
+//      LAST zone (ready=n-2), MUST execute STRICTLY BEFORE finalize_owned(n-1), which
+//      runs IN-SCAN (the tail's defer_head defers ONLY finalize(0)+sends). Encoded
+//      STRUCTURALLY here: the seam is emitted at j=n-1, and by the call contract the
+//      batches of position j execute BEFORE finalize_owned(j). The "in the pass tail"
+//      variant was REFUTED by the audit verifier — do not resurrect it. The micro-point
+//      WITHIN a position's window (arrival vs inside finalize(k-1) after START — audit
+//      open question §8.1) is NOT decided here: both candidates lie in the "after drift,
+//      before finalize" window of the same position; PR-1's adversarial design picks it.
+//  (5) Exactly one batch per unordered pair of adjacent zones per pass + exactly one
+//      self per slot (a generalization of INV-8).
+//  (6) Donation accumulators + ledger are strictly pass-scoped (reset on RECV); a
+//      mid-pass HALT discards the WHOLE pass, partial batch replay is forbidden.
+//      Donations do NOT touch min_r2 / PE / φ-once.
+//  (7) LOAD-BEARING "only adjacent edges" completeness premise: the membership_ok guard
+//      with g = 0.5*(width - 2*rcut). A PR that relaxes g or changes membership MUST
+//      re-derive this function (mutation tooth with a drift fixture — PR-1).
+//  (8) Domain: free — any n≥1; pbc — n==1 (degenerates to the free path, no seam) or
+//      n≥5 (ZoneDecomposition::build rejects periodic 2..4 at reach_mult=2). pbc n in
+//      [2,4] → throw — an EXPLICIT guard (eam_window_layout silently duplicates slots).
+struct DonationBatches {
+  int n_self = 0, n_cross = 0;
+  int self[2] = {-1, -1};                  // self(k) slots; executed FIRST
+  int cross[2][2] = {{-1, -1}, {-1, -1}};  // unordered pairs {a,b}; after self
+};
+
+inline DonationBatches donation_layout(int j, int n, bool pbc) {
+  if (n < 1 || j < 0 || j >= n)
+    throw std::invalid_argument("donation_layout: j out of [0,n)");
+  if (pbc && n >= 2 && n <= 4)
+    throw std::invalid_argument("donation_layout: periodic n_zones 2..4 rejected (reach_mult=2)");
+  DonationBatches b;
+  if (n == 1) { b.self[b.n_self++] = 0; return b; }   // free path; no seam
+  if (j == 0) {                                       // scan 0: slots 0,1 arrived+drifted
+    b.self[b.n_self++] = 0;
+    b.self[b.n_self++] = 1;
+    b.cross[0][0] = 0; b.cross[0][1] = 1; b.n_cross = 1;
+    return b;
+  }
+  if (j + 1 < n) {                                    // 1 <= j <= n-2
+    b.self[b.n_self++] = j + 1;                       // the new drift of this scan
+    b.cross[0][0] = j; b.cross[0][1] = j + 1; b.n_cross = 1;
+    return b;
+  }
+  if (pbc) { b.cross[0][0] = n - 1; b.cross[0][1] = 0; b.n_cross = 1; }  // (4): seam BEFORE finalize(n-1)
+  return b;
+}
+
+// Helpers slot<->label — the SINGLE source of the formulas for PR-1/2's persistent
+// structures (formulas = the ring's frozen conventions; tooth T-ROT).
+inline int pass_rotation(long h, int n, bool pbc) { return pbc ? int((h - 1) % n) : 0; }
+inline int slot_zone_id(int r, int slot, int n) { return (r + slot) % n; }
+
+// END-wait mask of the zone in slot j (audit §3.3 MUST-FIX). VACUOUS-BATCH convention:
+// a ledger bit means "the batch EXECUTED (possibly vacuously)", NOT "contributed ≥1
+// pair". An empty zone (n()==0 is legally resident) sets bits vacuously — else END
+// starves. The want side has NO population parameter by construction.
+// РАЗГРАНИЧЕНИЕ (PR-2: do not conflate): the PLANNING want-set of finalize(j) — selves of
+// ALL window slots + the interior edges (j-1,j),(j,j+1) — is closed by deadline scheduling
+// (teeth T8/T-SIM); want_closure_mask(j) is the END BOOKKEEPING of zone j ITSELF (only its
+// own self/lo/hi roles) — the pair-conveyor contrib_mask precedent. The future check point
+// (PR-2, NOT here): immediately before ZoneFSM::apply(END) in the ring's end path.
+// All shipped descriptors (uniform kCOnly) → 0 everywhere = the F-NOOP anchor.
+inline uint32_t want_closure_mask(std::span<const potentials::PassDecl> passes,
+                                  int j, int n, bool pbc) {
+  potentials::validate_pass_decls(passes);
+  (void)donation_layout(j, n, pbc);   // shared domain guard (throws on pbc 2..4 / j out)
+  const bool cyc    = pbc && n > 1;
+  const bool has_lo = cyc || j > 0;
+  const bool has_hi = cyc || j + 1 < n;    // edges drop on free-z borders, exactly as
+  uint32_t w = 0;                          // eam_window_layout drops slots
+  for (std::size_t p = 0; p < passes.size(); ++p) {
+    if (passes[p].w_class != potentials::WClass::kAccumB1) continue;
+    const uint8_t dr = passes[p].donor_roles;
+    using potentials::DonorRole;
+    if (dr & potentials::donor_bit(DonorRole::kSelf))
+      w |= potentials::closure_bit(int(p), DonorRole::kSelf);
+    if (has_lo && (dr & potentials::donor_bit(DonorRole::kCrossLo)))
+      w |= potentials::closure_bit(int(p), DonorRole::kCrossLo);
+    if (has_hi && (dr & potentials::donor_bit(DonorRole::kCrossHi)))
+      w |= potentials::closure_bit(int(p), DonorRole::kCrossHi);
+  }
+  return w;   // all shipped descriptors (uniform kCOnly) -> 0 everywhere = F-NOOP anchor
 }
 
 // M6 PR-E3b-1 — the 3-pass EAM force on ONE owned zone over a CONTIGUOUS window,
