@@ -83,14 +83,21 @@ int main(int argc, char** argv) {
   // enum/range guards (ensemble, potential, C_buf>=1, ...) live in load_config
   // since B10 — a Config that reaches this point is valid.
 
-  // M6 PR-E0: `potential.type: eam` is a VALID config (parsed + range-checked),
-  // but the EAM force path is not runnable yet — it lands in PR-E1 (analytic
-  // FS-EAM) / PR-E3 (on the ring). Reject explicitly so it can NEVER silently
-  // fall through to the morse branch below (the dispatch is `if lj … else morse`).
+  // `potential.type: eam` is a VALID config (parsed + range-checked), but the
+  // CLI runs the pairwise demo path only (Morse/LJ, direct/cluster/CPU-ring).
+  // The M6 many-body suite (EAM/SW/Tersoff/MEAM — CPU+GPU rings, LAMMPS-
+  // validated) is COMPLETE but lives in tests/tools (Test_EAM*, Test_SW*,
+  // Test_Tersoff*, Test_MEAM*, bench_eam*, eam_drift/eam_coexist/…); wiring it
+  // into the CLI is a separate track — decision recorded 2026-07-02, see
+  // docs/_meta/AUDIT_W_PHASE_NEIGHBORS_2026-07-02.md §7.1 and ConfigSchema §5.
+  // Reject explicitly so it can NEVER silently fall through to the morse
+  // branch below (the dispatch is `if lj … else morse`).
   if (cfg.pot_type == "eam") {
-    std::fprintf(stderr, "[fatal] potential.type: eam parsed OK but is not runnable in "
-                         "this build — EAM lands in M6 PR-E1+ (see "
-                         "docs/_meta/M6_EAM_MANYBODY_DESIGN_2026-06-14.md)\n");
+    std::fprintf(stderr,
+                 "[fatal] potential.type: eam — the M6 EAM engine is complete but not "
+                 "wired into the CLI (CLI v1 = pairwise demo; many-body runs via "
+                 "tests/tools). See docs/_meta/AUDIT_W_PHASE_NEIGHBORS_2026-07-02.md "
+                 "§7.1 / ConfigSchema §5.\n");
     return 2;
   }
 
@@ -236,7 +243,8 @@ int main(int argc, char** argv) {
       std::string rescue_written;
       if (cfg.rescue_enabled) {
         // ring halt: atoms hold the t0 state (a consistent mid-ring geometry
-        // does not exist — ZoneFSM §9; the in-flight dump is an M4+ item)
+        // does not exist — ZoneFSM §9; the in-flight dump is a future item,
+        // deferred again at M7)
         io::write_rescue_xyz(cfg.rescue_file, atoms, box, rc.halt_msg + " [ring: t0 state]");
         rescue_written = cfg.rescue_file;
       }

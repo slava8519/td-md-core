@@ -354,7 +354,7 @@ TEST(Conveyor, CausalityHaltFires) {
 
 // --- static-membership guard (M3.5 [ENG]): an atom wandering deeper than
 // (width - rcut)/2 into a non-adjacent slab must HALT, not silently lose
-// pairs. Migration is an M4 work item. ---
+// pairs. Migration is a future work item. ---
 
 TEST(Conveyor, StaleZoneGuardFires) {
   core::Box box;

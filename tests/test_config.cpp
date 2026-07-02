@@ -111,6 +111,84 @@ TEST(Config, UnknownKeyWarnsWithName) {
   EXPECT_NE(err.find("unknown key 'runn'"), std::string::npos) << err;
 }
 
+// Hygiene 2026-07-02 (AUDIT_W_PHASE_NEIGHBORS §7.3): EVERY key/section the
+// ConfigSchema §1 example documents must NOT trip the typo-warning — before
+// the fix, `logging` / `io.telemetry` / `io.async` / `io.trajectory.format`
+// all warned as typos (this test fails on the pre-fix parser — non-vacuous).
+// The fixture is a self-contained EXHAUSTIVE schema-§1 config (not kValid +
+// appends: YAML duplicate sections resolve last-wins and would mask keys).
+// Deliberately absent: legacy `potential.shift` together with `truncation`
+// (that combination prints an intentional migration warning by design).
+TEST(Config, DocumentedSectionsDoNotWarnAsTypos) {
+  TempConfig cfg(
+      "run: { steps: 10, ensemble: nve, seed: 1, init_temperature: 300.0 }\n"
+      "units: metal\n"
+      "precision: { mode: deterministic_fp64, real_type: fp32 }\n"
+      "geometry: { file: reference_data/al_fcc_72.data, format: lammps_data }\n"
+      "boundary: { x: periodic, y: periodic, z: periodic }\n"
+      "decomposition: { axis: z, mode: by_n_zones, zone_width: null, n_zones: 1,\n"
+      "                 cell_size: 2.33,\n"
+      "                 ring: { backend: streams, n_nodes: 1, steps_per_node: 1,\n"
+      "                         transport: auto } }\n"
+      "neighbor: { mode: cluster, skin: 1.0,\n"
+      "            verlet: { enable: false, K_on: 3.0, K_off: 1.5, default: false } }\n"
+      "potential: { type: morse, r_cut: 4.0, truncation: shift,\n"
+      "             morse: { D: 0.29614, alpha: 1.11892, r0: 3.29692 },\n"
+      "             lj: { epsilon: 1.0, sigma: 1.0 },\n"
+      "             eam: { file: x.eam.alloy }, table: { file: x.table } }\n"
+      "timestep: { mode: auto, dt_initial: 0.005, dt_max: 0.02,\n"
+      "            C1: 0.1, K2: 50.0, C3: 0.5, C_buf: 1.5 }\n"
+      "integrator: velocity_verlet\n"
+      "io: { trajectory: { file: t.lammpstrj, every: 5, format: lammpstrj },\n"
+      "      telemetry: { every: 100 }, async: true,\n"
+      "      rescue: { enabled: true, file: r.xyz, format: xyz } }\n"
+      "verify: { enabled: false, golden: reference_data/, lammps_lib: /x.so,\n"
+      "          tests: [test_0_step] }\n"
+      "logging: { level: info, dashboard: true }\n");
+  testing::internal::CaptureStderr();
+  EXPECT_NO_THROW(io::load_config(cfg.path()));
+  const std::string err = testing::internal::GetCapturedStderr();
+  EXPECT_EQ(err.find("[config] warning"), std::string::npos) << err;
+}
+
+// `integrator` was documented as a fixed enum but never validated (silent
+// `leapfrog` accepted) — closed 2026-07-02 alongside the sync contract.
+TEST(Config, BadIntegratorIsFatal) {
+  expect_throws_with(std::string(kValid) + "integrator: leapfrog\n",
+                     "integrator");
+  EXPECT_NO_THROW(io::load_config(
+      TempConfig(std::string(kValid) + "integrator: velocity_verlet\n").path()));
+}
+
+// ...and the documented-but-inert keys are NOT silently swallowed either:
+// each emits an explicit '[config] note' (the third failure mode — silent
+// ignore of real_type/ring.transport/potential.table — is closed).
+TEST(Config, InertKeysEmitNotes) {
+  TempConfig cfg(std::string(kValid) +
+                 "io: { async: true }\n"
+                 "logging: { level: info }\n"
+                 "decomposition: { axis: z, mode: by_n_zones, n_zones: 1,\n"
+                 "                 ring: { backend: streams, n_nodes: 1, transport: auto } }\n"
+                 "verify: { enabled: true }\n");
+  testing::internal::CaptureStderr();
+  EXPECT_NO_THROW(io::load_config(cfg.path()));
+  const std::string err = testing::internal::GetCapturedStderr();
+  EXPECT_NE(err.find("[config] note: 'io.async'"), std::string::npos) << err;
+  EXPECT_NE(err.find("[config] note: 'logging'"), std::string::npos) << err;
+  EXPECT_NE(err.find("[config] note: 'decomposition.ring.transport'"),
+            std::string::npos) << err;
+  EXPECT_NE(err.find("[config] note: 'verify.enabled'"), std::string::npos) << err;
+  // notes must never be warnings — a regression that drops a key from a known
+  // list would surface here as a typo-warning
+  EXPECT_EQ(err.find("[config] warning"), std::string::npos) << err;
+  // verify.enabled=false (the shipped form) must stay silent — no note noise
+  TempConfig quiet(std::string(kValid) + "verify: { enabled: false }\n");
+  testing::internal::CaptureStderr();
+  io::load_config(quiet.path());
+  EXPECT_EQ(testing::internal::GetCapturedStderr().find("'verify.enabled'"),
+            std::string::npos);
+}
+
 TEST(Config, UnknownNestedKeyWarnsWithSection) {
   TempConfig cfg(std::string(kValid) +
                  "\nio: { trajectory: { file: t.lammpstrj, evry: 5 } }\n");

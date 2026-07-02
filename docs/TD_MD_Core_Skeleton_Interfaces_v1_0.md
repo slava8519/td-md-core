@@ -1,33 +1,61 @@
 # КАРТА МОДУЛЕЙ И ИНТЕРФЕЙСЫ
-## TD-MD Core · v1.0 · 2026-06-05 · контракты до начала кода
+## TD-MD Core · v1.0 · 2026-06-05 · контракты до начала кода · §1 актуализирован as-built 2026-07-02
 
 Назначение — зафиксировать раскладку репозитория и ключевые C++-интерфейсы, чтобы модули не разъехались между шагами разработки. Сигнатуры — ориентир (C++20); агент уточняет детали, но **границы модулей и контракты держит**.
 
+> **Статус документа (2026-07-02, гигиена по `_meta/AUDIT_W_PHASE_NEIGHBORS` §7.5):** §1 ниже —
+> **фактическое** (as-built) дерево. §2–§9 — исходные дизайн-контракты 2026-06-05; они выдержаны
+> по границам модулей, но конкретные сигнатуры эволюционировали: вместо виртуального `IPotential` —
+> статически-типизированные парные функторы (`PairFn`-контракт `conveyor.hpp`) и **дескриптор
+> пассов many-body** (`potentials/many_body.hpp`: `PassDecl`/`needs_transpose`-firewall); вместо
+> `verify/`-каталога — замороженные эталоны `reference_data/` (см. Roadmap «Сквозные требования»);
+> dashboard живёт в `cli/`, не в `io/`. Актуальные контракты — в заголовках самих хедеров и CLAUDE.md.
+
 ---
 
-## 1. Раскладка репозитория
+## 1. Раскладка репозитория (as-built, 2026-07-02)
 
 ```
 td-md-core/
-├── CMakeLists.txt              # C++20, опции -DWITH_LAMMPS, -DPRECISION
-├── Apptainer.def · spack.yaml  # HPC-деплой
-├── .github/workflows/ci.yml    # линт, сборка GCC/Clang, юнит-тесты
-├── config/                     # примеры config.yaml
-├── reference_data/             # золотые данные (готово)
-├── docs/                       # эти md-инструкции (источник истины)
+├── CMakeLists.txt              # C++20; опции TDMD_BUILD_TESTS / TDMD_WITH_CUDA /
+│                               #   TDMD_WITH_MPI / TDMD_WITH_NVTX (флагов WITH_LAMMPS /
+│                               #   PRECISION НЕ существует; точность — из config.yaml)
+├── deploy/                     # HPC-деплой (M7): apptainer/tdmd.def, docker/Containerfile,
+│                               #   spack/spack.yaml, README
+├── .github/workflows/ci.yml    # 4 джобы: build-test, lint(-Werror), cuda-compile, gpu(инертна)
+├── config/                     # примеры config.yaml (m0 / auto / ring)
+├── reference_data/             # замороженные эталоны: golden Al/Морзе, nist_lj/ (NIST вербатим),
+│                               #   eam_al/, eam_al_analytic/, sw_si/, tersoff_si/, meam_si/
+│                               #   (LAMMPS-производные — с gen_*.in регенерацией)
+├── docs/                       # инструкции (источник истины); docs/_meta/ — журнал решений
+├── source/                     # диссертация (docx + md-транскрипция формул)
+├── scripts/gpu_gate.sh         # локальный GPU-гейт: ctest -L cuda + compute-sanitizer
+├── tools/                      # бенчи и физ-харнессы (bench_conveyor/bench_eam*/eam_drift/
+│                               #   eam_coexist/eam_rdf_stat/devprobe/gen_fcc.py и др.)
 ├── include/tdmd/
-│   ├── hal/         hal.hpp, transport.hpp, event.hpp      # абстракция железа
-│   ├── core/        soa.hpp, zone.hpp, fsm.hpp,
-│   │                conveyor.hpp, integrator.hpp, buffer.hpp
-│   ├── potentials/  ipotential.hpp, morse.hpp, eam.hpp, fs.hpp, ml.hpp
-│   ├── io/          config.hpp, reader_lammps.hpp,
-│   │                writer.hpp, dashboard.hpp, rescue.hpp
-│   └── verify/      verifylab.hpp, lammps_bridge.hpp
-├── src/                        # реализации (.cpp / .cu)
-└── tests/                      # Google Test: unit/ + integration/
+│   ├── units.hpp                                         # константы metal-единиц (kB, ftm2v, …)
+│   ├── hal/         hal.hpp                              # TDMD_HOST_DEVICE и переносимость
+│   ├── core/        soa.hpp, zone.hpp, zones.hpp, fsm.hpp, conveyor.hpp, transport.hpp,
+│   │                integrator.hpp, buffer.hpp, cluster.hpp, fixed_accum.hpp (B1),
+│   │                simulation.hpp, thermal.hpp
+│   ├── potentials/  pair_{morse,lj}.hpp, morse.hpp, lj.hpp, clustered_morse.hpp, cutoff.hpp,
+│   │                pair_driver.hpp, many_body.hpp (дескриптор пассов),
+│   │                eam*.hpp, sw*.hpp, tersoff*.hpp, meam*.hpp (+ *_zone/*_ring форки колец)
+│   ├── cuda/        conveyor_gpu.cuh, zone_{force,integrate,cells,verlet}.cuh,
+│   │                zone_{eam,sw,tersoff,meam}[_cells].cuh, *_window_force_gpu.cuh (политики),
+│   │                eam_conveyor_gpu.cuh, zone_eam_{verlet,sorted,newton3,mixed}.cuh (bench-only)
+│   ├── io/          config.hpp, reader_lammps.hpp, writer.hpp, rescue.hpp
+│   ├── cli/         dashboard.hpp, progress_monitor.hpp   # M7 (не io/ — рендер отделён от I/O)
+│   ├── gen/         diamond_si.hpp, partial_screen_slab.hpp  # генераторы фикстур
+│   ├── metrics/     eam_breakdown.hpp, k_cadence.hpp      # M4-N измерительная обвязка
+│   ├── mpi/         mpi_ring_edge.hpp                     # M5a host-staging граница
+│   └── probe/       occupancy.hpp                         # M2.5 аналитический зонд
+├── src/                        # main.cpp (CLI = парное демо, см. ConfigSchema §5),
+│                               #   io/*.cpp, cli/dashboard.cpp, probe/occupancy_probe.cpp
+└── tests/                      # Google Test: ~41 CPU-таргет + cuda/mpi-метки (см. CLAUDE.md)
 ```
 
-**Принцип:** физика потенциалов (`potentials/`) не знает о CUDA напрямую — только через `hal/`. Логика конвейера (`core/conveyor`) не знает о вендоре транспорта — только через `ITransport`.
+**Принцип:** физика потенциалов (`potentials/`) не знает о CUDA напрямую — единый источник парной/угловой математики через `hal.hpp` (`TDMD_HOST_DEVICE`), device-политики оконных сил — в `cuda/*_window_force_gpu.cuh`. Логика конвейера (`core/conveyor`) не знает о вендоре транспорта — только через `ITransport`/`IBoundaryEdge`.
 
 ---
 

@@ -62,6 +62,21 @@ void warn_unknown_keys(const YAML::Node& node, const char* section,
   }
 }
 
+// Hygiene 2026-07-02 (AUDIT_W_PHASE_NEIGHBORS §7.3): a DOCUMENTED key that is
+// legal per ConfigSchema but has no effect in this build gets an explicit
+// note — neither a spurious typo-warning (the old behavior for `logging`/
+// `io.telemetry`/`io.async`) nor a silent ignore (the old behavior for
+// `precision.real_type`/`ring.transport`/`potential.table`/`rescue.format`).
+// '[config] note', not '[config] warning': the shipped-configs no-warning
+// gate (Test_Config) keys off the latter.
+void note_inert_key(const YAML::Node& node, const char* key_path,
+                    const char* why) {
+  if (!node) return;
+  std::fprintf(stderr,
+               "[config] note: '%s' is accepted but inert in this build — %s\n",
+               key_path, why);
+}
+
 bool parse_boundary(const YAML::Node& n, const char* axis, Validator& v) {
   if (!n) return true;  // default: periodic
   const std::string s = n.as<std::string>();
@@ -83,7 +98,9 @@ Config load_config(const std::string& path) {
   warn_unknown_keys(root, "",
                     {"run", "units", "precision", "geometry", "boundary",
                      "decomposition", "neighbor", "potential", "timestep",
-                     "integrator", "io", "verify"});
+                     "integrator", "io", "verify", "logging"});
+  note_inert_key(root["logging"], "logging",
+                 "log level/dashboard are CLI concerns (--dashboard flag, M7)");
 
   if (auto u = root["units"]) {
     const auto s = u.as<std::string>();
@@ -105,6 +122,9 @@ Config load_config(const std::string& path) {
   if (auto pr = root["precision"]) {
     warn_unknown_keys(pr, "precision", {"mode", "real_type"});
     if (pr["mode"]) c.precision_mode = pr["mode"].as<std::string>();
+    note_inert_key(pr["real_type"], "precision.real_type",
+                   "production_mixed pairs FP32 pair-math with FP64 geometry "
+                   "by contract (B5/M4); the key does not switch types");
   }
   v.check_enum(c.precision_mode, "precision.mode",
                {"production_mixed", "deterministic_fp64"});
@@ -160,6 +180,12 @@ Config load_config(const std::string& path) {
       if (l["epsilon"]) c.lj_epsilon = l["epsilon"].as<double>();
       if (l["sigma"])   c.lj_sigma   = l["sigma"].as<double>();
     }
+    note_inert_key(p["eam"], "potential.eam",
+                   "the CLI runs the pairwise demo path only; the M6 "
+                   "many-body suite (EAM/SW/Tersoff/MEAM) runs via "
+                   "tests/tools (AUDIT_W_PHASE_NEIGHBORS §7.1)");
+    note_inert_key(p["table"], "potential.table",
+                   "tabulated potentials are backlog (TZ §5)");
   }
   v.check_enum(c.pot_type, "potential.type", {"morse", "lj", "eam"});
   v.check_enum(c.truncation, "potential.truncation",
@@ -210,6 +236,9 @@ Config load_config(const std::string& path) {
       if (r["backend"])        c.ring_backend  = r["backend"].as<std::string>();
       if (r["n_nodes"])        c.ring_nodes    = r["n_nodes"].as<int>();
       if (r["steps_per_node"]) c.steps_per_node = r["steps_per_node"].as<int>();
+      note_inert_key(r["transport"], "decomposition.ring.transport",
+                     "the CLI ring is the CPU reference conveyor; GPU/MPI "
+                     "transports are test-driven until M5b packaging");
     }
     if (d["cell_size"]) c.cell_size = d["cell_size"].as<double>();
   }
@@ -248,22 +277,43 @@ Config load_config(const std::string& path) {
           "neighbor.verlet.K_on must be >= K_off (hysteresis band)");
 
   if (auto io = root["io"]) {
-    warn_unknown_keys(io, "io", {"trajectory", "rescue"});
+    warn_unknown_keys(io, "io", {"trajectory", "rescue", "telemetry", "async"});
+    note_inert_key(io["telemetry"], "io.telemetry",
+                   "telemetry cadence is a dashboard concern (--dashboard, M7)");
+    note_inert_key(io["async"], "io.async",
+                   "the async background I/O writer is a deferred M7 sub-PR");
     if (auto tr = io["trajectory"]) {
-      warn_unknown_keys(tr, "io.trajectory", {"file", "every"});
+      warn_unknown_keys(tr, "io.trajectory", {"file", "every", "format"});
       if (tr["file"])  c.traj_file  = tr["file"].as<std::string>();
       if (tr["every"]) c.traj_every = tr["every"].as<long>();
+      note_inert_key(tr["format"], "io.trajectory.format",
+                     "the trajectory format is fixed .lammpstrj");
     }
     if (auto rs = io["rescue"]) {
       warn_unknown_keys(rs, "io.rescue", {"enabled", "file", "format"});
       if (rs["enabled"]) c.rescue_enabled = rs["enabled"].as<bool>();
       if (rs["file"])    c.rescue_file    = rs["file"].as<std::string>();
+      note_inert_key(rs["format"], "io.rescue.format",
+                     "the rescue format is fixed extended-XYZ (B9)");
     }
   }
   v.check(c.traj_every >= 0, "io.trajectory.every must be >= 0");
 
-  if (auto vf = root["verify"])
-    warn_unknown_keys(vf, "verify", {"enabled", "golden", "tests"});
+  // 2026-07-02 (verification finding): `integrator` was documented as a fixed
+  // enum but never validated — `integrator: leapfrog` silently proceeded.
+  if (auto ig = root["integrator"])
+    v.check_enum(ig.as<std::string>(), "integrator", {"velocity_verlet"});
+
+  if (auto vf = root["verify"]) {
+    warn_unknown_keys(vf, "verify", {"enabled", "golden", "tests", "lammps_lib"});
+    // note only when the user actually expects behavior (enabled: true);
+    // the shipped configs carry an inert `enabled: false` block — no noise.
+    if (vf["enabled"] && vf["enabled"].as<bool>(false))
+      note_inert_key(vf["enabled"], "verify.enabled",
+                     "VerifyLab/liblammps is not built into the engine; "
+                     "goldens are frozen under reference_data/ (regenerated "
+                     "offline via the committed gen_*.in LAMMPS scripts)");
+  }
 
   v.throw_if_failed();
   return c;

@@ -69,8 +69,9 @@
 // surfaced there). INV-4 forecast: v_pred = v_full + a_full·dt·L, L=max(1,n−1)
 // ([ENG] lag generalization of the M3 cold-start refinement).
 //
-// Static zone membership [ENG]: atoms are binned once at t0; migration is
-// deferred to M4 (the zone payload format changes there anyway, B5). The
+// Static zone membership [ENG]: atoms are binned once at t0; migration is a
+// FUTURE work item (2026-07-02: the M4 payload-format change it once waited
+// on has long landed — no ring implements migration; the guard is load-bearing). The
 // honest guard: at END every member must lie within its slab ± (width−rcut)/2
 // (pair completeness bound), else HALT StaleZone. n=2 with free z is a
 // bipartition — always complete, no guard needed; n>=3 guarded.
@@ -84,7 +85,8 @@
 //
 // HALT semantics: the ring stops via an atomic flag + transport shutdown;
 // the result keeps t0 atom state (no consistent mid-ring geometry exists —
-// §9's rescue dump of the in-flight ring is an M4 work item) and the stats
+// §9's rescue dump of the in-flight ring is a future work item, deferred
+// again at M7) and the stats
 // prefix of provably completed passes. FixedAccum overflow / FSM violations
 // surface as Halt::Internal (the §9 rescue path), not as UB or assert.
 namespace tdmd::core {
@@ -156,7 +158,7 @@ struct PassStats {
 
 // On HALT: atoms keep their t0 state (a consistent mid-ring geometry does not
 // exist — zones of several passes are in flight; the §9 rescue dump of the
-// ring state is an M4 work item), stats hold the longest prefix of passes
+// ring state is a future work item, deferred again at M7), stats hold the longest prefix of passes
 // whose record was written — a pass that finished concurrently with the halt
 // but aborted before its stats write is conservatively NOT counted.
 struct ConveyorResult {
@@ -447,13 +449,13 @@ class TimeConveyor {
                       h, s.fsm.id, s.v_max * dt, R_buf, dt);
         return fail(Halt::Causality, buf);
       }
-      // [ENG] static-membership guard (migration deferred to M4).
+      // [ENG] static-membership guard (migration is a future work item).
       if (n_ >= 3 && !membership_ok(s)) {
         return fail(Halt::StaleZone,
                     "stale zone membership at step " + std::to_string(h) +
                         " zone " + std::to_string(s.fsm.id) +
                         ": atom left its slab by more than (width-r_cut)/2; "
-                        "atom migration is an M4 work item");
+                        "atom migration is a future work item");
       }
       ZoneFSM::apply(s.fsm, ZoneEvent::END);  // T4: force_complete = true
       outq.push_back(j);
