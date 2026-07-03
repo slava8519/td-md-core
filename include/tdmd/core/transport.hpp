@@ -47,6 +47,15 @@ struct ZoneHeader {
   double skin_consumed = 0.0;  // accumulated 2*R_buf budget since last rebuild
   uint8_t rebuild_now = 1;     // 1 => materialize the list this pass
   uint8_t verlet_active = 0;   // 1 => Verlet reuse path; 0 => cell-raster (Базис A)
+  // PR-4 lazy MPI materialization (INERT until PR-4; rebuild_now stays the ACTIVE
+  // decision). Monotone per-head rebuild counter: a rank materializes zone z's list
+  // iff local_epoch[z] < rebuild_epoch (core/rebuild_epoch.hpp). Default 0 => no rank
+  // ever sees a stale local epoch => bitwise no-op, exactly like d_full/drift_full ride
+  // zero while verlet_hybrid=false. z-independent broadcast scalar (NL-INV-4). Lands in
+  // the 4-byte-aligned slot (offset 68) inside the existing padding hole before d_full
+  // => sizeof unchanged (asserted below). Consumers (PR-4, NOT written/read here):
+  // broadcast into EVERY header like rebuild_now (conveyor_gpu.cuh send) + arrival-0 read.
+  uint32_t rebuild_epoch = 0;
   // PR-3 hybrid criterion (opt-in, verlet_hybrid): the lagged max atom
   // displacement from the last rebuild epoch — rides the Λ-chain like v_full.
   // PR-4 drift (opt-in, verlet_drift): the lagged mean displacement (drift D0)
@@ -54,6 +63,16 @@ struct ZoneHeader {
   double d_full = 0.0;             // max ||x - x_ref|| (or residual under drift)
   double drift_full[3] = {0, 0, 0};  // mean displacement D0 (PR-4)
 };
+
+// PR-0c F-NOOP gate (machine-checked, not prose): rebuild_epoch was placed in the
+// existing 4-byte padding hole after the two uint8, so the wire image length is
+// UNCHANGED. A future field reorder that grows the struct/wire image goes RED here.
+static_assert(sizeof(ZoneHeader) == 104,
+              "ZoneHeader wire image must stay 104 bytes (PR-0c: rebuild_epoch fits the "
+              "padding hole; a size change breaks the memcpy/sizeof wire-parity)");
+static_assert(offsetof(ZoneHeader, d_full) == 72,
+              "rebuild_epoch must occupy the padding hole before d_full (offset 68), "
+              "leaving d_full at 72 — else the field grew the struct");
 
 // Zone payload. deterministic_fp64 mode ships plain FP64 global coordinates
 // (B5: FP32 offsets are a production_mixed traffic optimization, M4).

@@ -384,6 +384,10 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_skin_budget PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_Skin_Budget COMMAND test_skin_budget)
 
+  add_executable(test_rebuild_epoch tests/test_rebuild_epoch.cpp)  # PR-0c: epoch primitive + scaffold
+  target_link_libraries(test_rebuild_epoch PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_Rebuild_Epoch COMMAND test_rebuild_epoch)
+
   add_executable(test_dashboard tests/test_dashboard.cpp)  # M7: live ANSI dashboard + A6
   target_link_libraries(test_dashboard PRIVATE tdmd_core GTest::gtest_main
                         Threads::Threads)
