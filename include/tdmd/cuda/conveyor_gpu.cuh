@@ -63,6 +63,7 @@
 #include "tdmd/core/buffer.hpp"
 #include "tdmd/core/conveyor.hpp"
 #include "tdmd/core/fsm.hpp"
+#include "tdmd/core/skin_budget.hpp"  // PR-0b: extracted decide_pass (one source, PR-4)
 #include "tdmd/core/transport.hpp"
 #include "tdmd/core/zones.hpp"
 #include "tdmd/cuda/zone_cells.cuh"
@@ -1365,46 +1366,17 @@ class GpuTimeConveyor {
   std::size_t packed_bytes() const {
     return sizeof(double) * cap_ + 9 * sizeof(int) * std::size_t(cap_);
   }
-  // PR-1b-ii skin recurrence (NL-INV-2a) + PR-2 K-aware fallback (I1). All
-  // inputs are z-independent scalars over the lagged Λ-forecast, so the whole
-  // decision (skin budget, rebuild, AND verlet_active) is bitwise z-independent.
-  //   * charge 2*R_buf — the per-step pair-approach bound INV-4 enforces.
-  //   * K_pred = skin/(2*R_buf): predicted reuse factor. Two-threshold
-  //     hysteresis (K_on > K_off) flips verlet_active without chatter; below
-  //     break-even we fall back to the cell-raster path (worst case == current
-  //     engine, not "+tax"). A 0->1 turn-on forces a rebuild (no list yet).
+  // PR-1b-ii skin recurrence (NL-INV-2a) + PR-2 K-aware fallback (I1). The whole
+  // decision (skin budget, rebuild, AND verlet_active) is bitwise z-independent —
+  // see the rationale in core/skin_budget.hpp. PR-0b EXTRACTED the arithmetic there
+  // byte-identical so the many-body ring port (PR-4) consumes one source; this is
+  // now a thin config-binding wrapper (M4-S И2 refinement DEFERRED — verlet_skin/ROADMAP).
   void decide_pass(double skin_in, double R_buf, uint8_t va_prev, double d_lagged,
                    double lag, double& skin_out, bool& rebuild,
                    uint8_t& va_next) const {
-    const double charge = 2.0 * R_buf;
-    const double K_pred = charge > 1e-300
-                              ? o_.verlet_skin / charge
-                              : std::numeric_limits<double>::infinity();
-    va_next = va_prev;
-    if (va_prev == 0 && K_pred >= o_.verlet_K_on) va_next = 1;
-    else if (va_prev == 1 && K_pred < o_.verlet_K_off) va_next = 0;
-    if (!va_next) {                 // fallback (cell-raster): budget idle
-      rebuild = false; skin_out = 0.0;
-    } else if (va_prev == 0) {      // turned ON: no list yet -> force rebuild
-      rebuild = true; skin_out = 0.0;
-    } else {
-      skin_out = skin_in + charge;       // conservative accumulator (carried)
-      double skin_used = skin_out;
-      if (o_.verlet_hybrid) {
-        // PR-3 hybrid: 2*d_lagged + 2*L*R_buf is also a valid upper bound on
-        // the current pair-approach (d_lagged = max displacement as of t-L,
-        // + L steps of R_buf). min() of two upper bounds is the tightest SAFE
-        // bound => rebuilds no sooner than conservative (larger K). The
-        // M4-S И2 refinement d_(1)+d_(2) <= 2*d_lagged would tighten the prefix
-        // (still safe, monotone) — DEFERRED (marginal K, see verlet_skin/ROADMAP).
-        // post-rebuild stale d_lagged is harmless: skin_out is then tiny, so
-        // min() picks it — no rebuild storm (no epoch tracking needed).
-        const double hyb = 2.0 * d_lagged + 2.0 * lag * R_buf;
-        skin_used = hyb < skin_used ? hyb : skin_used;
-      }
-      rebuild = (skin_used >= o_.verlet_skin);
-      if (rebuild) skin_out = 0.0;
-    }
+    core::skin_budget::decide_pass(
+        {o_.verlet_skin, o_.verlet_K_on, o_.verlet_K_off, o_.verlet_hybrid},
+        skin_in, R_buf, va_prev, d_lagged, lag, skin_out, rebuild, va_next);
   }
   CellGrid zone_grid(int zone_id) const {
     const double len[3] = {box_.len(0), box_.len(1), box_.len(2)};
