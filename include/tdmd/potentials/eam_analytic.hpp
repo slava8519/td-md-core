@@ -74,6 +74,16 @@ struct AnalyticEam {
   // params and before any eval (else the truncation is not applied → the
   // energy is discontinuous at rcut and FD fails). make_analytic_al() does it.
   void finalize() {
+    // PR-1 D3 (W-contract): rho_a >= 0 is load-bearing for donations (partial-ρ
+    // monotonicity partial<=final + rho_cap trigger-set equivalence hold only on
+    // non-negative quanta). For the analytic form beta>0 && rho_amp>0 PROVES it:
+    // v'(r) = f'(r) − f'(rc) < 0 on [0,rc) (f' = −β·f strictly increasing) ⇒ the
+    // force-shifted ρ_a decreases strictly to v(rc)=0 ⇒ v > 0 on [0,rc) — a
+    // closed-form proof, stronger than any scan (the setfl twin scans exactly).
+    if (!(beta > 0.0 && rho_amp > 0.0))
+      throw std::runtime_error(
+          "AnalyticEam: beta and rho_amp must be > 0 — the donation contract "
+          "requires rho_a >= 0 (PR-1 D3)");
     phi_rc_ = phi_raw(rcut, dphi_rc_);
     rhoa_rc_ = rhoa_raw(rcut, drhoa_rc_);
   }

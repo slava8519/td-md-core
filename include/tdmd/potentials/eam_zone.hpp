@@ -104,8 +104,11 @@ inline int eam_window_layout(int j, int n, bool pbc, int wslots[3]) {
 //      batches of position j execute BEFORE finalize_owned(j). The "in the pass tail"
 //      variant was REFUTED by the audit verifier — do not resurrect it. The micro-point
 //      WITHIN a position's window (arrival vs inside finalize(k-1) after START — audit
-//      open question §8.1) is NOT decided here: both candidates lie in the "after drift,
-//      before finalize" window of the same position; PR-1's adversarial design picks it.
+//      open question §8.1) — DECIDED (PR-1): the ARRIVAL variant; see
+//      TD_MD_Core_WContract_v1_0.md §9. PR-2 schedules donations as a standalone
+//      scan-loop step between arrival/drift and finalize, NOT baked into finalize;
+//      the finalize(k-1)-after-START alternative (the dissertation letter) lies in
+//      the same window and is W-1-equivalent — rejected for the M5b freedom.
 //  (5) Exactly one batch per unordered pair of adjacent zones per pass + exactly one
 //      self per slot (a generalization of INV-8).
 //  (6) Donation accumulators + ledger are strictly pass-scoped (reset on RECV); a

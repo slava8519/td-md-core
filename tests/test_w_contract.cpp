@@ -87,19 +87,33 @@ TEST(WContract, ValidateAcceptsAllShippedDescriptors) {
   EXPECT_NO_THROW(validate_pass_decls(canon));  // legal future value, gated by its consumer PR
 }
 
-// T-INERT — every shipped descriptor is inert (kCOnly + no roles). KILL: flip any shipped
-// tail field, OR insert a field in the MIDDLE of PassDecl (the compile-time part).
+// T-INERT (retargeted by PR-1 D5 — the deliberate descriptor flip): every shipped
+// descriptor is inert (kCOnly + no roles) EXCEPT EAM Density, which is EXACTLY
+// {kAccumB1, self|lo|hi, fb 44} — the first shipped W-descriptor (its consumer is the
+// donation driver's ledger assert). The lock is retargeted, not deleted: any OTHER
+// flip, or a drift of the EAM flip itself, still fails here. KILL: flip any other
+// shipped tail field / change the EAM roles / insert a field mid-PassDecl.
 TEST(WContract, ShippedDescriptorsAreInert) {
-  auto check = [](std::span<const PassDecl> ps) {
+  auto check_conly = [](std::span<const PassDecl> ps) {
     for (const auto& d : ps) {
       EXPECT_EQ(d.w_class, WClass::kCOnly);
       EXPECT_EQ(d.donor_roles, 0);
     }
   };
-  check(eam_pass_decls());
-  check(SwPotential<double>().passes());
-  check(TersoffPotential<double>().passes());
-  check(MeamPotential<double>().passes());
+  // EAM: pass 0 flipped exactly as PR-1 shipped it; passes 1-2 stay inert.
+  const auto eam = eam_pass_decls();
+  EXPECT_EQ(eam[0].w_class, WClass::kAccumB1);
+  EXPECT_EQ(eam[0].donor_roles,
+            donor_bit(DonorRole::kSelf) | donor_bit(DonorRole::kCrossLo) |
+                donor_bit(DonorRole::kCrossHi));
+  EXPECT_EQ(eam[0].accum_fracbits, 44);
+  EXPECT_EQ(eam[1].w_class, WClass::kCOnly);
+  EXPECT_EQ(eam[1].donor_roles, 0);
+  EXPECT_EQ(eam[2].w_class, WClass::kCOnly);
+  EXPECT_EQ(eam[2].donor_roles, 0);
+  check_conly(SwPotential<double>().passes());
+  check_conly(TersoffPotential<double>().passes());
+  check_conly(MeamPotential<double>().passes());
   // compile-time: the tail fields default and a 5-positional aggregate still builds
   // (breaks if a field is inserted mid-struct — the positional-init hazard).
   constexpr PassDecl five{PassKind::Force, true, false, false, 40};
@@ -298,19 +312,40 @@ TEST(WContract, ConsistentWithEamWindowLayout) {
 // want_closure_mask / ledger (§4)
 // ---------------------------------------------------------------------------
 
-// T9 — all-kCOnly shipped descriptors → want mask 0 everywhere (the F-NOOP anchor).
-// KILL: derive the mask from kind instead of w_class, or leak a bit from a kCOnly pass.
+// T9 (retargeted by PR-1 D5): the all-kCOnly shipped descriptors (SW/Tersoff/MEAM)
+// → want mask 0 everywhere. EAM left this lock (its Density flipped to kAccumB1) —
+// its masks are pinned by T9-EAM below. KILL: derive the mask from kind instead of
+// w_class, or leak a bit from a kCOnly pass.
 TEST(WContract, WantMaskAllCOnlyIsZero) {
   auto run = [](std::span<const PassDecl> ps, int n, bool pbc) {
     for (int j = 0; j < n; ++j) EXPECT_EQ(want_closure_mask(ps, j, n, pbc), 0u);
   };
   for (int n = 1; n <= 6; ++n) {
-    run(eam_pass_decls(), n, false);
     run(SwPotential<double>().passes(), n, false);
     run(TersoffPotential<double>().passes(), n, false);
     run(MeamPotential<double>().passes(), n, false);
   }
-  run(eam_pass_decls(), 5, true);
+  run(SwPotential<double>().passes(), 5, true);
+}
+
+// T9-EAM (PR-1 D5) — the flipped EAM descriptor's want masks, hand-computed:
+// Density (pass 0) carries self|lo|hi; edges drop on free-z; pbc keeps all three;
+// n=1 keeps only self. Embedding/Force contribute NO bits (kCOnly).
+// KILL: revert the flip (masks all-zero) / change the roles / break edge-dropping.
+TEST(WContract, WantMaskEamFlippedDescriptor) {
+  const auto eam = eam_pass_decls();
+  const uint32_t s = closure_bit(0, DonorRole::kSelf);
+  const uint32_t lo = closure_bit(0, DonorRole::kCrossLo);
+  const uint32_t hi = closure_bit(0, DonorRole::kCrossHi);
+  // free n=5: j=0 no lower edge; interior all three; j=4 no upper edge
+  EXPECT_EQ(want_closure_mask(eam, 0, 5, false), s | hi);
+  EXPECT_EQ(want_closure_mask(eam, 2, 5, false), s | lo | hi);
+  EXPECT_EQ(want_closure_mask(eam, 4, 5, false), s | lo);
+  // pbc n=5: every zone has both edges
+  for (int j = 0; j < 5; ++j) EXPECT_EQ(want_closure_mask(eam, j, 5, true), s | lo | hi);
+  // n=1: only self (free and pbc degenerate)
+  EXPECT_EQ(want_closure_mask(eam, 0, 1, false), s);
+  EXPECT_EQ(want_closure_mask(eam, 0, 1, true), s);
 }
 
 // T10 — synthetic kAccumB1 [Density, roles=self|lo|hi]: interior→3 bits; free j=0 no lo;

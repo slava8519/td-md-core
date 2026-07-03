@@ -5,8 +5,13 @@
 > целиком: EAM-лестница E0–E7 + физ-критерий coexistence/RDF/drift + **угловые лестницы
 > SW T1–T7 / Tersoff Te1–Te7 / MEAM Me1–Me7** — CPU+GPU, LAMMPS-валидированы) ·
 > ✅ M7 (CI/контейнеры/dashboard). **Открыто: M5b** (multi-GPU; внешний триггер ≥2 GPU).
+> **W-трек (пост-M7, ветка `opus`):** ✅ PR-0a (инертный дескриптор + `donation_layout` +
+> concept-firewall + закрытие FIREWALL GAP) · ✅ PR-1 (serial-оракул EAM-донаций: ρ
+> донационными int64-батчами ≡ `zone_eam_pass` побитово на домене G-A; `_meta/PR1_DONATION_ORACLE_DESIGN`).
+> Далее по лестнице аудита: PR-2 (донации в живом EamRing), PR-0b (skin_budget), PR-3a-b (GPU, гейт R_W≥1.15).
 > Полная летопись вех — CLAUDE.md; перф-числа — `TD_MD_Core_Bench_v1_0.md`; актуальный
-> аудит w-фазы/соседей и W-контракт — `_meta/AUDIT_W_PHASE_NEIGHBORS_2026-07-02.md`.
+> аудит w-фазы/соседей и W-контракт — `_meta/AUDIT_W_PHASE_NEIGHBORS_2026-07-02.md` +
+> `TD_MD_Core_WContract_v1_0.md`.
 >
 > *Историческая шапка (2026-06-11):* ✅ M0 · ✅ M1 · ✅ M2 · ✅ M2.5 · ✅ M2.6 — критерии приёмки
 > зелёные (6 тестов в CI). Текущей вехой была M2.7 (GPU bring-up). Сверка формул диссертации с кодом —

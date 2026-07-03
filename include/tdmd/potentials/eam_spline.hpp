@@ -1,4 +1,5 @@
 #pragma once
+#include <algorithm>
 #include <cmath>
 #include <fstream>
 #include <sstream>
@@ -111,8 +112,54 @@ struct EamSetfl {
     Fspl = interpolate(Nrho, drho, Ff);
     rhoaspl = interpolate(Nr, dr, rhoaf);
     rphispl = interpolate(Nr, dr, rphif);
+    assert_rhoa_nonnegative_();  // PR-1 D3 — the donation-contract guard (one funnel
+                                 // for BOTH loaders: from_setfl and from_analytic)
     double dv;
     eval_rhoa(r_min_guard, rhoa_floor, dv);  // physical-floor density bound
+  }
+
+  // PR-1 D3 (W-contract): the donation contract requires ρ_a(r) >= 0 — the
+  // monotonicity of partial ρ (partial <= final) and the rho_cap trigger-set
+  // equivalence hold only on non-negative quanta (rint(v·2^fb) >= 0 for v >= 0).
+  // EXACT per-interval cubic minimum, not knot sampling: the D3 mandate was the
+  // BETWEEN-knot spline overshoot (knot-only checking is the kill-mutation of
+  // tooth Т-15б). Interval m in [1, Nr-1], p in [0,1):
+  //   v(p) = ((c3·p + c4)·p + c5)·p + c6, ci = rhoaspl[7m+3..6];
+  //   min over {v(0), v(1), v(p*)} for real roots p* of 3c3·p² + 2c4·p + c5 in (0,1).
+  // The knot m = Nr covers the clamp tail (eval clamps p to the last knot).
+  // STRICT `< 0.0`: from_analytic's force-shifted ρ_a is EXACTLY 0 at the rcut
+  // knot (measured) — zero must pass. Load-time only; the HOST_DEVICE eval path
+  // (bitwise CPU<->GPU contract) is untouched.
+  void assert_rhoa_nonnegative_() const {
+    auto C = [&](int m, int k) -> double { return rhoaspl[7 * m + k]; };
+    double vmin = C(1, 6);
+    for (int m = 1; m <= Nr - 1; ++m) {
+      const double c3 = C(m, 3), c4 = C(m, 4), c5 = C(m, 5), c6 = C(m, 6);
+      auto v = [&](double p) { return ((c3 * p + c4) * p + c5) * p + c6; };
+      vmin = std::min(vmin, std::min(v(0.0), v(1.0)));
+      // interior extrema: roots of 3c3 p^2 + 2c4 p + c5 = 0 in (0,1)
+      const double a = 3.0 * c3, b = 2.0 * c4;
+      if (a == 0.0) {
+        if (b != 0.0) {
+          const double p = -c5 / b;
+          if (p > 0.0 && p < 1.0) vmin = std::min(vmin, v(p));
+        }
+      } else {
+        const double disc = b * b - 4.0 * a * c5;
+        if (disc >= 0.0) {
+          const double sq = std::sqrt(disc);
+          for (const double p : {(-b + sq) / (2.0 * a), (-b - sq) / (2.0 * a)})
+            if (p > 0.0 && p < 1.0) vmin = std::min(vmin, v(p));
+        }
+      }
+    }
+    vmin = std::min(vmin, C(Nr, 6));  // clamp-tail knot
+    if (vmin < 0.0)
+      throw std::runtime_error(
+          "EamSetfl: rho_a(r) dips below zero (min " + std::to_string(vmin) +
+          ") — the donation contract requires rho_a >= 0: the monotonicity of "
+          "partial rho (partial <= final) and the rho_cap trigger-set "
+          "equivalence hold only on non-negative quanta (PR-1 D3)");
   }
 
   // --- single-element setfl (eam/alloy) loader ---

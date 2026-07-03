@@ -376,6 +376,10 @@ if(TDMD_BUILD_TESTS)
   target_link_libraries(test_w_contract PRIVATE tdmd_core GTest::gtest_main)
   add_test(NAME Test_W_Contract COMMAND test_w_contract)
 
+  add_executable(test_eam_donation tests/test_eam_donation.cpp)  # PR-1: donation oracle
+  target_link_libraries(test_eam_donation PRIVATE tdmd_core GTest::gtest_main)
+  add_test(NAME Test_EAM_Donation COMMAND test_eam_donation)
+
   add_executable(test_dashboard tests/test_dashboard.cpp)  # M7: live ANSI dashboard + A6
   target_link_libraries(test_dashboard PRIVATE tdmd_core GTest::gtest_main
                         Threads::Threads)

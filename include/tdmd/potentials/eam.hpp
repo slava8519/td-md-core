@@ -103,8 +103,18 @@ EamAccum eam_direct_fp64(AtomSoA<Real>& a, const Box& box, const Math& m,
 // no two copies of truth (tooth T-SRC). Was EamPotential<Real,Math>::kPasses, a
 // per-instantiation member unreachable without the Math type; hoisted to a
 // namespace-scope constant (kPasses had no consumer outside eam.hpp — verified).
+// PR-1 (D5, К1): Density is FLIPPED to kAccumB1 + all three donor roles — the first
+// shipped W-descriptor. Legal by the PR-0a sanction ("flipping EAM Density → kAccumB1
+// in PR-1 breaks no consumer" — w_class declares a CAPABILITY; every ring keeps its
+// monolithic path). The first runtime consumer is the donation driver's ledger assert
+// (eam_donation.hpp) — WITHOUT the flip want_closure_mask(EAM)≡0 and that assert would
+// be structurally dead (the 5-recidive class). Embedding stays kCOnly in the enum
+// (SEMANTICALLY kWrapup — see WContract §10); Force stays kCOnly (C-phase).
+// Rollback tooth: assert_eam_donation_descriptor (Т-13, test_eam_donation.cpp).
 inline constexpr PassDecl kEamPassDecls[3] = {
-    {PassKind::Density, /*reuse*/ true, false, false, 44},
+    {PassKind::Density, /*reuse*/ true, false, false, 44, WClass::kAccumB1,
+     uint8_t(donor_bit(DonorRole::kSelf) | donor_bit(DonorRole::kCrossLo) |
+             donor_bit(DonorRole::kCrossHi))},
     {PassKind::Embedding, /*reuse*/ false, false, false, 30},  // local map
     {PassKind::Force, /*reuse*/ true, false, false, 40},
 };
