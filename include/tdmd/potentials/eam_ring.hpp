@@ -19,6 +19,7 @@
 #include "tdmd/units.hpp"
 #include "tdmd/core/zones.hpp"
 #include "tdmd/potentials/eam.hpp"
+#include "tdmd/potentials/eam_donation.hpp"  // PR-2: donation executors + DonatingWindowForcePolicy
 #include "tdmd/potentials/eam_zone.hpp"  // eam_window_force, zone_eam_window
 
 // M6 PR-E3b — EamRing: threaded EAM TD ring (SEPARATE driver; the pair
@@ -45,6 +46,19 @@
 // GPU policy (cuda/eam_window_force_gpu.cuh) runs the E5 kernels on the SAME
 // gathered window ⇒ EamGpuRing inherits ALL orchestration ⇒ bitwise ≡ CPU ring
 // by construction (the int64 window-force result is order-free, B1/INV-9).
+//
+// PR-2 (live donation ring) — FORK DIVERGENCE (audit §5/§7.7 foresaw it, fork #5 to
+// unify at ReaxFF): the EAM scan loop (run_pass_impl<DA> + donate_position + the
+// compose-from-rho finalize + the ledger gate) now carries the W-contract donation
+// path and DIVERGES IRREVERSIBLY from the 3 sibling rings (sw_ring/tersoff_ring/
+// meam_ring). Those siblings are PRE-PR-2 forks (git-recoverable), kept BYTE-UNTOUCHED
+// (house rule: siblings byte-untouched proves PR-2 leaked nothing into their paths).
+// CONSEQUENTLY the sibling banners' "diff eam_ring.hpp sw_ring.hpp shows ONLY the five
+// swaps" provenance claim (sw_ring.hpp:30-35, tersoff_ring.hpp:33-34, meam_ring.hpp:33-35)
+// is a SUPERSEDED HISTORICAL ARTIFACT as of PR-2 — the density surgery makes that diff no
+// longer swap-only. Future orchestration fixes port to eam_ring by hand. The refinement
+// concept (DonatingWindowForcePolicy) is ADDITIVE ⇒ SwWinForce/TersoffWinForce/MeamWinForce
+// still model the BASE WindowForcePolicy and stay byte-intact. fsm.hpp is byte-untouched.
 namespace tdmd::potentials {
 
 using core::AtomSoA;
@@ -90,6 +104,36 @@ struct CpuEamWindowForce {
   static void assert_supported(std::span<const potentials::PassDecl> passes) {
     potentials::assert_eam_symmetric_passes(passes, "CpuEamWindowForce");
   }
+
+  // PR-2 (live donation ring) — the three donation hooks (thin wrappers over the
+  // PR-1 executors, already bitwise-proven vs the window recompute by lemma W-1).
+  // The ring calls these; the ring (not the hook) owns the ledger. After PR-2 the CPU
+  // ring composes force from the donated rho ⇒ compute() above is no longer called by
+  // the production ring for density (kept for the base concept + as the frozen recompute).
+  template <class DA>
+  void on_zone_arrival(potentials::EamDonationState<DA>& st, int label,
+                       const potentials::ZoneBlockView& blk,
+                       const core::PairGeom& geom) const {
+    potentials::eam_donate_self<Math, DA>(blk, *math, geom, st.rho[std::size_t(label)]);
+  }
+  template <class DA>
+  void on_edge(potentials::EamDonationState<DA>& st, int la, int lb,
+               const potentials::ZoneBlockView& a, const potentials::ZoneBlockView& b,
+               const core::PairGeom& geom) const {
+    potentials::eam_donate_cross<Math, DA>(a, b, *math, geom, st.rho[std::size_t(la)],
+                                           st.rho[std::size_t(lb)]);
+  }
+  template <class DA>
+  void compose(const double* wx, const double* wy, const double* wz, const long* key, int m,
+               const int* owned, int n_owned, const core::PairGeom& geom, double rho_cap,
+               const DA* rho_w, std::vector<core::fixed::ForceAccum>& wFx,
+               std::vector<core::fixed::ForceAccum>& wFy,
+               std::vector<core::fixed::ForceAccum>& wFz, core::fixed::EnergyAccum& pe,
+               double& min_r2, int zone_j) const {
+    potentials::eam_window_force_from_rho<Math, DA>(wx, wy, wz, key, m, owned, n_owned, *math,
+                                                    geom, rho_cap, rho_w, wFx, wFy, wFz, pe,
+                                                    min_r2, potentials::NullDonationTrace{}, zone_j);
+  }
 };
 
 template <typename Real, typename Math, typename WinForce = CpuEamWindowForce<Math>>
@@ -97,10 +141,14 @@ class EamRing {
   // PR-0a: the WinForce contract, PROMOTED from the opt-in `if constexpr requires`
   // (silently bypassable — the overdue MB1/MB2 promise). Fires on ANY instantiation
   // of the ring, even a TU that only constructs it (many_body.hpp).
-  static_assert(potentials::WindowForcePolicy<WinForce>,
-      "WinForce must model WindowForcePolicy (static assert_supported + 14-arg const "
-      "compute) — the opt-in `if constexpr requires` firewall was silently bypassable "
-      "(PR-0a; see many_body.hpp)");
+  // PR-2 upgrades the base WindowForcePolicy to the DonatingWindowForcePolicy REFINEMENT:
+  // the WinForce must ALSO carry the three donation hooks (on_zone_arrival/on_edge/compose)
+  // the live donation ring calls. Refinement (not a base change) ⇒ the sibling sw/tersoff/
+  // meam policies (which static_assert the BASE) stay byte-untouched. Mandatory = compile
+  // error, not opt-in (WContract §12.1).
+  static_assert(potentials::DonatingWindowForcePolicy<WinForce>,
+      "WinForce must model DonatingWindowForcePolicy (base WindowForcePolicy + the PR-2 "
+      "donation hooks on_zone_arrival/on_edge/compose) — see eam_donation.hpp");
 
  public:
   // The default-policy ctor (CPU): builds the policy from pot.math. Byte-compatible
@@ -125,6 +173,13 @@ class EamRing {
     fb_ = pot_.math.density_fracbits();  // 44 (Q19.44) or 40 (Q23.40)
   }
 
+  // PR-2 TEST-ONLY knob (G10): when set, the ring drops the FIRST self donation's ledger
+  // bit (rho still donated), making the ledger INCOMPLETE so the end_eam completeness check
+  // must HALT StaleZone. Default false ⇒ production is untouched. Use with z=1 (single node,
+  // no race on the one-shot state). NOT forwarded through run_eam_ring — set on a directly
+  // constructed EamRing.
+  bool test_drop_first_self_ledger_ = false;
+
   ConveyorResult run() {
     zd_ = core::ZoneDecomposition::build(atoms_, box_, o_.n_zones, rcut_, /*reach_mult=*/2);
     n_ = zd_.n_zones;
@@ -136,6 +191,10 @@ class EamRing {
     // cannot silently run wrong). Both no-op on legal EAM ⇒ F-NOOP.
     potentials::validate_pass_decls(pot_.passes());
     WinForce::assert_supported(pot_.passes());
+    // PR-2: the donation path requires the D5-flipped EAM Density descriptor (kAccumB1 +
+    // self|lo|hi) — without it want_closure_mask is 0 and the ring ledger-check is vacuous.
+    potentials::assert_eam_donation_descriptor(pot_.passes());
+    td_self_dropped_ = false;  // PR-2 test knob (G10): reset the one-shot ledger-drop
 
     // t0 forces via the serial oracle (same kernel ⇒ same bits) for the 1st drift.
     core::zero_forces(atoms_);
@@ -181,6 +240,10 @@ class EamRing {
     core::conveyor_detail::Lambda lam_in{};
     bool present = false, drifted = false, finalized = false, sent = false;
     double v_max = 0.0, a_max = 0.0, k2cap = 0.0;
+    // PR-2: the atom ids as long, materialized on arrival — ZoneBlockView.key needs a
+    // valid const long* (ZoneMsg.id is int; the donation executors evaluate key[t] even
+    // under NullPairHook, so nullptr would be a null-deref the sanitizer flags).
+    std::vector<long> gkey;
   };
 
   void node_main(int k, std::vector<ZoneMsg>* preload) {
@@ -194,7 +257,16 @@ class EamRing {
     }
   }
 
+  // PR-2: fb-dispatch (44=Q19.44 / 40=Q23.40) mirrors zone_eam_pass_impl / zone_eam_pass_
+  // donated_impl — keyed ONLY off density_fracbits() (fb_), NEVER the static descriptor.
   bool run_pass(int k, long h, std::vector<ZoneMsg>* preload) {
+    return (fb_ == 44)
+               ? run_pass_impl<core::fixed::FixedAccum<44>>(k, h, preload)
+               : run_pass_impl<core::fixed::FixedAccum<40>>(k, h, preload);
+  }
+
+  template <class DensAccum>
+  bool run_pass_impl(int k, long h, std::vector<ZoneMsg>* preload) {
     const int in_edge = (k - 1 + z_) % z_;
     const int out_edge = k;
     const auto io = core::node_io_order(k + 1);  // §7.4 parity (1-based)
@@ -209,6 +281,13 @@ class EamRing {
     core::conveyor_detail::Lambda agg{0.0, 0.0, std::numeric_limits<double>::infinity()};
     core::fixed::EnergyAccum pe;
     double ke = 0.0, min_r2 = std::numeric_limits<double>::infinity();
+
+    // PR-2: pass-scoped per-zone donated density + completeness ledger, keyed by zone_id
+    // (label), reset on RECV. A mid-pass HALT (any return false / throw) destroys this
+    // stack frame ⇒ the whole pass is discarded, no partial replay (SPEC(6)).
+    potentials::EamDonationState<DensAccum> dstate;
+    dstate.rho.assign(std::size_t(n_), {});
+    dstate.ledger.assign(std::size_t(n_), 0u);
 
     auto fail = [&](Halt kind, const std::string& msg) { set_halt(kind, msg); return false; };
 
@@ -235,6 +314,11 @@ class EamRing {
           core::ZoneFSM::apply(s.fsm, core::ZoneEvent::RECV);
         }
         s.present = true;
+        // PR-2: materialize the long key + reset this zone's donated rho/ledger on RECV
+        // (label = want_id). reset_zone was designed for exactly this (eam_donation.hpp).
+        s.gkey.assign(std::size_t(s.msg.n()), 0);
+        for (int i = 0; i < s.msg.n(); ++i) s.gkey[std::size_t(i)] = long(s.msg.id[std::size_t(i)]);
+        dstate.reset_zone(want_id, std::size_t(s.msg.n()));
         if (arrived == 0) dt = s.msg.hdr.dt_next;
         if (arrived == std::min(1, n_ - 1)) {
           const core::conveyor_detail::Lambda& lf = slot[std::size_t(arrived)].lam_in;
@@ -264,16 +348,69 @@ class EamRing {
       s.drifted = true;
     };
 
+    // PR-2: a zone's coordinate block for donations (POST-drift; key = the materialized
+    // long id array). key IS used (the executors evaluate on_pair(key[t],key[u]) even
+    // under the default NullPairHook) ⇒ must be a valid pointer, hence Slot::gkey.
+    auto block_view = [&](const Slot& s) -> potentials::ZoneBlockView {
+      return {s.msg.x.data(), s.msg.y.data(), s.msg.z.data(), s.gkey.data(), s.msg.n()};
+    };
+
+    // PR-2: execute the donation batches READY at scan position jj (self first, then cross)
+    // per donation_layout — the arrival-variant schedule (WContract §9). The RING owns the
+    // ledger (the free executors touch rho only); exactly-once is a runtime INV-8 (throw on
+    // a repeated batch). Edge-order (many_body.hpp): close_cross_batch(lower,upper) marks
+    // CrossHi in the lower zone, CrossLo in the upper — the seam (n-1,0) marks n-1 as lower.
+    auto donate_position = [&](int jj) -> bool {
+      const potentials::DonationBatches b =
+          potentials::donation_layout(jj, n_, box_.periodic[2]);
+      for (int s = 0; s < b.n_self; ++s) {
+        const int sl = b.self[s];
+        const int label = slot[std::size_t(sl)].fsm.id;
+        const uint32_t bit = potentials::closure_bit(0, potentials::DonorRole::kSelf);
+        if (dstate.ledger[std::size_t(label)] & bit)
+          return fail(Halt::Internal, "donation: self batch twice zone " + std::to_string(label));
+        winforce_.on_zone_arrival(dstate, label, block_view(slot[std::size_t(sl)]), geom);
+        // G10 test knob: drop the FIRST self ledger bit (rho still donated ⇒ physics fine),
+        // making the ledger INCOMPLETE ⇒ the end_eam ledger-before-END check must HALT. This
+        // is the ONLY way to exercise that check (the ledger is ring-owned, not policy-owned).
+        if (test_drop_first_self_ledger_ && !td_self_dropped_)
+          td_self_dropped_ = true;
+        else
+          dstate.ledger[std::size_t(label)] |= bit;
+      }
+      for (int c = 0; c < b.n_cross; ++c) {
+        const int sa = b.cross[c][0], sb = b.cross[c][1];
+        const int la = slot[std::size_t(sa)].fsm.id, lb = slot[std::size_t(sb)].fsm.id;
+        const uint32_t hi = potentials::closure_bit(0, potentials::DonorRole::kCrossHi);
+        if (dstate.ledger[std::size_t(la)] & hi)
+          return fail(Halt::Internal, "donation: cross batch twice edge " + std::to_string(la));
+        winforce_.on_edge(dstate, la, lb, block_view(slot[std::size_t(sa)]),
+                          block_view(slot[std::size_t(sb)]), geom);
+        potentials::close_cross_batch(dstate.ledger[std::size_t(la)],
+                                      dstate.ledger[std::size_t(lb)], 0);
+      }
+      return true;
+    };
+
     // T3 START + force store + second-half kick + zone-local reductions + checks.
     auto end_eam = [&](int j, const std::vector<int>& ownedloc,
                        std::vector<core::fixed::ForceAccum>& wFx,
                        std::vector<core::fixed::ForceAccum>& wFy,
                        std::vector<core::fixed::ForceAccum>& wFz) -> bool {
       Slot& s = slot[std::size_t(j)];
-      // EAM has no pair-cross "partial force into successor", so EVERY zone's
-      // d->w SPHERE is artificial (its symmetric window data is what's ready),
-      // not just zone 0's §7.1 seed. Apply it here for all owned zones.
-      core::ZoneFSM::apply(s.fsm, core::ZoneEvent::SPHERE);  // d -> w
+      // PR-2: the density ledger of THIS zone must be closed (all its self + cross
+      // donation batches executed) STRICTLY before SPHERE/END — this is the completeness
+      // check (WContract §5/§12.4) AND the reason SPHERE is now MATERIAL: the w-phase
+      // carries the donated rho that filled this zone in its d/w, no longer artificial.
+      // want uses SLOT j (free-z edge-drop); ledger uses LABEL (s.fsm.id) — the slot->label
+      // mapping the rotational tooth (G-ROT) guards.
+      const uint32_t want = potentials::want_closure_mask(pot_.passes(), j, n_, box_.periodic[2]);
+      if (dstate.ledger[std::size_t(s.fsm.id)] != want)
+        return fail(Halt::StaleZone,
+                    "eam_ring: donation ledger " + std::to_string(dstate.ledger[std::size_t(s.fsm.id)]) +
+                        " != want " + std::to_string(want) + " (missing/late batch) step " +
+                        std::to_string(h) + " zone " + std::to_string(s.fsm.id));
+      core::ZoneFSM::apply(s.fsm, core::ZoneEvent::SPHERE);  // d -> w (MATERIAL: ledger closed)
       core::ZoneFSM::apply(s.fsm, core::ZoneEvent::START);   // w -> c
       const std::size_t mj = std::size_t(s.msg.n());
       if (min_r2 < o_.r_min_halt * o_.r_min_halt)
@@ -337,30 +474,37 @@ class EamRing {
         if (!w.present || !w.drifted)  // empty (n()==0) slot is legitimately resident
           throw std::logic_error("eam_ring: window slot not resident at finalize");
       }
-      // gather contiguous window (key = atom id for the φ-once order)
+      // gather contiguous window (key = atom id for the φ-once order) + the donated rho
+      // in the SAME block order [pred][center][succ]. rho comes from the PERSISTENT
+      // per-zone dstate (keyed by LABEL = slot.fsm.id), NOT recomputed here (PR-2: the
+      // ×3 density recompute is gone). raw copy of the int64 accumulator is bit-trivial.
       std::vector<double> wx, wy, wz;
       std::vector<long> key;
       std::vector<int> ownedloc;
+      std::vector<DensAccum> rho_w;
       for (int t = 0; t < nw; ++t) {
         const Slot& w = slot[std::size_t(wslots[t])];
         const int base = int(wx.size());
+        const auto& rz = dstate.rho[std::size_t(w.fsm.id)];  // LABEL keying (G-ROT tooth)
         for (int i = 0; i < w.msg.n(); ++i) {
           wx.push_back(w.msg.x[std::size_t(i)]);
           wy.push_back(w.msg.y[std::size_t(i)]);
           wz.push_back(w.msg.z[std::size_t(i)]);
           key.push_back(w.msg.id[std::size_t(i)]);
+          rho_w.push_back(rz[std::size_t(i)]);
         }
         if (wslots[t] == j)
           for (int i = 0; i < w.msg.n(); ++i) ownedloc.push_back(base + i);
       }
       const int m = int(wx.size());
       std::vector<core::fixed::ForceAccum> wFx(m), wFy(m), wFz(m);
-      // M6 E5b-3b: the SINGLE moving part — delegate to the window-force policy
-      // (CPU default = eam_window_force; GPU = the E5 kernels). pe/min_r2 are
-      // updated exactly as before; the int64 force result is order-free.
-      winforce_.compute(wx.data(), wy.data(), wz.data(), key.data(), m,
-                        ownedloc.data(), int(ownedloc.size()), geom, rho_cap, wFx,
-                        wFy, wFz, pe, min_r2);
+      // PR-2: COMPOSE the C-phase force from the donated rho (pass-2/3 of eam_window_force,
+      // verbatim — cap on owned-full rho only). CPU default = eam_window_force_from_rho;
+      // GPU (PR-2) recomputes density per-window inside compose (bitwise == today) until
+      // device-resident donation lands in PR-3b. pe/min_r2/φ-once identical to the oracle.
+      winforce_.compose(wx.data(), wy.data(), wz.data(), key.data(), m, ownedloc.data(),
+                        int(ownedloc.size()), geom, rho_cap, rho_w.data(), wFx, wFy, wFz, pe,
+                        min_r2, j);
       return end_eam(j, ownedloc, wFx, wFy, wFz);
     };
 
@@ -403,6 +547,10 @@ class EamRing {
       if (!ensure_arrival(j)) return false;
       if (j + 1 < n_ && !ensure_arrival(j + 1)) return false;
       ensure_drift(j - 1); ensure_drift(j); ensure_drift(j + 1);
+      // PR-2: execute the donation batches READY at scan j (POST-drift coords) BEFORE any
+      // finalize reads them — the arrival-variant deadline (WContract §9). The seam
+      // cross(n-1,0) fires here at j=n-1, strictly before the tail finalize(0)/finalize(n-1).
+      if (!donate_position(j)) return false;
       if (!(defer_head && j == 0))  // PBC: owned 0 deferred to the tail
         if (!finalize_owned(j)) return false;
     }
@@ -499,6 +647,7 @@ class EamRing {
   WinForce winforce_;
   core::ZoneDecomposition zd_;
   int n_ = 0, z_ = 0;
+  bool td_self_dropped_ = false;  // G10 one-shot state (reset in run(); use with z=1)
   core::conveyor_detail::Lambda lam0_{};
   std::unique_ptr<ITransport> transport_;
   std::vector<ZoneMsg> final_;

@@ -513,4 +513,28 @@ EamAccum zone_eam_pass_donated(core::AtomSoA<Real>& a, const core::Box& box,
   throw std::runtime_error("zone_eam_pass_donated: unexpected density_fracbits (not 44/40)");
 }
 
+// PR-2 (live donation ring) — the REFINEMENT concept a window-force policy must model to
+// drive the LIVE EamRing donation path. It is a strict refinement of WindowForcePolicy
+// (many_body.hpp, which the sibling sw/tersoff/meam policies static_assert and which stays
+// BYTE-UNTOUCHED): the base is unchanged, so the siblings compile; only EamRing<...> upgrades
+// its class-scope static_assert to this refinement. The three donation hooks are MANDATORY
+// (a compile error, not an if-constexpr opt-in — WContract §12.1): on_zone_arrival donates a
+// zone's self-pairs into its persistent rho; on_edge donates a cross-edge's pairs into both
+// zones; compose builds the C-phase force from the (now donated) rho — a GPU policy that
+// still recomputes density per-window must ALSO model compose (so it cannot silently bypass
+// the rho path). It lives HERE (not many_body.hpp) because it references ZoneBlockView and
+// EamDonationState, which are defined in this header (the include arrow is donation->many_body).
+template <typename WF>
+concept DonatingWindowForcePolicy =
+    WindowForcePolicy<WF> &&
+    requires(const WF wf, EamDonationState<core::fixed::FixedAccum<44>>& st, int label,
+             const ZoneBlockView& blk, const core::PairGeom& geom, const double* d,
+             const long* k, int i, const int* ip, double rc,
+             const core::fixed::FixedAccum<44>* rho_w,
+             std::vector<core::fixed::ForceAccum>& f, core::fixed::EnergyAccum& pe, double& mr) {
+      { wf.on_zone_arrival(st, label, blk, geom) } -> std::same_as<void>;          // self donate
+      { wf.on_edge(st, label, label, blk, blk, geom) } -> std::same_as<void>;       // cross donate
+      { wf.compose(d, d, d, k, i, ip, i, geom, rc, rho_w, f, f, f, pe, mr, i) } -> std::same_as<void>;
+    };
+
 }  // namespace tdmd::potentials

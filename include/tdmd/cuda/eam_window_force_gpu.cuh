@@ -18,6 +18,7 @@
 #include "tdmd/core/zones.hpp"  // PairGeom
 #include "tdmd/cuda/zone_eam.cuh"  // eam_density/embedding/force kernels, EamSetflView
 #include "tdmd/cuda/zone_eam_cells.cuh"  // E5c-integration: culled kernels + window grid
+#include "tdmd/potentials/eam_donation.hpp"  // PR-2: EamDonationState/ZoneBlockView + concept
 #include "tdmd/potentials/eam.hpp"  // PR-0a: assert_eam_symmetric_passes (NOT transitively
                                     // reachable via zone_eam.cuh→eam_spline→eam_analytic;
                                     // cycle-safe — eam.hpp pulls no cuda headers)
@@ -403,6 +404,29 @@ struct GpuEamWindowForce {
     double gpu_mr2;
     std::memcpy(&gpu_mr2, &h_mr, 8);
     if (gpu_mr2 < min_r2) min_r2 = gpu_mr2;
+  }
+
+  // PR-2 (live donation ring) — the GPU policy models DonatingWindowForcePolicy so
+  // EamGpuRing compiles. In PR-2 the GPU ring RECOMPUTES density per-window (bitwise ≡
+  // today); device-resident donation is PR-3b (gated R_W>=1.15, NULL-rollback). The two
+  // donation hooks are INERT (the ring still calls them + owns the ledger, so END never
+  // starves, but no rho is accumulated device-side); compose IGNORES the (all-zero) rho_w
+  // and runs the existing E5 device recompute ⇒ EamGpuRing output == today, bitwise.
+  template <class DA>
+  void on_zone_arrival(potentials::EamDonationState<DA>&, int, const potentials::ZoneBlockView&,
+                       const core::PairGeom&) const {}
+  template <class DA>
+  void on_edge(potentials::EamDonationState<DA>&, int, int, const potentials::ZoneBlockView&,
+               const potentials::ZoneBlockView&, const core::PairGeom&) const {}
+  template <class DA>
+  void compose(const double* wx, const double* wy, const double* wz, const long* key, int m,
+               const int* owned, int n_owned, const core::PairGeom& geom, double rho_cap,
+               const DA* /*rho_w — ignored; GPU recomputes density in compute() until PR-3b*/,
+               std::vector<core::fixed::ForceAccum>& wFx,
+               std::vector<core::fixed::ForceAccum>& wFy,
+               std::vector<core::fixed::ForceAccum>& wFz, core::fixed::EnergyAccum& pe,
+               double& min_r2, int /*zone_j*/) const {
+    compute(wx, wy, wz, key, m, owned, n_owned, geom, rho_cap, wFx, wFy, wFz, pe, min_r2);
   }
 };
 

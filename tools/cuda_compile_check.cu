@@ -40,6 +40,7 @@ namespace tc = tdmd::cuda;
 static_assert(tp::WindowForcePolicy<tc::GpuSwWinForce<double>>);
 static_assert(tp::WindowForcePolicy<tc::GpuMeamWinForce<double>>);
 static_assert(tp::WindowForcePolicy<tc::GpuEamWindowForce>);
+static_assert(tp::DonatingWindowForcePolicy<tc::GpuEamWindowForce>);  // PR-2: donation hooks
 
 // Member-scoped explicit instantiation of run() — implicitly instantiates each ring class
 // (firing its static_assert) + compiles the orchestration surface, without the ill-formed ctor.

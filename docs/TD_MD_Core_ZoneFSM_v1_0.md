@@ -262,3 +262,16 @@ loop over подинтервалы шага (= число зон):
    PBC-ротация §7.2 (finalize(0) — в хвосте, defer_head). Несущая предпосылка донаций —
    страж членства g = 0.5·(width − 2·rcut) (INV-4-семейство): PR, ослабляющий g или
    меняющий членство, обязан пере-дериваировать `donation_layout` (WContract §3).
+
+**6. Реализация PR-2 (живое кольцо `eam_ring.hpp`, 2026-07-03).** (i) `apply(SPHERE)` d→w
+сохранён НА МЕСТЕ (в `end_eam`), но теперь ГЕЙТИТСЯ завершённостью density-леджера зоны
+(`dstate.ledger[label] == want_closure_mask(slot)`) — материальная w = донационные батчи,
+наполнившие ρ зоны в её d/w; артифициальность («EVERY zone's d→w SPHERE is artificial»,
+старый комментарий) снята. (ii) Completeness-леджер проверяется СТРОГО перед
+`apply(SPHERE)`/`apply(END)`. (iii) Донор-в-d/w теперь ИСПОЛНЯЕТСЯ: `donate_position(j)` на
+scan-шаге (после `ensure_drift`, до `finalize_owned`) — self на drift-фронте, cross на
+ко-резидентности (arrival-вариант §9 WContract). (iv) ρ-состояние — пер-зонное
+`EamDonationState<DA>` (ключ zone_id/label, pass-scoped, reset на RECV, mid-pass HALT
+отбрасывает проход). Λ-цепочка §6, defer_head §7.2, INV-3/4, чёт/нечёт §7.4, таблица
+переходов §4, `fsm.hpp` — нетронуты. Fork: EAM scan-loop расходится с sw/tersoff/meam
+(байт-целы; будущая унификация — ReaxFF).
