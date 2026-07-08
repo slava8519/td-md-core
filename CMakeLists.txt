@@ -461,6 +461,15 @@ if(TDMD_BUILD_TESTS)
     add_test(NAME Test_CUDA_EAM_Ring COMMAND test_cuda_eam_ring)
     set_tests_properties(Test_CUDA_EAM_Ring PROPERTIES LABELS cuda)
 
+    # PR-3a (W-contract): device-donation substrate A-gates (lanes bitwise vs CPU-donated
+    # rho, seam arithmetic, fb=40, vacuum, drifted donor, overflow-sticky, stamp fence).
+    # --fmad=false (tdmd_eam_cuda_flags) is LOAD-BEARING for the lane bitwise contract.
+    add_executable(test_cuda_eam_donation tests/test_cuda_eam_donation.cu)
+    target_link_libraries(test_cuda_eam_donation PRIVATE tdmd_core GTest::gtest_main
+                          tdmd_eam_cuda_flags Threads::Threads)
+    add_test(NAME Test_CUDA_EAM_Donation COMMAND test_cuda_eam_donation)
+    set_tests_properties(Test_CUDA_EAM_Donation PROPERTIES LABELS cuda)
+
     # SW T5: GPU Stillinger-Weber (the φ3 transpose accumulator). --fmad=false (via
     # tdmd_eam_cuda_flags) is for GPU-INTERNAL structural determinism + the wing-canonical
     # operand order — NOT CPU↔GPU bitwise (SW exp/pow diverge from libm; that relation is

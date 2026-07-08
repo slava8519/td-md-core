@@ -513,8 +513,23 @@ EamAccum zone_eam_pass_donated(core::AtomSoA<Real>& a, const core::Box& box,
   throw std::runtime_error("zone_eam_pass_donated: unexpected density_fracbits (not 44/40)");
 }
 
-// PR-2 (live donation ring) — the REFINEMENT concept a window-force policy must model to
-// drive the LIVE EamRing donation path. It is a strict refinement of WindowForcePolicy
+// PR-3a — the window's block layout, filled by the RING in finalize_owned from wslots
+// (the slot→label mapping stays ring-side — hooks/compose never see slots, only labels).
+// label[t] = slot[wslots[t]].fsm.id, n[t] = that slot's member count, center = the t with
+// wslots[t] == j (the owned/center block). Block order == the gather order [pred][center]
+// [succ]. pbc n=1 would emit a {0,0,0} triple with NO dedup (mirrors the ring gather; the
+// К7 dedup is serial-path-only) — but pbc n=1 stays outside the live-ring domain anyway.
+struct WindowBlocks {
+  int nb = 0;
+  int label[3] = {-1, -1, -1};
+  int n[3] = {0, 0, 0};
+  int center = -1;
+};
+
+// PR-2 (live donation ring), CONCEPT v2 IN PR-3a (the device-donation substrate — design
+// _meta/PR3AB_GPU_DONATION_DESIGN_2026-07-07.md §4.1; the PR-2 §11 signature change spent
+// ONCE, here, with its consumer) — the REFINEMENT concept a window-force policy must model
+// to drive the LIVE EamRing donation path. It is a strict refinement of WindowForcePolicy
 // (many_body.hpp, which the sibling sw/tersoff/meam policies static_assert and which stays
 // BYTE-UNTOUCHED): the base is unchanged, so the siblings compile; only EamRing<...> upgrades
 // its class-scope static_assert to this refinement. The three donation hooks are MANDATORY
@@ -522,19 +537,29 @@ EamAccum zone_eam_pass_donated(core::AtomSoA<Real>& a, const core::Box& box,
 // zone's self-pairs into its persistent rho; on_edge donates a cross-edge's pairs into both
 // zones; compose builds the C-phase force from the (now donated) rho — a GPU policy that
 // still recomputes density per-window must ALSO model compose (so it cannot silently bypass
-// the rho path). It lives HERE (not many_body.hpp) because it references ZoneBlockView and
+// the rho path). v2 adds the per-NODE device-donation state seat: make_node_state(n_zones)
+// returns a NodeState the ring owns (one per node jthread — audit ownership shape; per-node
+// pass-local, hard constraint 1); begin_pass(h) sets the pass token (the stamp/staleness
+// fence — PR-4's rebuild_epoch seat); the hooks take the NodeState first, and compose
+// receives it plus the WindowBlocks (labels arrive per-call from the ring, so the SHARED
+// policy never caches cross-pass mutable state). CPU policies carry an inert NodeState —
+// the CPU ring is byte-identical (F-NOOP gate = the CPU suite bitwise).
+// It lives HERE (not many_body.hpp) because it references ZoneBlockView and
 // EamDonationState, which are defined in this header (the include arrow is donation->many_body).
 template <typename WF>
 concept DonatingWindowForcePolicy =
     WindowForcePolicy<WF> &&
-    requires(const WF wf, EamDonationState<core::fixed::FixedAccum<44>>& st, int label,
-             const ZoneBlockView& blk, const core::PairGeom& geom, const double* d,
-             const long* k, int i, const int* ip, double rc,
+    requires(const WF wf, typename WF::NodeState& ns,
+             EamDonationState<core::fixed::FixedAccum<44>>& st, int label,
+             const ZoneBlockView& blk, const core::PairGeom& geom, const WindowBlocks& wb,
+             const double* d, const long* k, int i, const int* ip, double rc,
              const core::fixed::FixedAccum<44>* rho_w,
              std::vector<core::fixed::ForceAccum>& f, core::fixed::EnergyAccum& pe, double& mr) {
-      { wf.on_zone_arrival(st, label, blk, geom) } -> std::same_as<void>;          // self donate
-      { wf.on_edge(st, label, label, blk, blk, geom) } -> std::same_as<void>;       // cross donate
-      { wf.compose(d, d, d, k, i, ip, i, geom, rc, rho_w, f, f, f, pe, mr, i) } -> std::same_as<void>;
+      { wf.make_node_state(i) } -> std::same_as<typename WF::NodeState>;
+      { ns.begin_pass(long{}) } -> std::same_as<void>;
+      { wf.on_zone_arrival(ns, st, label, blk, geom) } -> std::same_as<void>;      // self donate
+      { wf.on_edge(ns, st, label, label, blk, blk, geom) } -> std::same_as<void>;  // cross donate
+      { wf.compose(ns, d, d, d, k, i, wb, ip, i, geom, rc, rho_w, f, f, f, pe, mr, i) } -> std::same_as<void>;
     };
 
 }  // namespace tdmd::potentials

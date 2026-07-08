@@ -146,13 +146,19 @@ struct CpuEamRecomputeWinForce {
   static void assert_supported(std::span<const potentials::PassDecl> p) {
     potentials::assert_eam_symmetric_passes(p, "CpuEamRecomputeWinForce");
   }
-  template <class DA> void on_zone_arrival(potentials::EamDonationState<DA>&, int,
+  // PR-3a concept-v2 shim: inert NodeState (test policy holds no device state).
+  struct NodeState {
+    void begin_pass(long) {}
+  };
+  NodeState make_node_state(int) const { return {}; }
+  template <class DA> void on_zone_arrival(NodeState&, potentials::EamDonationState<DA>&, int,
       const potentials::ZoneBlockView&, const core::PairGeom&) const {}
-  template <class DA> void on_edge(potentials::EamDonationState<DA>&, int, int,
+  template <class DA> void on_edge(NodeState&, potentials::EamDonationState<DA>&, int, int,
       const potentials::ZoneBlockView&, const potentials::ZoneBlockView&, const core::PairGeom&) const {}
   template <class DA>
-  void compose(const double* wx, const double* wy, const double* wz, const long* key, int m_,
-               const int* owned, int n_owned, const core::PairGeom& geom, double rho_cap,
+  void compose(NodeState&, const double* wx, const double* wy, const double* wz, const long* key,
+               int m_, const potentials::WindowBlocks&, const int* owned, int n_owned,
+               const core::PairGeom& geom, double rho_cap,
                const DA* /*rho_w — IGNORED: recompute reference*/,
                std::vector<core::fixed::ForceAccum>& wFx, std::vector<core::fixed::ForceAccum>& wFy,
                std::vector<core::fixed::ForceAccum>& wFz, core::fixed::EnergyAccum& pe,
@@ -184,20 +190,26 @@ struct CpuEamPoisonWinForce {
   static void assert_supported(std::span<const potentials::PassDecl> p) {
     potentials::assert_eam_symmetric_passes(p, "CpuEamPoisonWinForce");
   }
-  template <class DA> void on_zone_arrival(potentials::EamDonationState<DA>& st, int label,
-      const potentials::ZoneBlockView& blk, const core::PairGeom& geom) const {
+  // PR-3a concept-v2 shim: inert NodeState (test policy holds no device state).
+  struct NodeState {
+    void begin_pass(long) {}
+  };
+  NodeState make_node_state(int) const { return {}; }
+  template <class DA> void on_zone_arrival(NodeState&, potentials::EamDonationState<DA>& st,
+      int label, const potentials::ZoneBlockView& blk, const core::PairGeom& geom) const {
     potentials::eam_donate_self<Math, DA>(blk, *math, geom, st.rho[std::size_t(label)]);
   }
-  template <class DA> void on_edge(potentials::EamDonationState<DA>& st, int la, int lb,
-      const potentials::ZoneBlockView& a, const potentials::ZoneBlockView& b,
+  template <class DA> void on_edge(NodeState&, potentials::EamDonationState<DA>& st, int la,
+      int lb, const potentials::ZoneBlockView& a, const potentials::ZoneBlockView& b,
       const core::PairGeom& geom) const {
     potentials::DonationPoison p; p.one_sided = true;  // <<< the half-bug
     potentials::eam_donate_cross<Math, DA>(a, b, *math, geom, st.rho[std::size_t(la)],
         st.rho[std::size_t(lb)], potentials::donation_detail::NullPairHook{}, &p);
   }
   template <class DA>
-  void compose(const double* wx, const double* wy, const double* wz, const long* key, int m_,
-               const int* owned, int n_owned, const core::PairGeom& geom, double rho_cap,
+  void compose(NodeState&, const double* wx, const double* wy, const double* wz, const long* key,
+               int m_, const potentials::WindowBlocks&, const int* owned, int n_owned,
+               const core::PairGeom& geom, double rho_cap,
                const DA* rho_w, std::vector<core::fixed::ForceAccum>& wFx,
                std::vector<core::fixed::ForceAccum>& wFy, std::vector<core::fixed::ForceAccum>& wFz,
                core::fixed::EnergyAccum& pe, double& min_r2, int zone_j) const {

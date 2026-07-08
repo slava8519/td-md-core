@@ -110,21 +110,31 @@ struct CpuEamWindowForce {
   // The ring calls these; the ring (not the hook) owns the ledger. After PR-2 the CPU
   // ring composes force from the donated rho ⇒ compute() above is no longer called by
   // the production ring for density (kept for the base concept + as the frozen recompute).
+  //
+  // PR-3a (concept v2 — device-donation substrate): the CPU NodeState is INERT (the CPU
+  // donated rho lives in the ring's pass-scoped dstate, not here) ⇒ the CPU ring stays
+  // byte-identical (F-NOOP gate = the CPU suite bitwise). ns/wb are accepted and ignored.
+  struct NodeState {
+    void begin_pass(long) {}
+  };
+  NodeState make_node_state(int /*n_zones*/) const { return {}; }
+
   template <class DA>
-  void on_zone_arrival(potentials::EamDonationState<DA>& st, int label,
+  void on_zone_arrival(NodeState& /*ns*/, potentials::EamDonationState<DA>& st, int label,
                        const potentials::ZoneBlockView& blk,
                        const core::PairGeom& geom) const {
     potentials::eam_donate_self<Math, DA>(blk, *math, geom, st.rho[std::size_t(label)]);
   }
   template <class DA>
-  void on_edge(potentials::EamDonationState<DA>& st, int la, int lb,
+  void on_edge(NodeState& /*ns*/, potentials::EamDonationState<DA>& st, int la, int lb,
                const potentials::ZoneBlockView& a, const potentials::ZoneBlockView& b,
                const core::PairGeom& geom) const {
     potentials::eam_donate_cross<Math, DA>(a, b, *math, geom, st.rho[std::size_t(la)],
                                            st.rho[std::size_t(lb)]);
   }
   template <class DA>
-  void compose(const double* wx, const double* wy, const double* wz, const long* key, int m,
+  void compose(NodeState& /*ns*/, const double* wx, const double* wy, const double* wz,
+               const long* key, int m, const potentials::WindowBlocks& /*wb*/,
                const int* owned, int n_owned, const core::PairGeom& geom, double rho_cap,
                const DA* rho_w, std::vector<core::fixed::ForceAccum>& wFx,
                std::vector<core::fixed::ForceAccum>& wFy,
@@ -195,6 +205,12 @@ class EamRing {
     // self|lo|hi) — without it want_closure_mask is 0 and the ring ledger-check is vacuous.
     potentials::assert_eam_donation_descriptor(pot_.passes());
     td_self_dropped_ = false;  // PR-2 test knob (G10): reset the one-shot ledger-drop
+    // PR-3a: per-NODE donation state (one per node jthread — the audit ownership shape;
+    // per-node pass-local, hard constraint 1). Created AFTER the firewall asserts and the
+    // decomposition build (n_ known), BEFORE the jthreads spawn. CPU NodeState is inert.
+    node_stores_.clear();
+    node_stores_.reserve(std::size_t(o_.n_nodes));
+    for (int k = 0; k < o_.n_nodes; ++k) node_stores_.push_back(winforce_.make_node_state(n_));
 
     // t0 forces via the serial oracle (same kernel ⇒ same bits) for the 1st drift.
     core::zero_forces(atoms_);
@@ -288,6 +304,10 @@ class EamRing {
     potentials::EamDonationState<DensAccum> dstate;
     dstate.rho.assign(std::size_t(n_), {});
     dstate.ledger.assign(std::size_t(n_), 0u);
+    // PR-3a: the node's device-donation state + pass token (the stamp staleness fence —
+    // PR-4's rebuild_epoch seat). Inert no-op for the CPU policy.
+    auto& ns = node_stores_[std::size_t(k)];
+    ns.begin_pass(h);
 
     auto fail = [&](Halt kind, const std::string& msg) { set_halt(kind, msg); return false; };
 
@@ -369,7 +389,7 @@ class EamRing {
         const uint32_t bit = potentials::closure_bit(0, potentials::DonorRole::kSelf);
         if (dstate.ledger[std::size_t(label)] & bit)
           return fail(Halt::Internal, "donation: self batch twice zone " + std::to_string(label));
-        winforce_.on_zone_arrival(dstate, label, block_view(slot[std::size_t(sl)]), geom);
+        winforce_.on_zone_arrival(ns, dstate, label, block_view(slot[std::size_t(sl)]), geom);
         // G10 test knob: drop the FIRST self ledger bit (rho still donated ⇒ physics fine),
         // making the ledger INCOMPLETE ⇒ the end_eam ledger-before-END check must HALT. This
         // is the ONLY way to exercise that check (the ledger is ring-owned, not policy-owned).
@@ -384,7 +404,7 @@ class EamRing {
         const uint32_t hi = potentials::closure_bit(0, potentials::DonorRole::kCrossHi);
         if (dstate.ledger[std::size_t(la)] & hi)
           return fail(Halt::Internal, "donation: cross batch twice edge " + std::to_string(la));
-        winforce_.on_edge(dstate, la, lb, block_view(slot[std::size_t(sa)]),
+        winforce_.on_edge(ns, dstate, la, lb, block_view(slot[std::size_t(sa)]),
                           block_view(slot[std::size_t(sb)]), geom);
         potentials::close_cross_batch(dstate.ledger[std::size_t(la)],
                                       dstate.ledger[std::size_t(lb)], 0);
@@ -497,14 +517,25 @@ class EamRing {
           for (int i = 0; i < w.msg.n(); ++i) ownedloc.push_back(base + i);
       }
       const int m = int(wx.size());
+      // PR-3a: the window's block layout (labels + sizes + center) — built HERE, from data
+      // finalize already iterates (the slot→label mapping stays ring-side; hooks/compose see
+      // only labels). Block order == the gather order above.
+      potentials::WindowBlocks wb;
+      wb.nb = nw;
+      for (int t = 0; t < nw; ++t) {
+        const Slot& w = slot[std::size_t(wslots[t])];
+        wb.label[t] = w.fsm.id;
+        wb.n[t] = w.msg.n();
+        if (wslots[t] == j) wb.center = t;
+      }
       std::vector<core::fixed::ForceAccum> wFx(m), wFy(m), wFz(m);
       // PR-2: COMPOSE the C-phase force from the donated rho (pass-2/3 of eam_window_force,
       // verbatim — cap on owned-full rho only). CPU default = eam_window_force_from_rho;
-      // GPU (PR-2) recomputes density per-window inside compose (bitwise == today) until
-      // device-resident donation lands in PR-3b. pe/min_r2/φ-once identical to the oracle.
-      winforce_.compose(wx.data(), wy.data(), wz.data(), key.data(), m, ownedloc.data(),
-                        int(ownedloc.size()), geom, rho_cap, rho_w.data(), wFx, wFy, wFz, pe,
-                        min_r2, j);
+      // GPU recomputes density per-window inside compose (bitwise == today) until the
+      // device-donated compose lands in PR-3b. pe/min_r2/φ-once identical to the oracle.
+      winforce_.compose(ns, wx.data(), wy.data(), wz.data(), key.data(), m, wb,
+                        ownedloc.data(), int(ownedloc.size()), geom, rho_cap, rho_w.data(),
+                        wFx, wFy, wFz, pe, min_r2, j);
       return end_eam(j, ownedloc, wFx, wFy, wFz);
     };
 
@@ -645,6 +676,8 @@ class EamRing {
   double rcut_;
   int fb_ = 44;
   WinForce winforce_;
+  // PR-3a: per-node donation state, ring-owned (created in run(), one per node jthread).
+  std::vector<typename WinForce::NodeState> node_stores_;
   core::ZoneDecomposition zd_;
   int n_ = 0, z_ = 0;
   bool td_self_dropped_ = false;  // G10 one-shot state (reset in run(); use with z=1)

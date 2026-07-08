@@ -64,5 +64,27 @@ using core::rebuild_epoch::stale;
 // No NeighborTier vocabulary-enum is shipped here: an enum nobody switches on is itself
 // softly dead — the tier type arrives with its Tier-0 consumer (PR-1/3a) + the logic.
 // ===========================================================================
+//
+// PR-3a REALIZATION NOTE (append-only; design PR3AB_GPU_DONATION_DESIGN_2026-07-07 §0
+// pt.5 + amendment S3 — this note SUPERSEDES the two stale consumer lines above, quoted):
+//   * Tier-0: REALIZED in PR-3a as the SECOND sanctioned MUST-FIX shape — "a CSR over
+//     the global index space with counted memory": the donation batches refresh the
+//     population of the EXISTING whole-box lattice CSR (eam_window_force_gpu.cuh shared
+//     grid; geometry resolved once, counted memory, zero new grid allocations). Drift
+//     binning is discharged BY CONSTRUCTION (a drifted donor bins at its TRUE cell — no
+//     slab boundary exists to escape); the G-B straddle fixture is gate A5
+//     (DriftedDonorAcrossZoneBoundary, test_cuda_eam_donation.cu), teeth =
+//     drop_outside_nominal_slab poison (the slab-clamp mutation was MEASURED
+//     structurally dead — amendment M4). The line "CONSUMER: PR-1 (Tier-0 binning +
+//     G-B), PR-3a" above is SATISFIED in this shape.
+//   * Tier-1: the SLAB RESIDENCY half landed in PR-3a (per-zone LABEL-keyed device
+//     position mirrors + persistent int64 rho lanes in GpuEamDonationNodeStore — the
+//     donation-side consumer); the WINDOW-AS-VIEW-CONCAT consumption half is DEFERRED
+//     to M5b/on-measure (its only production effect today is H2D 3x->1x ~= 1% of wall —
+//     non-claimable; once slabs + WindowBlocks labels exist it is a ~10-line compose()
+//     addition). The lines "CONSUMER: PR-3a" (Tier-1) and "Tier-1 window-view => PR-3a"
+//     above are SUPERSEDED accordingly: residency PR-3a, consumption DEFER -> M5b.
+//   * The ZoneLane.stamp pass-token in GpuEamDonationNodeStore is the PR-4 seat for the
+//     rebuild_epoch primitive re-exported above (token-compare -> advance/stale).
 
 }  // namespace tdmd::cuda::nbr_store

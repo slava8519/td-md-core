@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <string>
 #include <vector>
 #ifdef TDMD_EAM_RING_TIMERS
 #include <chrono>
@@ -18,6 +19,7 @@
 #include "tdmd/core/zones.hpp"  // PairGeom
 #include "tdmd/cuda/zone_eam.cuh"  // eam_density/embedding/force kernels, EamSetflView
 #include "tdmd/cuda/zone_eam_cells.cuh"  // E5c-integration: culled kernels + window grid
+#include "tdmd/cuda/zone_eam_donation.cuh"  // PR-3a: the cross donation kernel pair
 #include "tdmd/potentials/eam_donation.hpp"  // PR-2: EamDonationState/ZoneBlockView + concept
 #include "tdmd/potentials/eam.hpp"  // PR-0a: assert_eam_symmetric_passes (NOT transitively
                                     // reachable via zone_eam.cuh→eam_spline→eam_analytic;
@@ -59,6 +61,41 @@ inline T* eam_wf_malloc(std::size_t n) {
     throw std::runtime_error("GpuEamWindowForce: cudaMalloc failed");
   return d;
 }
+
+// PR-3a — test-only donation poison knobs (policy-level fields, NEVER kernel defaults —
+// the P-k precedent). Default INERT. They express the intra-batch faults the ring ledger
+// is honestly blind to (the T-5..T-8 class, on device):
+//   stencil_override — force the stencil radius (±s) at donation-kernel launch; ONLY
+//     meaningful with cell_div >= 2 (at k=1 the override-to-1 is the identity — recorded,
+//     design amendment M5);
+//   one_sided — route the cross batch's B-side writes into a discard lane (the classic
+//     half-bug; ledger stays clean, physics red — FP64-oracle witness);
+//   drop_outside_nominal_slab — park atoms whose wrapped z lies outside the zone's NOMINAL
+//     [zone_lo, zone_hi] far outside the box in the slab MIRROR upload only: mimics a
+//     slab-extent CSR losing a drifted donor (the REAL Tier-0 drift-binning hazard the
+//     whole-box grid discharges by construction; design amendment M4 — the A5 kill);
+//   defer_seam_to_next_compose — (PR-3b, B2) buffer the pbc seam cross launch past
+//     finalize(n-1)'s lane read (fires at the entry of the TAIL finalize(0) compose —
+//     design amendment S9); pins the in-scan seam deadline as load-bearing ON DEVICE.
+struct GpuDonationPoison {
+  int stencil_override = -1;
+  bool one_sided = false;
+  bool drop_outside_nominal_slab = false;
+  bool defer_seam_to_next_compose = false;
+};
+
+// PR-3a — a captured per-(pass, window) lane snapshot (test-only; the A1/B-D2 capture
+// seam, design J11). GPU side: D2H of the <=3 window lane segments at compose. The CPU
+// twin (a wrapper policy logging dstate.rho[label]) lives in the test TU.
+struct EamLaneCapture {
+  long pass = 0;
+  int zone_j = -1;
+  int nb = 0;
+  int label[3] = {-1, -1, -1};
+  std::vector<long long> lane[3];  // raw int64 rho, member order
+};
+
+struct GpuEamDonationNodeStoreImpl;  // fwd (PR-3a; defined below the state)
 
 // Shared device state: the spline view (uploaded once) + growable per-call
 // scratch + the serialization mutex. Held by shared_ptr so the policy is cheap
@@ -111,9 +148,45 @@ struct GpuEamWindowState {
   EamCellGrid grid_{};       // persistent — geometry built once, refreshed per pass
   bool grid_built_ = false;
 
+  // PR-3a — the device-donation knob + observability (design §3.2). donate_device=false
+  // (the DEFAULT) ⇒ the hooks return before ANY device call and this state is byte-inert:
+  // the default path is byte-identical to HEAD. donate_device=true ⇒ the hooks run the
+  // donation kernels into the per-NODE lanes (GpuEamDonationNodeStore); in PR-3a compose
+  // still RECOMPUTES density (knob-ON is purely observational — gate A0); the donated
+  // compose (consuming the lanes) is PR-3b.
+  bool donate_device = false;
+  // non-vacuity counters (mutex-held increments; the cells_passes() pattern). Semantics
+  // PINNED (design amendment S4): self/cross count every EXECUTED batch INCLUDING the
+  // vacuous n==0 ones (incremented before the early-return); A4 checks the absence of
+  // kernel LAUNCHES for n==0, not of the increment. donated_composes stays 0 until PR-3b.
+  unsigned long long donation_self_batches_ = 0;
+  unsigned long long donation_cross_batches_ = 0;
+  unsigned long long donated_composes_ = 0;
+  GpuDonationPoison poison;   // test-only, default inert
+  bool capture_lanes = false;  // test-only (A1/B-D2): log lane snapshots at compose
+  std::vector<EamLaneCapture> capture_log;
+  // registry of ring-created NodeStores (A6: the sticky donation-overflow flag lives in
+  // the per-node impl; the ring owns the stores privately, so the observability accessor
+  // reads them through this weak registry, post-run).
+  std::vector<std::weak_ptr<GpuEamDonationNodeStoreImpl>> node_impls_;
+#ifdef TDMD_EAM_RING_TIMERS
+  // PR-3a (design amendment M3): donation-kernel device time. The hooks launch with NO
+  // sync, so their GPU time would otherwise land in the NEXT compose's blocking-H2D
+  // bucket (null-stream ordering) and falsify the work-removal attribution. TIMERS builds
+  // bracket each donation launch with this event pair and cudaEventSynchronize IMMEDIATELY
+  // (a TIMERS-ONLY sync — headline R_W numbers come from the default build; attribution
+  // from the TIMERS build). Expectation (restated): (compose kernels + donation kernels)
+  // total device-time drop ≈ the wall drop; H2D bytes unchanged; the donated leg's h2d
+  // bucket LEGITIMATELY shrinks by what moved here.
+  cudaEvent_t ev_ds_ = nullptr, ev_de_ = nullptr;
+  double t_donation_kernel_ms = 0;
+  unsigned long long n_donation_launches = 0;
+#endif
+
   GpuEamWindowState(const potentials::EamSetfl<double>& setfl, const core::Box& box,
-                    bool cull_, int cell_div_ = 0)  // 0 = AUTO (see cell_div field)
-      : cull(cull_), cell_div(cell_div_) {
+                    bool cull_, int cell_div_ = 0,  // 0 = AUTO (see cell_div field)
+                    bool donate_device_ = false)    // PR-3a: default byte-identical to HEAD
+      : cull(cull_), cell_div(cell_div_), donate_device(donate_device_) {
     box_lo[0] = box.lo[0]; box_lo[1] = box.lo[1]; box_lo[2] = box.lo[2];
     box_len[0] = box.len(0); box_len[1] = box.len(1); box_len[2] = box.len(2);
     periodic[0] = box.periodic[0]; periodic[1] = box.periodic[1]; periodic[2] = box.periodic[2];
@@ -144,11 +217,18 @@ struct GpuEamWindowState {
     grow(64);  // initial scratch
 #ifdef TDMD_EAM_RING_TIMERS
     cudaEventCreate(&ev_ks_); cudaEventCreate(&ev_ke_);
+    cudaEventCreate(&ev_ds_); cudaEventCreate(&ev_de_);
 #endif
   }
 
   void grow(int m) {
     if (m <= cap_m) return;
+    // PR-3a (design amendment M9 — use-after-free guard): the donation hooks release the
+    // mutex with kernels QUEUED on the null stream that reference grid_.d_cell_of/d_order;
+    // pre-PR-3a compute() fully synced before unlock, so free-after-queue could not happen.
+    // grow() is grow-only/rare ⇒ an unconditional sync before freeing costs nothing and
+    // restores the invariant "no queued work ever references a freed buffer".
+    if (cap_m > 0) cudaDeviceSynchronize();
     free_scratch();
     cap_m = m;
     wx = eam_wf_malloc<double>(cap_m);
@@ -222,7 +302,100 @@ struct GpuEamWindowState {
 #ifdef TDMD_EAM_RING_TIMERS
     if (ev_ks_) cudaEventDestroy(ev_ks_);
     if (ev_ke_) cudaEventDestroy(ev_ke_);
+    if (ev_ds_) cudaEventDestroy(ev_ds_);
+    if (ev_de_) cudaEventDestroy(ev_de_);
 #endif
+  }
+};
+
+// PR-3a — the per-NODE device donation store (design §3.1): per-zone (LABEL-keyed, NEVER
+// slot — the G-ROT/rotation tooth guards the mapping ring-side) position slab mirrors +
+// persistent int64 rho lanes. Ring-created (EamRing::run() builds one per node jthread via
+// make_node_state — the audit ownership shape; per-node pass-local, hard constraint 1).
+// NOT in the z-shared GpuEamWindowState and NOT in the growable window scratch. Fully LAZY:
+// knob-off runs allocate NOTHING device-side here.
+//
+// d_of_dn STICKY-WITHOUT-PER-PASS-RESET BANNER (design OQ5/R5): the donation overflow flag
+// is zeroed ONCE at first use and sticky thereafter — safe because a HALT is TERMINAL for
+// run() (no pass-retry / partial-replay API exists, SPEC(6)). If in-flight mid-ring rescue
+// (the deferred M7 item) ever lands, a pass-boundary reset MUST be added here.
+struct GpuEamDonationNodeStoreImpl {
+  long token = 0;  // begin_pass(h) sets it (host-only; no device work)
+  struct ZoneLane {
+    double *x = nullptr, *y = nullptr, *z = nullptr;  // slab mirror, 24 B/atom (POST-drift)
+    long long* rho = nullptr;  // persistent per-zone int64 rho lane (fb-agnostic raw)
+    int cap = 0, n = 0;        // grow-only capacity / members this pass
+    long stamp = -1;           // == token <=> uploaded this pass  [PR-4: rebuild_epoch seat]
+  };
+  std::vector<ZoneLane> zone;  // index == zone LABEL (fsm.id)
+  double *cxx = nullptr, *cxy = nullptr, *cxz = nullptr;  // cross concat scratch (grow-only)
+  int ccap = 0;
+  long long* rho_discard = nullptr;  // one_sided poison sink (grow-only, test-only)
+  int discard_cap = 0;
+  int* d_of_dn = nullptr;  // sticky donation overflow (bit 1 = quantize) — see BANNER above
+
+  explicit GpuEamDonationNodeStoreImpl(int n_zones) : zone(std::size_t(n_zones)) {}
+  GpuEamDonationNodeStoreImpl(const GpuEamDonationNodeStoreImpl&) = delete;
+  GpuEamDonationNodeStoreImpl& operator=(const GpuEamDonationNodeStoreImpl&) = delete;
+
+  void lane_grow(ZoneLane& L, int n) {
+    if (n <= L.cap) return;
+    // M9 twin: previous-pass kernels referencing the old lane arrays are long completed
+    // (every pass syncs at each compose), but the uniform rule is sync-before-free.
+    cudaDeviceSynchronize();
+    for (void* p : {(void*)L.x, (void*)L.y, (void*)L.z, (void*)L.rho})
+      if (p) cudaFree(p);
+    L.cap = n;
+    L.x = eam_wf_malloc<double>(std::size_t(n));
+    L.y = eam_wf_malloc<double>(std::size_t(n));
+    L.z = eam_wf_malloc<double>(std::size_t(n));
+    L.rho = eam_wf_malloc<long long>(std::size_t(n));
+  }
+  void concat_grow(int m) {
+    if (m <= ccap) return;
+    cudaDeviceSynchronize();  // M9 twin
+    for (void* p : {(void*)cxx, (void*)cxy, (void*)cxz})
+      if (p) cudaFree(p);
+    ccap = m;
+    cxx = eam_wf_malloc<double>(std::size_t(m));
+    cxy = eam_wf_malloc<double>(std::size_t(m));
+    cxz = eam_wf_malloc<double>(std::size_t(m));
+  }
+  long long* discard_lane(int n) {  // one_sided poison sink
+    if (n > discard_cap) {
+      cudaDeviceSynchronize();  // M9 twin
+      if (rho_discard) cudaFree(rho_discard);
+      discard_cap = n;
+      rho_discard = eam_wf_malloc<long long>(std::size_t(n));
+      // the cross kernel's lane epilogue is `+=` (RMW) — it READS the sink; zero it so
+      // the poison leg is initcheck-clean (the values are discarded either way — J10).
+      cudaMemset(rho_discard, 0, std::size_t(n) * 8);
+    }
+    return rho_discard;
+  }
+  int* ensure_of() {  // lazy alloc + zero ONCE (sticky; see BANNER)
+    if (!d_of_dn) {
+      d_of_dn = eam_wf_malloc<int>(1);
+      cudaMemset(d_of_dn, 0, sizeof(int));
+    }
+    return d_of_dn;
+  }
+
+  ~GpuEamDonationNodeStoreImpl() {
+    for (auto& L : zone)
+      for (void* p : {(void*)L.x, (void*)L.y, (void*)L.z, (void*)L.rho})
+        if (p) cudaFree(p);
+    for (void* p : {(void*)cxx, (void*)cxy, (void*)cxz, (void*)rho_discard, (void*)d_of_dn})
+      if (p) cudaFree(p);
+  }
+};
+
+// The handle the ring stores by value (std::vector<NodeState>) — shared_ptr keeps the
+// impl non-copyable device state stable across vector growth.
+struct GpuEamDonationNodeStore {
+  std::shared_ptr<GpuEamDonationNodeStoreImpl> impl;
+  void begin_pass(long h) {
+    if (impl) impl->token = h;
   }
 };
 
@@ -235,12 +408,51 @@ struct GpuEamWindowForce {
   // box is REQUIRED — the cell grid needs box.lo (F1); compute() only gets a
   // PairGeom. cull=true ⇒ cell-list culling (cells ≡ all-window bitwise, B1);
   // cull=false ⇒ the O(m²) all-window path (the in-process bitwise reference).
+  // donate_device=false (DEFAULT, PR-3a) ⇒ the donation hooks are device-free no-ops and
+  // the whole policy is byte-identical to HEAD; =true ⇒ hooks run donation kernels into
+  // the per-node lanes (observational in PR-3a — compose still recomputes; gate A0).
   GpuEamWindowForce(const potentials::EamSetfl<double>& setfl, const core::Box& box,
-                    bool cull = true, int cell_div = 0)  // 0 = AUTO (production default)
-      : st(std::make_shared<GpuEamWindowState>(setfl, box, cull, cell_div)) {}
+                    bool cull = true, int cell_div = 0,  // 0 = AUTO (production default)
+                    bool donate_device = false)
+      : st(std::make_shared<GpuEamWindowState>(setfl, box, cull, cell_div, donate_device)) {}
 
   // non-vacuity witness: how many compute() calls took the culled path.
   unsigned long long cells_passes() const { return st->cells_passes; }
+
+  // PR-3a — per-NODE donation state (ring-owned; created once per node jthread in run()).
+  using NodeState = GpuEamDonationNodeStore;
+  NodeState make_node_state(int n_zones) const {
+    // Fully lazy: no device allocation here (knob-off runs stay device-free on this path).
+    auto impl = std::make_shared<GpuEamDonationNodeStoreImpl>(n_zones);
+    {
+      std::lock_guard<std::mutex> lk(st->mu);
+      st->node_impls_.push_back(impl);  // A6 observability registry (weak)
+    }
+    return NodeState{std::move(impl)};
+  }
+
+  // PR-3a — donation observability (test/bench accessors; S4-pinned counter semantics).
+  unsigned long long donation_self_batches() const { return st->donation_self_batches_; }
+  unsigned long long donation_cross_batches() const { return st->donation_cross_batches_; }
+  unsigned long long donated_composes() const { return st->donated_composes_; }
+  const std::vector<EamLaneCapture>& capture_log() const { return st->capture_log; }
+  // A6: OR of the sticky donation overflow flags across every ring-created NodeStore.
+  // Tolerates a HALTed run (design amendment S5) — call AFTER run(); D2H is synchronous.
+  int donation_overflow() const {
+    int acc = 0;
+    std::lock_guard<std::mutex> lk(st->mu);
+    for (const auto& w : st->node_impls_)
+      if (auto impl = w.lock(); impl && impl->d_of_dn) {
+        int of = 0;
+        cudaMemcpy(&of, impl->d_of_dn, sizeof(int), cudaMemcpyDeviceToHost);
+        acc |= of;
+      }
+    return acc;
+  }
+#ifdef TDMD_EAM_RING_TIMERS
+  double timer_donation_kernel_s() const { return st->t_donation_kernel_ms / 1000.0; }
+  unsigned long long timer_donation_launches() const { return st->n_donation_launches; }
+#endif
 
   // DESCRIPTOR FIREWALL (correctness, not perf). This GPU policy implements the EAM
   // SYMMETRIC 3-pass force: the int64 accumulator writes q(j)=−q(i) (zone_force.cuh),
@@ -406,26 +618,198 @@ struct GpuEamWindowForce {
     if (gpu_mr2 < min_r2) min_r2 = gpu_mr2;
   }
 
-  // PR-2 (live donation ring) — the GPU policy models DonatingWindowForcePolicy so
-  // EamGpuRing compiles. In PR-2 the GPU ring RECOMPUTES density per-window (bitwise ≡
-  // today); device-resident donation is PR-3b (gated R_W>=1.15, NULL-rollback). The two
-  // donation hooks are INERT (the ring still calls them + owns the ledger, so END never
-  // starves, but no rho is accumulated device-side); compose IGNORES the (all-zero) rho_w
-  // and runs the existing E5 device recompute ⇒ EamGpuRing output == today, bitwise.
+  // PR-3a (live device-donation substrate — design §3.3/§4.3). donate_device=false
+  // (DEFAULT): the hooks return BEFORE any device call ⇒ byte-identical to HEAD. =true:
+  // the SELF batch runs the frozen density kernel VERBATIM over the zone's slab mirror
+  // (its single overwrite-write per lane element IS the per-pass reset by construction —
+  // the schedule fires self(L) strictly before any cross touching L; the memsetAsync
+  // below is DEFENSIVE, NOT load-bearing — the staleness guard is the stamp fence); the
+  // CROSS batch D2D-concats two slabs and runs the one new kernel pair. NO sync, NO D2H
+  // in the hooks (the next compose's blocking ops are null-stream-ordered behind them).
+  // The host EamDonationState (the CPU mirror) is NOT touched — device lanes are the
+  // GPU-side rho store; compose ignores both in PR-3a (recompute; gate A0 observational).
   template <class DA>
-  void on_zone_arrival(potentials::EamDonationState<DA>&, int, const potentials::ZoneBlockView&,
-                       const core::PairGeom&) const {}
+  void on_zone_arrival(NodeState& ns, potentials::EamDonationState<DA>& /*st_host*/, int label,
+                       const potentials::ZoneBlockView& blk, const core::PairGeom& geom) const {
+    GpuEamWindowState& s = *st;
+    if (!s.donate_device) return;  // knob-off: NO device call (A0/A8 by construction)
+    // fb trap (A3): the lane raws are compared against DA-format CPU raws — the policy's
+    // ctor-frozen dens_scale must BE DA::kScale (both keyed off runtime density_fracbits).
+    if (DA::kScale != s.dens_scale)
+      throw std::logic_error("GpuEamWindowForce: donation DA::kScale != policy dens_scale "
+                             "(fb dispatch mismatch — the T-12/A3 trap)");
+    std::lock_guard<std::mutex> lk(s.mu);
+    ++s.donation_self_batches_;  // S4: counts EXECUTED batches incl. vacuous
+    auto& impl = *ns.impl;
+    auto& L = impl.zone.at(std::size_t(label));
+    impl.lane_grow(L, blk.n);
+    L.n = blk.n;
+    L.stamp = impl.token;  // the staleness fence (PR-4: rebuild_epoch seat)
+    if (blk.n == 0) return;  // vacuous batch: stamp set, ledger closes ring-side, no launch
+    // slab H2D — the very POST-drift bytes the finalize gather reads (donate_position runs
+    // after ensure_drift; positions are immutable for the rest of the pass).
+    if (s.poison.drop_outside_nominal_slab) {
+      // A5 kill (amendment M4): park drifted atoms far outside the box in the MIRROR only
+      // — mimics a slab-extent CSR losing the drifted donor (all its pairs vanish from the
+      // batch, both directions) ⇒ lanes + FP64-oracle go red. Nominal slab from the label.
+      const int nz = int(impl.zone.size());
+      const double w = s.box_len[2] / double(nz);
+      const double lo = s.box_lo[2] + double(label) * w, hi = lo + w;
+      std::vector<double> px(blk.x, blk.x + blk.n), py(blk.y, blk.y + blk.n),
+          pz(blk.z, blk.z + blk.n);
+      for (int i = 0; i < blk.n; ++i) {
+        double zw = pz[std::size_t(i)];
+        if (s.periodic[2])
+          zw -= s.box_len[2] * std::floor((zw - s.box_lo[2]) / s.box_len[2]);
+        if (zw < lo || zw > hi) pz[std::size_t(i)] = s.box_lo[2] + s.box_len[2] + 1e6;
+      }
+      cudaMemcpy(L.x, px.data(), std::size_t(blk.n) * 8, cudaMemcpyHostToDevice);
+      cudaMemcpy(L.y, py.data(), std::size_t(blk.n) * 8, cudaMemcpyHostToDevice);
+      cudaMemcpy(L.z, pz.data(), std::size_t(blk.n) * 8, cudaMemcpyHostToDevice);
+    } else {
+      cudaMemcpy(L.x, blk.x, std::size_t(blk.n) * 8, cudaMemcpyHostToDevice);
+      cudaMemcpy(L.y, blk.y, std::size_t(blk.n) * 8, cudaMemcpyHostToDevice);
+      cudaMemcpy(L.z, blk.z, std::size_t(blk.n) * 8, cudaMemcpyHostToDevice);
+    }
+    cudaMemsetAsync(L.rho, 0, std::size_t(blk.n) * 8);  // defensive (see banner above)
+    int* of = impl.ensure_of();
+    using namespace eam_sn_detail;  // kB, ng
+#ifdef TDMD_EAM_RING_TIMERS
+    cudaEventRecord(s.ev_ds_);
+#endif
+    if (s.cull) {
+      s.ensure_grid_geometry(3 * blk.n);  // AUTO hint frozen as 3·blk.n (design OQ3)
+      s.grow(blk.n);  // M8: grid per-atom arrays must cover the slab BEFORE first compose
+      EamCellGrid& g = s.grid_;
+      cudaMemsetAsync(g.d_counts, 0, std::size_t(g.ncells) * sizeof(int));
+      cell_count_kernel<<<ng(blk.n), kB>>>(L.x, L.y, L.z, blk.n, g.g, g.d_cell_of, g.d_counts);
+      cub::DeviceScan::ExclusiveSum(g.d_cub, g.cub_bytes, g.d_counts, g.d_starts, g.ncells);
+      cudaMemcpyAsync(g.d_cursor, g.d_starts, std::size_t(g.ncells) * sizeof(int),
+                      cudaMemcpyDeviceToDevice);
+      cell_scatter_kernel<<<ng(blk.n), kB>>>(g.d_cell_of, blk.n, g.d_cursor, g.d_order);
+      CellGrid gp = g.g;  // stencil poison: launch-time copy, kernels stay clean (P-k)
+      if (s.poison.stencil_override > 0)
+        gp.sx = gp.sy = gp.sz = s.poison.stencil_override;
+      eam_density_cells_kernel<<<ng(blk.n), kB>>>(L.x, L.y, L.z, blk.n, geom, s.view,
+                                                  s.dens_scale, gp, g.d_starts, g.d_counts,
+                                                  g.d_order, L.rho, of);
+    } else {
+      eam_density_kernel<<<ng(blk.n), kB>>>(L.x, L.y, L.z, blk.n, geom, s.view, s.dens_scale,
+                                            L.rho, of);
+    }
+#ifdef TDMD_EAM_RING_TIMERS
+    cudaEventRecord(s.ev_de_);
+    cudaEventSynchronize(s.ev_de_);  // TIMERS-ONLY sync (amendment M3)
+    float ms = 0; cudaEventElapsedTime(&ms, s.ev_ds_, s.ev_de_);
+    s.t_donation_kernel_ms += ms; ++s.n_donation_launches;
+#endif
+    // NO sync, NO D2H — the donation result is consumed device-side (PR-3b) / by gates.
+  }
+
   template <class DA>
-  void on_edge(potentials::EamDonationState<DA>&, int, int, const potentials::ZoneBlockView&,
-               const potentials::ZoneBlockView&, const core::PairGeom&) const {}
+  void on_edge(NodeState& ns, potentials::EamDonationState<DA>& /*st_host*/, int la, int lb,
+               const potentials::ZoneBlockView& a, const potentials::ZoneBlockView& b,
+               const core::PairGeom& geom) const {
+    GpuEamWindowState& s = *st;
+    if (!s.donate_device) return;
+    if (DA::kScale != s.dens_scale)
+      throw std::logic_error("GpuEamWindowForce: donation DA::kScale != policy dens_scale "
+                             "(fb dispatch mismatch — the T-12/A3 trap)");
+    std::lock_guard<std::mutex> lk(s.mu);
+    ++s.donation_cross_batches_;  // S4: counts EXECUTED batches incl. vacuous
+    auto& impl = *ns.impl;
+    auto& LA = impl.zone.at(std::size_t(la));
+    auto& LB = impl.zone.at(std::size_t(lb));
+    // A7 stamp fence: CoRes(A,B) guarantees both selfs already executed this pass — a
+    // stale/missing lane here is a label-keying or missed-arrival bug, deterministic HALT.
+    if (LA.stamp != impl.token || LA.n != a.n || LB.stamp != impl.token || LB.n != b.n)
+      throw std::logic_error("GpuEamWindowForce: cross batch on a lane not stamped this "
+                             "pass (label " + std::to_string(la) + "," + std::to_string(lb) +
+                             ") — stale zone lane");
+    if (a.n == 0 || b.n == 0) return;  // vacuous: nothing to donate, ledger closes ring-side
+    const int m = a.n + b.n;
+    impl.concat_grow(m);
+    // D2D concat [A|B] from the slab mirrors (already POST-drift on device).
+    cudaMemcpyAsync(impl.cxx, LA.x, std::size_t(a.n) * 8, cudaMemcpyDeviceToDevice);
+    cudaMemcpyAsync(impl.cxy, LA.y, std::size_t(a.n) * 8, cudaMemcpyDeviceToDevice);
+    cudaMemcpyAsync(impl.cxz, LA.z, std::size_t(a.n) * 8, cudaMemcpyDeviceToDevice);
+    cudaMemcpyAsync(impl.cxx + a.n, LB.x, std::size_t(b.n) * 8, cudaMemcpyDeviceToDevice);
+    cudaMemcpyAsync(impl.cxy + a.n, LB.y, std::size_t(b.n) * 8, cudaMemcpyDeviceToDevice);
+    cudaMemcpyAsync(impl.cxz + a.n, LB.z, std::size_t(b.n) * 8, cudaMemcpyDeviceToDevice);
+    // one_sided poison: route the B-side writes into a discard sink (ledger stays clean,
+    // physics red — the FP64-oracle/A1 witness of the intra-batch half-bug class).
+    long long* rho_b = s.poison.one_sided ? impl.discard_lane(b.n) : LB.rho;
+    int* of = impl.ensure_of();
+    using namespace eam_sn_detail;
+#ifdef TDMD_EAM_RING_TIMERS
+    cudaEventRecord(s.ev_ds_);
+#endif
+    if (s.cull) {
+      s.ensure_grid_geometry(3 * m);
+      s.grow(m);  // M8
+      EamCellGrid& g = s.grid_;
+      cudaMemsetAsync(g.d_counts, 0, std::size_t(g.ncells) * sizeof(int));
+      cell_count_kernel<<<ng(m), kB>>>(impl.cxx, impl.cxy, impl.cxz, m, g.g, g.d_cell_of,
+                                       g.d_counts);
+      cub::DeviceScan::ExclusiveSum(g.d_cub, g.cub_bytes, g.d_counts, g.d_starts, g.ncells);
+      cudaMemcpyAsync(g.d_cursor, g.d_starts, std::size_t(g.ncells) * sizeof(int),
+                      cudaMemcpyDeviceToDevice);
+      cell_scatter_kernel<<<ng(m), kB>>>(g.d_cell_of, m, g.d_cursor, g.d_order);
+      CellGrid gp = g.g;
+      if (s.poison.stencil_override > 0)
+        gp.sx = gp.sy = gp.sz = s.poison.stencil_override;
+      eam_donate_cross_cells_kernel<<<ng(m), kB>>>(impl.cxx, impl.cxy, impl.cxz, a.n, m,
+                                                   geom, s.view, s.dens_scale, gp,
+                                                   g.d_starts, g.d_counts, g.d_order,
+                                                   LA.rho, rho_b, of);
+    } else {
+      eam_donate_cross_kernel<<<ng(m), kB>>>(impl.cxx, impl.cxy, impl.cxz, a.n, m, geom,
+                                             s.view, s.dens_scale, LA.rho, rho_b, of);
+    }
+#ifdef TDMD_EAM_RING_TIMERS
+    cudaEventRecord(s.ev_de_);
+    cudaEventSynchronize(s.ev_de_);  // TIMERS-ONLY sync (amendment M3)
+    float ms = 0; cudaEventElapsedTime(&ms, s.ev_ds_, s.ev_de_);
+    s.t_donation_kernel_ms += ms; ++s.n_donation_launches;
+#endif
+  }
+
   template <class DA>
-  void compose(const double* wx, const double* wy, const double* wz, const long* key, int m,
-               const int* owned, int n_owned, const core::PairGeom& geom, double rho_cap,
-               const DA* /*rho_w — ignored; GPU recomputes density in compute() until PR-3b*/,
+  void compose(NodeState& ns, const double* wx, const double* wy, const double* wz,
+               const long* key, int m, const potentials::WindowBlocks& wb, const int* owned,
+               int n_owned, const core::PairGeom& geom, double rho_cap,
+               const DA* /*rho_w — host mirror, ignored; the GPU rho lives in the lanes*/,
                std::vector<core::fixed::ForceAccum>& wFx,
                std::vector<core::fixed::ForceAccum>& wFy,
                std::vector<core::fixed::ForceAccum>& wFz, core::fixed::EnergyAccum& pe,
-               double& min_r2, int /*zone_j*/) const {
+               double& min_r2, int zone_j) const {
+    GpuEamWindowState& s = *st;
+    // A1/B-D2 capture seam (test-only): snapshot the <=3 window lane segments (blocking
+    // D2H — waits for the queued donation kernels on the null stream) BEFORE the recompute.
+    if (s.donate_device && s.capture_lanes && ns.impl) {
+      std::lock_guard<std::mutex> lk(s.mu);
+      EamLaneCapture rec;
+      rec.pass = ns.impl->token;
+      rec.zone_j = zone_j;
+      rec.nb = wb.nb;
+      for (int t = 0; t < wb.nb; ++t) {
+        rec.label[t] = wb.label[t];
+        const auto& L = ns.impl->zone.at(std::size_t(wb.label[t]));
+        // capture fence (acceptance wf_1c8cf3af hygiene): a wb mis-build (slot-vs-label)
+        // must die HERE as a clean logic_error, not cascade into a noisy downstream halt.
+        if (L.stamp != ns.impl->token || L.n != wb.n[t])
+          throw std::logic_error("GpuEamWindowForce: capture on unstamped/mismatched lane "
+                                 "(label " + std::to_string(wb.label[t]) + ")");
+        rec.lane[t].resize(std::size_t(wb.n[t]));
+        if (wb.n[t] > 0 &&
+            cudaMemcpy(rec.lane[t].data(), L.rho, std::size_t(wb.n[t]) * 8,
+                       cudaMemcpyDeviceToHost) != cudaSuccess)
+          throw std::runtime_error("GpuEamWindowForce: capture D2H failed");
+      }
+      s.capture_log.push_back(std::move(rec));
+    }
+    // PR-3a: compose RECOMPUTES density on device — verbatim today (knob-ON is purely
+    // observational; the donated compose consuming the lanes is PR-3b, gated R_W>=1.15).
     compute(wx, wy, wz, key, m, owned, n_owned, geom, rho_cap, wFx, wFy, wFz, pe, min_r2);
   }
 };

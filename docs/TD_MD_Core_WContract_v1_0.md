@@ -177,6 +177,44 @@ Serial-исполнение склеивает оба кандидата ⇒ т�
    путь, исчезающий тем же PR.
 6. `g_override` — тест-only рычаг; в кольцо НЕ прокидывать.
 
+## §13. PR-3a/b — device-донации (append-only; дизайн `_meta/PR3AB_GPU_DONATION_DESIGN_2026-07-07.md`)
+
+1. **PR-3a (ВЫПОЛНЕН): device-донационный субстрат, default-инертный.** Форма — фолбэк
+   аудита (§5 PR-3a), НЕ полный Tier-1 view-concat (вердикт судьи: bitwise-by-construction
+   над bitwise-by-test; консумент window-consumption — M5b). Состав: пер-НОДОВЫЙ
+   `GpuEamDonationNodeStore` (создаёт КОЛЬЦО в `run()`, по одному на node-jthread —
+   пер-узловое пассовое состояние, инвариант B5 цел: ρ в ZoneMsg НЕ ездит); пер-зонные
+   LABEL-ключёванные слэбы позиций (24 Б/атом, POST-drift байты) + персистентные int64
+   ρ-лейны; SELF-батч = `eam_density[_cells]_kernel` ДОСЛОВНО над слэбом; CROSS-батч —
+   единственная новая kernel-пара (`zone_eam_donation.cuh`). Концепт v2
+   (`DonatingWindowForcePolicy`: `NodeState`/`make_node_state`/`begin_pass` +
+   `WindowBlocks` в compose) — подписная правка §12.1 потрачена ОДИН раз, здесь, со своим
+   консументом; база `WindowForcePolicy` и sibling-политики байт-целы.
+2. **Нож `donate_device=false` (default)** ⇒ хуки возвращаются ДО любого device-вызова —
+   путь байт-идентичен доножевому (критерий 3a «побитовость + wall ±3%» по построению).
+   Knob-ON в 3a ОБСЕРВАЦИОНЕН: донационные ядра пишут ТОЛЬКО лейны NodeStore + sticky
+   `d_of_dn`; compose пересчитывает density (гейт A0). Лейны ≡ CPU-донированной ρ
+   ПОБИТОВО (raw int64, гейты A1/A3/A5).
+3. **Stamp/token-fence**: `begin_pass(h)` ставит токен; arrival штампует лейн;
+   `on_edge`/донированный compose (3b) сверяют `stamp==token && n` ⇒ label-keying/
+   missed-arrival = детерминированный `logic_error`→`Halt::Internal` (гейт A7).
+   `ZoneLane.stamp` — посадочное место `rebuild_epoch` PR-4.
+4. **Tier-0 реализован второй санкционированной формой** MUST-FIX аудита («CSR над
+   глобальным индексным пространством с посчитанной памятью»): population-refresh
+   существующего whole-box грида per-батч; drift-binning снят ПО ПОСТРОЕНИЮ; G-B
+   фикстура = гейт A5 (зуб — population-poison; slab-clamp-мутация вычеркнута
+   СТРУКТУРНЫМ аргументом верификатора дизайна как вакуумная — поправка M4, без
+   исполненного замера).
+5. **PR-3b (следующий)**: донированный compose = D2D-скаттер ≤3 ρ-лейнов в `d_rho` в
+   блочном порядке окна + `embedding_nocap` + отдельное 8-строчное `owned_cap`-ядро (К3;
+   силовые ядра БАЙТ-ЦЕЛЫ) — два коммита (c1 код+гейты default-off, c2 флип дефолта);
+   гейт R_W ≥ 1.15 по замороженному протоколу (дизайн §7 + поправка M2: пин rect-триплетов
+   12,8,26 / 20,19,26 / 32,32,26 / 45,45,26, nzones=5, cellk=3, dt=5e-4, seed=12345,
+   reps=8, idle; GO ⟺ R_W≥1.15 на КАЖДОЙ точке ≥21k атомов/зону И ≥0.97 на меньших);
+   NULL ⇒ реверт ТОЛЬКО c2 (продакшн возвращается на recompute-ногу; донационный путь
+   остаётся knob-gated и тесто-покрытым; субстрат 3a стоит). `eam_ring.hpp` и
+   `eam_donation.hpp` в 3b git-байт-заморожены.
+
 ---
 *Связи: расписание/леммы — `eam_zone.hpp`/`eam_donation.hpp` (SPEC-шапки); автомат —
 аддендум [ENG] в `TD_MD_Core_ZoneFSM_v1_0.md` §10; история решений — `docs/_meta/`.*

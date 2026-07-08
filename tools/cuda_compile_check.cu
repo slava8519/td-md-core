@@ -28,6 +28,7 @@
 
 #include "tdmd/cuda/eam_conveyor_gpu.cuh"       // eam_sn_detail + eam_gpu_run_singlenode
 #include "tdmd/cuda/eam_window_force_gpu.cuh"    // GpuEamWindowForce (needs eam_sn_detail above)
+#include "tdmd/cuda/zone_eam_donation.cuh"       // PR-3a: cross donation kernel pair (cloud-compiled)
 #include "tdmd/potentials/eam_ring.hpp"          // EamRing
 #include "tdmd/cuda/sw_window_force_gpu.cuh"     // GpuSwWinForce
 #include "tdmd/potentials/sw_ring.hpp"           // SwRing (sw policy header pulls no ring header)
@@ -40,7 +41,8 @@ namespace tc = tdmd::cuda;
 static_assert(tp::WindowForcePolicy<tc::GpuSwWinForce<double>>);
 static_assert(tp::WindowForcePolicy<tc::GpuMeamWinForce<double>>);
 static_assert(tp::WindowForcePolicy<tc::GpuEamWindowForce>);
-static_assert(tp::DonatingWindowForcePolicy<tc::GpuEamWindowForce>);  // PR-2: donation hooks
+static_assert(tp::DonatingWindowForcePolicy<tc::GpuEamWindowForce>);  // PR-2/PR-3a: concept v2
+                                                                      // (NodeState + WindowBlocks)
 
 // Member-scoped explicit instantiation of run() — implicitly instantiates each ring class
 // (firing its static_assert) + compiles the orchestration surface, without the ill-formed ctor.

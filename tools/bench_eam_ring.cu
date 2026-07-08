@@ -170,24 +170,80 @@ double per_phase_breakdown(const SetflPot& pot, const potentials::EamSetfl<doubl
 int main(int argc, char** argv) {
   std::string setfl_path = "reference_data/eam_al/Al_zhou.eam.alloy";
   long S = 20, W = 4; int reps = 3;
+  // PR-3a (design amendment M1): donation-AGNOSTIC geometry flags for the frozen R_W-grid
+  // protocol (PR3AB design §7 + amendment M2). --rect nx,ny,nz + --nzones Z run "Axis G":
+  // ONE frozen geometry (periodic, z=1, cull=true) instead of the default axes. The FROZEN
+  // primary-grid triples (nz=26, width 21.06 Å ≥ 2·rcut=20.205, g=0.43 Å; deviation from
+  // them breaks the pre-registration): --rect 12,8,26 (apz≈2.0k), 20,19,26 (≈7.9k),
+  // 32,32,26 (≈21.3k), 45,45,26 (≈42.1k), all with --nzones 5. --apz A picks the nearest
+  // frozen triple (convenience; the triples are the registration). --donate / R_W legs are
+  // PR-3b — this harness measures geometry throughput only in PR-3a (the A8 wall baseline).
+  int g_nzones = 0, g_rect[3] = {0, 0, 0};
+  bool cellk_explicit = false;
   for (int i = 1; i < argc; ++i) {
     const std::string s = argv[i];
     if (s == "--setfl") setfl_path = argv[++i];
     else if (s == "--steps") S = std::stol(argv[++i]);
     else if (s == "--warmup") W = std::stol(argv[++i]);
     else if (s == "--reps") reps = std::stoi(argv[++i]);
-    else if (s == "--cellk") g_cell_div = std::stoi(argv[++i]);
+    else if (s == "--cellk") { g_cell_div = std::stoi(argv[++i]); cellk_explicit = true; }
+    else if (s == "--nzones") g_nzones = std::stoi(argv[++i]);
+    else if (s == "--rect") { std::sscanf(argv[++i], "%d,%d,%d", &g_rect[0], &g_rect[1], &g_rect[2]); }
+    else if (s == "--apz") {
+      const long apz = std::stol(argv[++i]);
+      // nearest FROZEN triple (amendment M2) — apz = 4·nx·ny·26/5
+      struct T { long apz; int nx, ny; };
+      const T frozen[4] = {{1997, 12, 8}, {7904, 20, 19}, {21299, 32, 32}, {42120, 45, 45}};
+      const T* best = &frozen[0];
+      for (const T& t : frozen)
+        if (std::labs(t.apz - apz) < std::labs(best->apz - apz)) best = &t;
+      g_rect[0] = best->nx; g_rect[1] = best->ny; g_rect[2] = 26;
+      if (g_nzones == 0) g_nzones = 5;
+    }
   }
-  cudaDeviceProp pr{}; cudaGetDeviceProperties(&pr, 0);
+  // Axis G frozen-protocol pin (design §7/J9 + M2; acceptance wf_1c8cf3af hygiene):
+  // cellk=3 defaults on when the axis is selected; explicit deviation warns loudly.
+  if (g_nzones > 0 && g_rect[0] > 0) {
+    if (!cellk_explicit) {
+      g_cell_div = 3;
+      std::printf("Axis G: cellk defaulted to 3 (frozen R_W protocol pin).\n");
+    } else if (g_cell_div != 3) {
+      std::printf("WARNING: Axis G with cellk=%d DEVIATES from the frozen R_W protocol "
+                  "(pinned cellk=3).\n", g_cell_div);
+    }
+  }
+  cudaDeviceProp pr{};
+  cudaGetDeviceProperties(&pr, 0);
   const auto setfl = potentials::EamSetfl<double>::from_setfl(setfl_path);
   const SetflPot pot(setfl);
   const double dt = 5e-4;
   cudaFree(0);  // spin up GPU clocks before the first timed cell
 
   std::printf("bench_eam_ring: %s | Al_zhou rcut=%.4f | deterministic_fp64 --fmad=false | "
-              "dt=5e-4 W=%ld S=%ld reps=%d\n", pr.name, setfl.rcut, W, S, reps);
+              "dt=5e-4 W=%ld S=%ld reps=%d cellk=%d seed=12345\n",
+              pr.name, setfl.rcut, W, S, reps, g_cell_div);
   std::printf("  NOTE: device work mutex-serialized on null stream; z>1 overlaps HOST "
               "orchestration only; single-GPU.\n");
+
+  // ---- Axis G (PR-3a M1): one frozen R_W-grid geometry, z=1, cull=true ----
+  if (g_nzones > 0 && g_rect[0] > 0) {
+    core::Box box; auto init = make_fcc_rect(box, g_rect[0], g_rect[1], g_rect[2]);
+    core::thermal::maxwell_init(init, 300.0, 12345u);
+    const double width = box.len(2) / g_nzones;
+    std::printf("\nAxis G (frozen R_W-grid geometry): rect %d,%d,%d N=%d n_zones=%d "
+                "apz=%.0f width=%.3f (2rcut=%.4f, g=%.3f)\n",
+                g_rect[0], g_rect[1], g_rect[2], init.n, g_nzones,
+                double(init.n) / g_nzones, width, 2.0 * setfl.rcut,
+                0.5 * (width - 2.0 * setfl.rcut));
+    unsigned long long cp = 0;
+    const double a = throughput(init, box, pot, setfl, W, S, reps, dt, g_nzones, 1, true, &cp);
+    if (a > 0)
+      std::printf("  A(cull=1,z=1)=%.3e atom-steps/s  cells_p=%llu %s\n", a, cp,
+                  cp ? "" : "VACUOUS!");
+    else
+      std::printf("  (dropped — HALT/short-run)\n");
+    return 0;
+  }
 
   // ---- Axis A: z=1 whole-system window N-sweep, both cull legs ----
   std::printf("\nAxis A (z=1 whole-system window, free-z; η=R_ring/R_kernel):\n");
